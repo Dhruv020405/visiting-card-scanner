@@ -56,7 +56,7 @@ MAX_LONG_FIELD_LEN = 800
 
 # Auth, Session & Rate-Limiting Constants
 MIN_SESSION_SECRET_LEN = 32
-MIN_PASSWORD_LENGTH = 10
+MIN_PASSWORD_LENGTH = 8
 PBKDF2_ITERATIONS = 260_000
 DEFAULT_DAILY_SCAN_LIMIT = 40
 SESSION_TTL_SECONDS = 7 * 24 * 60 * 60     # 7-day revocable session
@@ -2863,7 +2863,7 @@ def render_auth_screen() -> None:
                         reg_password = st.text_input(
                             "Password",
                             type="password",
-                            placeholder="Min 10 chars, 1 uppercase, 1 lowercase, 1 number",
+                            placeholder="Min 8 chars, 1 uppercase, 1 lowercase, 1 number",
                         )
                         reg_confirm = st.text_input(
                             "Confirm Password",
@@ -3005,7 +3005,7 @@ def render_auth_screen() -> None:
                     new_pw = st.text_input(
                         "New Password",
                         type="password",
-                        placeholder="Min 10 chars, 1 uppercase, 1 lowercase, 1 number",
+                        placeholder="Min 8 chars, 1 uppercase, 1 lowercase, 1 number",
                     )
                     confirm_new_pw = st.text_input(
                         "Confirm New Password",
