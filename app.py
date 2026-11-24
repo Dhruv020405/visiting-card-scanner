@@ -7,8 +7,9 @@ import secrets
 import time
 import unicodedata
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import gspread
 import pandas as pd
@@ -16,16 +17,34 @@ import streamlit as st
 from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types
+from PIL import Image, ImageOps
 from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-MODEL_NAME = "gemini-3.5-flash-lite"
-FALLBACK_MODELS = ["gemini-3.6-flash", "gemini-3.8-flash"]
+# All 4 models below are on the Gemini API Free Tier (no billing required).
+# Flash-Lite models are tried first for speed and high daily free quotas.
+MODEL_CHAIN = [
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-3.6-flash",
+    "gemini-3.8-flash",
+]
+
+# Anti-504 Timeout & Image Optimization Settings
+PER_REQUEST_TIMEOUT_MS = 22_000  # 22s per model attempt (in milliseconds)
+TOTAL_SCAN_BUDGET_SEC = 45.0     # Always finish under Streamlit Cloud's ~60s proxy limit
+MAX_IMAGE_SIDE_PX = 1400         # Sharp enough for tiny card fonts, small enough to upload fast
+JPEG_QUALITY = 82
+
+# Free-tier protection: default daily scans allowed per registered user
+DEFAULT_DAILY_SCAN_LIMIT = 40
 
 CARDS_WORKSHEET = "visiting_cards"
 USERS_WORKSHEET = "users"
+USAGE_WORKSHEET = "scan_usage"
+
 PBKDF2_ITERATIONS = 260_000
 MAX_CARD_IMAGES = 2
 
@@ -66,6 +85,13 @@ USER_HEADERS = [
     "created_at",
 ]
 
+USAGE_HEADERS = [
+    "user_id",
+    "quota_date",
+    "scan_count",
+    "updated_at",
+]
+
 st.set_page_config(
     page_title="Company Visiting Card Scanner",
     page_icon="📇",
@@ -74,7 +100,7 @@ st.set_page_config(
 
 
 # ---------------------------------------------------------------------------
-# Secret, Hashing & Normalization Helpers
+# Secret, Timezone, Hashing & Normalization Helpers
 # ---------------------------------------------------------------------------
 def get_secret(key: str, default: Any = None) -> Any:
     """Safely read a key from st.secrets or environment variables."""
@@ -84,6 +110,28 @@ def get_secret(key: str, default: Any = None) -> Any:
     except Exception:
         pass
     return os.getenv(key, default)
+
+
+def get_daily_scan_limit() -> int:
+    """Read configurable daily limit from Streamlit Secrets (default: 40/user/day)."""
+    raw = get_secret("DAILY_SCAN_LIMIT", DEFAULT_DAILY_SCAN_LIMIT)
+    try:
+        val = int(raw)
+        return max(1, val)
+    except Exception:
+        return DEFAULT_DAILY_SCAN_LIMIT
+
+
+def get_quota_date_str() -> str:
+    """
+    Return today's date in Pacific Time (America/Los_Angeles) so user limits
+    reset at the exact same time as Google's Gemini API daily free quota.
+    """
+    try:
+        tz = ZoneInfo("America/Los_Angeles")
+    except Exception:
+        tz = timezone(timedelta(hours=-8))
+    return datetime.now(tz).strftime("%Y-%m-%d")
 
 
 def hash_password(password: str) -> str:
@@ -121,7 +169,7 @@ def is_valid_username(username: str) -> bool:
 
 
 def normalize_digits(text: str) -> str:
-    """Convert any regional Unicode digits (e.g., Gujarati ૦-૯, Hindi ०-९) to ASCII 0-9."""
+    """Convert regional Unicode digits (Gujarati ૦-૯, Hindi ०-९, etc.) to ASCII 0-9."""
     return "".join(
         str(unicodedata.digit(ch)) if ch.isdecimal() and not ch.isascii() else ch
         for ch in text
@@ -148,6 +196,35 @@ def extract_normalized_emails(email_str: str) -> set[str]:
         return set()
     parts = re.split(r"[,;/|\s]+", email_str.strip().lower())
     return {p for p in parts if is_valid_email(p)}
+
+
+def optimize_card_image(raw_bytes: bytes, fallback_mime: str) -> Tuple[bytes, str]:
+    """
+    Auto-orient and compress visiting card photos to JPEG (max 1400px side).
+    Drastically cuts upload size and latency so mobile uploads never trigger 504 timeouts.
+    """
+    try:
+        with Image.open(io.BytesIO(raw_bytes)) as img:
+            img = ImageOps.exif_transpose(img)
+            if img.mode in ("RGBA", "LA", "P"):
+                background = Image.new("RGB", img.size, (255, 255, 255))
+                converted = img.convert("RGBA")
+                background.paste(converted, mask=converted.split()[-1])
+                img = background
+            elif img.mode != "RGB":
+                img = img.convert("RGB")
+
+            if max(img.size) > MAX_IMAGE_SIDE_PX:
+                img.thumbnail(
+                    (MAX_IMAGE_SIDE_PX, MAX_IMAGE_SIDE_PX),
+                    Image.Resampling.LANCZOS,
+                )
+
+            out = io.BytesIO()
+            img.save(out, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+            return out.getvalue(), "image/jpeg"
+    except Exception:
+        return raw_bytes, fallback_mime or "image/jpeg"
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +296,7 @@ def _clean_card_output(card: VisitingCard) -> VisitingCard:
 
 
 # ---------------------------------------------------------------------------
-# Google Sheets Storage Layer (Auto-Migrates Columns Safely)
+# Google Sheets Storage Layer (Auto-Creates & Auto-Repairs Headers)
 # ---------------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def get_spreadsheet() -> gspread.Spreadsheet:
@@ -241,7 +318,7 @@ def get_spreadsheet() -> gspread.Spreadsheet:
 
 
 def _migrate_cards_worksheet_if_needed(cards_ws: gspread.Worksheet) -> None:
-    """Align existing `visiting_cards` sheet rows to the latest CARD_HEADERS order."""
+    """Align existing `visiting_cards` rows to CARD_HEADERS and repair missing Row 1."""
     all_rows = cards_ws.get_all_values()
     if not all_rows:
         cards_ws.append_row(CARD_HEADERS, value_input_option="RAW")
@@ -249,6 +326,13 @@ def _migrate_cards_worksheet_if_needed(cards_ws: gspread.Worksheet) -> None:
 
     current_headers = all_rows[0]
     if current_headers == CARD_HEADERS:
+        return
+
+    # If Row 1 has data instead of headers, insert headers above it safely
+    if "record_id" not in current_headers and "user_id" not in current_headers:
+        if cards_ws.col_count < len(CARD_HEADERS):
+            cards_ws.resize(cols=len(CARD_HEADERS))
+        cards_ws.insert_row(CARD_HEADERS, index=1, value_input_option="RAW")
         return
 
     if cards_ws.col_count < len(CARD_HEADERS):
@@ -261,7 +345,6 @@ def _migrate_cards_worksheet_if_needed(cards_ws: gspread.Worksheet) -> None:
         padded = row + [""] * (len(current_headers) - len(row))
         old_rec = dict(zip(current_headers, padded))
 
-        # Preserve old single `phone` column into `whatsapp_phone` by default
         wp_val = old_rec.get("whatsapp_phone") or old_rec.get("phone") or "N/A"
         call_val = old_rec.get("call_phone") or "N/A"
 
@@ -288,7 +371,7 @@ def _migrate_cards_worksheet_if_needed(cards_ws: gspread.Worksheet) -> None:
 
 
 def ensure_worksheets(spreadsheet: gspread.Spreadsheet) -> None:
-    """Create or migrate 'visiting_cards' and 'users' worksheets."""
+    """Create or repair 'visiting_cards', 'users', and 'scan_usage' worksheets."""
     existing_titles = {ws.title for ws in spreadsheet.worksheets()}
 
     if CARDS_WORKSHEET not in existing_titles:
@@ -310,6 +393,16 @@ def ensure_worksheets(spreadsheet: gspread.Spreadsheet) -> None:
         if not users_ws.row_values(1):
             users_ws.append_row(USER_HEADERS, value_input_option="RAW")
 
+    if USAGE_WORKSHEET not in existing_titles:
+        usage_ws = spreadsheet.add_worksheet(
+            title=USAGE_WORKSHEET, rows=500, cols=len(USAGE_HEADERS)
+        )
+        usage_ws.append_row(USAGE_HEADERS, value_input_option="RAW")
+    else:
+        usage_ws = spreadsheet.worksheet(USAGE_WORKSHEET)
+        if not usage_ws.row_values(1):
+            usage_ws.append_row(USAGE_HEADERS, value_input_option="RAW")
+
 
 def get_cards_worksheet() -> gspread.Worksheet:
     return get_spreadsheet().worksheet(CARDS_WORKSHEET)
@@ -317,6 +410,69 @@ def get_cards_worksheet() -> gspread.Worksheet:
 
 def get_users_worksheet() -> gspread.Worksheet:
     return get_spreadsheet().worksheet(USERS_WORKSHEET)
+
+
+def get_usage_worksheet() -> gspread.Worksheet:
+    return get_spreadsheet().worksheet(USAGE_WORKSHEET)
+
+
+# ---------------------------------------------------------------------------
+# Per-User Daily Scan Quota Tracking (Backed by `scan_usage` Tab)
+# ---------------------------------------------------------------------------
+@st.cache_data(ttl=60, show_spinner=False)
+def _fetch_all_usage_rows() -> list[list[str]]:
+    ws = get_usage_worksheet()
+    rows = ws.get_all_values()
+    if not rows:
+        ws.append_row(USAGE_HEADERS, value_input_option="RAW")
+        return [USAGE_HEADERS]
+    return rows
+
+
+def get_user_scans_today(user_id: str) -> int:
+    """Return how many successful AI scans `user_id` has used in the current quota day."""
+    today = get_quota_date_str()
+    rows = _fetch_all_usage_rows()
+    if len(rows) <= 1:
+        return 0
+    for row in rows[1:]:
+        if len(row) >= 3 and row[0] == user_id and row[1] == today:
+            try:
+                return int(row[2])
+            except ValueError:
+                return 0
+    return 0
+
+
+def increment_user_scan_count(user_id: str) -> int:
+    """Increment `user_id`'s scan counter for today and return the new total."""
+    ws = get_usage_worksheet()
+    today = get_quota_date_str()
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    rows = ws.get_all_values()
+    if not rows:
+        ws.append_row(USAGE_HEADERS, value_input_option="RAW")
+        rows = [USAGE_HEADERS]
+
+    for row_idx, row in enumerate(rows[1:], start=2):
+        if len(row) >= 3 and row[0] == user_id and row[1] == today:
+            try:
+                current = int(row[2])
+            except ValueError:
+                current = 0
+            new_count = current + 1
+            ws.update(
+                values=[[str(new_count), now_str]],
+                range_name=f"C{row_idx}:D{row_idx}",
+                value_input_option="RAW",
+            )
+            _fetch_all_usage_rows.clear()
+            return new_count
+
+    ws.append_row([user_id, today, "1", now_str], value_input_option="RAW", table_range="A1")
+    _fetch_all_usage_rows.clear()
+    return 1
 
 
 # ---------------------------------------------------------------------------
@@ -417,9 +573,19 @@ def authenticate_user(
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=60, show_spinner=False)
 def _fetch_all_card_rows() -> list[list[str]]:
-    """Fetch all raw rows from `visiting_cards` (cached 60s to respect API quota)."""
+    """Fetch all raw rows from `visiting_cards` and auto-repair missing headers."""
     ws = get_cards_worksheet()
-    return ws.get_all_values()
+    all_rows = ws.get_all_values()
+    if not all_rows:
+        ws.append_row(CARD_HEADERS, value_input_option="RAW")
+        return [CARD_HEADERS]
+
+    first_row = all_rows[0]
+    if "record_id" not in first_row and "user_id" not in first_row:
+        ws.insert_row(CARD_HEADERS, index=1, value_input_option="RAW")
+        return [CARD_HEADERS, *all_rows]
+
+    return all_rows
 
 
 def fetch_user_records(user_id: str) -> pd.DataFrame:
@@ -475,7 +641,6 @@ def find_duplicate_records(
     if not new_phones and not new_emails:
         return []
 
-    # Refresh cache before checking so recently added cards are never missed
     _fetch_all_card_rows.clear()
     existing_df = fetch_user_records(user_id)
     if existing_df.empty:
@@ -526,11 +691,17 @@ def save_record(
 ) -> str:
     """Append a verified visiting card row in CARD_HEADERS order (Email before Address)."""
     ws = get_cards_worksheet()
+
+    # Guard against missing header row before writing
+    first_row = ws.row_values(1)
+    if not first_row:
+        ws.append_row(CARD_HEADERS, value_input_option="RAW", table_range="A1")
+    elif "record_id" not in first_row and "user_id" not in first_row:
+        ws.insert_row(CARD_HEADERS, index=1, value_input_option="RAW")
+
     record_id = uuid.uuid4().hex[:8]
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # Enforce default rule if user cleared WhatsApp but left a single number in Call only?
-    # Respect whatever the user manually edited in the verification form.
     row = [
         record_id,
         user_id,
@@ -588,25 +759,35 @@ def build_excel_bytes(df: pd.DataFrame) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# Gemini AI Extraction Helper (Supports 1 or 2 Sides + Retry & Fallback)
+# Anti-504 Gemini AI Extraction Helper
 # ---------------------------------------------------------------------------
+class ScanUnavailableError(Exception):
+    """Raised when all free models are temporarily busy or timed out."""
+
+
 def extract_card_details(
     images: list[Tuple[bytes, str]], api_key: str
 ) -> Tuple[VisitingCard, str]:
-    """Send 1 or 2 visiting card images (front/back) to Gemini with retry & fallback."""
+    """
+    Send 1 or 2 compressed visiting card images to Gemini across 4 free models,
+    enforcing strict per-request and total time budgets so users never hit 504s.
+    """
     if not api_key or not api_key.strip():
         raise ValueError(
-            "Gemini API key is missing. Add it in Streamlit Secrets or the sidebar Settings."
+            "Scanner API key is missing. Add it in Streamlit Secrets or the sidebar Settings."
         )
     if not images:
         raise ValueError("Please provide at least one visiting card image.")
 
-    client = genai.Client(api_key=api_key.strip())
+    # Compress & auto-orient images first to speed up transfer and vision parsing
+    optimized_images = [
+        optimize_card_image(raw_bytes, mime) for raw_bytes, mime in images
+    ]
 
     side_note = (
         "You are given 2 images showing the FRONT and BACK sides of the SAME visiting card. "
         "Combine and merge all details found across both sides into one unified record without duplicating numbers or text. "
-        if len(images) == 2
+        if len(optimized_images) == 2
         else "You are given 1 image of a visiting card. "
     )
 
@@ -637,92 +818,149 @@ def extract_card_details(
 
     image_parts = [
         types.Part.from_bytes(data=img_bytes, mime_type=mime_type)
-        for img_bytes, mime_type in images
+        for img_bytes, mime_type in optimized_images
     ]
 
-    models_to_try = [MODEL_NAME, *FALLBACK_MODELS]
-    last_error: Optional[Exception] = None
+    started_at = time.monotonic()
 
-    for model in models_to_try:
-        for attempt in range(2):
-            try:
-                response = client.models.generate_content(
-                    model=model,
-                    contents=[*image_parts, prompt],
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=VisitingCard,
-                    ),
-                )
+    for model in MODEL_CHAIN:
+        elapsed = time.monotonic() - started_at
+        remaining_sec = TOTAL_SCAN_BUDGET_SEC - elapsed
+        if remaining_sec < 4.0:
+            break
 
-                if isinstance(response.parsed, VisitingCard):
-                    return _clean_card_output(response.parsed), model
+        # Cap each attempt tightly so we never hang past Streamlit Cloud's proxy timeout
+        attempt_timeout_ms = min(PER_REQUEST_TIMEOUT_MS, int(remaining_sec * 1000))
+        client = genai.Client(
+            api_key=api_key.strip(),
+            http_options=types.HttpOptions(timeout=attempt_timeout_ms),
+        )
 
-                if not response.text:
-                    raise RuntimeError(
-                        "Gemini returned an empty response. Try a clearer, well-lit photo."
-                    )
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=[*image_parts, prompt],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=VisitingCard,
+                    max_output_tokens=1024,
+                ),
+            )
 
-                cleaned_json = re.sub(
-                    r"^```(?:json)?\s*|\s*```$",
-                    "",
-                    response.text.strip(),
-                    flags=re.IGNORECASE,
-                )
-                return (
-                    _clean_card_output(VisitingCard.model_validate_json(cleaned_json)),
-                    model,
-                )
+            if isinstance(response.parsed, VisitingCard):
+                return _clean_card_output(response.parsed), model
 
-            except genai_errors.APIError as api_err:
-                last_error = api_err
-                if api_err.code in (429, 503):
-                    time.sleep(2 * (attempt + 1))
-                    continue
-                if api_err.code == 404:
-                    break
-                raise
+            if not response.text:
+                continue
 
-    if last_error:
-        raise last_error
-    raise RuntimeError("All Gemini models failed to process the visiting card.")
+            cleaned_json = re.sub(
+                r"^```(?:json)?\s*|\s*```$",
+                "",
+                response.text.strip(),
+                flags=re.IGNORECASE,
+            )
+            return (
+                _clean_card_output(VisitingCard.model_validate_json(cleaned_json)),
+                model,
+            )
+
+        except genai_errors.APIError as api_err:
+            # Invalid API key / auth error should fail fast with a clear message
+            if api_err.code in (401, 403):
+                raise ValueError(
+                    "The configured Gemini API key was rejected. Please check your key in Settings."
+                ) from api_err
+            # Silently fail over to the next free model on 404, 429, 500, 502, 503, 504
+            if api_err.code in (404, 408, 429, 500, 502, 503, 504):
+                time.sleep(0.5)
+                continue
+            continue
+        except Exception:
+            # Catch network hiccups, client timeouts, or JSON glitches and try next model
+            time.sleep(0.5)
+            continue
+
+    raise ScanUnavailableError(
+        "The AI scanner is momentarily busy or timed out. "
+        "Please tap Scan again in a few seconds — or use 'Fill Details Manually' below."
+    )
 
 
-def run_scan(image_files: list, api_key: str) -> None:
-    """Process 1 or 2 UploadedFile objects from file_uploader or camera_input."""
+def run_scan(image_files: list, api_key: str, user_id: str) -> None:
+    """Enforce daily free quota, scan 1–2 card images, and hide raw server errors."""
     if not api_key:
-        st.error(
-            "Gemini API key is not configured. Please add it in the sidebar Settings."
+        st.warning(
+            "Scanner API key is not configured yet. Please add it in the sidebar Settings."
         )
         return
     if not image_files:
-        st.error("Please upload or capture at least 1 card image.")
+        st.warning("Please upload or capture at least 1 card image.")
         return
     if len(image_files) > MAX_CARD_IMAGES:
-        st.error(f"Maximum {MAX_CARD_IMAGES} images (Front & Back) are allowed.")
+        st.warning(f"Maximum {MAX_CARD_IMAGES} images (Front & Back) are allowed.")
         return
 
-    images_payload = [
-        (f.getvalue(), f.type or "image/jpeg") for f in image_files
-    ]
+    daily_limit = get_daily_scan_limit()
+    try:
+        used_today = get_user_scans_today(user_id)
+    except Exception:
+        used_today = 0
+
+    if used_today >= daily_limit:
+        st.warning(
+            f"You have reached your daily limit of **{daily_limit} AI scans**. "
+            "Your quota resets automatically at 1:30 PM IST (12:30 PM IST in summer). "
+            "You can still add cards right now using **Fill Details Manually** below."
+        )
+        return
+
+    images_payload = [(f.getvalue(), f.type or "image/jpeg") for f in image_files]
     side_label = "both card sides" if len(images_payload) == 2 else "visiting card"
 
-    with st.spinner(f"Scanning {side_label} with Gemini..."):
+    with st.spinner(f"Scanning {side_label}..."):
         try:
-            extracted, used_model = extract_card_details(images_payload, api_key)
+            extracted, _used_model = extract_card_details(images_payload, api_key)
+            # Only count against the user's daily quota when extraction succeeds
+            try:
+                increment_user_scan_count(user_id)
+            except Exception:
+                pass
+
             st.session_state["extracted_card"] = extracted.model_dump()
             st.session_state["pending_duplicate_save"] = None
             st.session_state["scan_counter"] += 1
             st.session_state["scan_notice"] = (
-                f"Scanned {len(images_payload)} image(s) using `{used_model}`! "
-                "Please verify or edit the details below and click Save."
+                f"Scanned {len(images_payload)} image(s) successfully! "
+                "Please verify or edit the details below and click Save Card."
             )
-        except genai_errors.APIError as api_err:
-            st.error(f"Gemini API error ({api_err.code}): {api_err.message}")
+            st.rerun()
         except ValueError as val_err:
-            st.error(str(val_err))
-        except Exception as exc:
-            st.error(f"Could not extract card details: {exc}")
+            st.warning(str(val_err))
+        except ScanUnavailableError as busy_err:
+            st.warning(str(busy_err))
+        except Exception:
+            st.warning(
+                "Could not read the card right now. Please try a clearer photo, "
+                "tap Scan again in a moment, or use 'Fill Details Manually' below."
+            )
+
+
+def open_blank_manual_form() -> None:
+    """Open an empty verification form so users can add cards even without AI."""
+    st.session_state["extracted_card"] = {
+        "company_name": "",
+        "contact_person": "",
+        "whatsapp_phone": "",
+        "call_phone": "N/A",
+        "products_services": "",
+        "email": "N/A",
+        "address": "",
+    }
+    st.session_state["pending_duplicate_save"] = None
+    st.session_state["scan_counter"] += 1
+    st.session_state["scan_notice"] = (
+        "Manual entry mode — type the visiting card details below and click Save Card."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -766,8 +1004,8 @@ def render_auth_screen() -> None:
                             st.rerun()
                         else:
                             st.error(msg)
-                    except Exception as exc:
-                        st.error(f"Login failed: {exc}")
+                    except Exception:
+                        st.error("Unable to sign in right now. Please try again.")
 
         with tab_register:
             with st.form("register_form"):
@@ -806,8 +1044,10 @@ def render_auth_screen() -> None:
                                 st.rerun()
                             else:
                                 st.error(msg)
-                        except Exception as exc:
-                            st.error(f"Registration failed: {exc}")
+                        except Exception:
+                            st.error(
+                                "Unable to create account right now. Please try again."
+                            )
 
 
 # ---------------------------------------------------------------------------
@@ -858,11 +1098,25 @@ def main() -> None:
     current_username = auth_user["username"]
     current_email = auth_user["email"]
 
-    # ---- Sidebar: Account, Logout & Settings ----
+    daily_limit = get_daily_scan_limit()
+    try:
+        scans_used_today = get_user_scans_today(current_user_id)
+    except Exception:
+        scans_used_today = 0
+    scans_remaining = max(0, daily_limit - scans_used_today)
+
+    # ---- Sidebar: Account, Daily Limit & Settings ----
     with st.sidebar:
         st.header("Account")
         st.markdown(f"**{current_username}**")
         st.caption(current_email)
+
+        st.metric(
+            label="AI Scans Left Today",
+            value=f"{scans_remaining} / {daily_limit}",
+        )
+        st.progress(min(1.0, scans_used_today / daily_limit))
+        st.caption("Resets daily at 1:30 PM IST (12:30 PM in summer)")
 
         if st.button("Logout", use_container_width=True):
             st.session_state["auth_user"] = None
@@ -878,7 +1132,7 @@ def main() -> None:
 
         server_api_key = str(get_secret("GEMINI_API_KEY", "") or "").strip()
         if server_api_key:
-            st.success("Gemini API key configured")
+            st.success("AI Scanner ready")
             override_key = st.text_input(
                 "Use your own Gemini API Key (optional)",
                 value="",
@@ -895,14 +1149,11 @@ def main() -> None:
             )
             active_api_key = user_api_key.strip()
             if active_api_key:
-                st.success("Gemini API key configured")
+                st.success("AI Scanner ready")
             else:
                 st.warning("Enter a Gemini API key to scan cards.")
 
-        st.success("Google Sheets connected")
-        st.divider()
-        st.caption(f"Primary model: `{MODEL_NAME}`")
-        st.caption(f"Fallbacks: `{', '.join(FALLBACK_MODELS)}`")
+        st.success("Cloud storage connected")
 
     # ---- Page Header ----
     st.title("Company Visiting Card Scanner")
@@ -919,7 +1170,14 @@ def main() -> None:
         st.session_state["flash_info"] = None
 
     # ---- Step 1: Image Capture & Upload (1 or 2 Sides) ----
-    st.subheader("1. Capture or Upload Visiting Card (1 or 2 Sides)")
+    step1_col, manual_col = st.columns([4, 1.4])
+    with step1_col:
+        st.subheader("1. Capture or Upload Visiting Card (1 or 2 Sides)")
+    with manual_col:
+        if st.button("Fill Details Manually", use_container_width=True):
+            open_blank_manual_form()
+            st.rerun()
+
     tab_upload, tab_camera = st.tabs(["Upload Image(s)", "Take Photo with Camera"])
 
     with tab_upload:
@@ -949,8 +1207,9 @@ def main() -> None:
                     f"Scan Uploaded Card ({len(uploaded_files)} image{'s' if len(uploaded_files) > 1 else ''})",
                     type="primary",
                     key="btn_scan_upload",
+                    disabled=(scans_remaining == 0),
                 ):
-                    run_scan(uploaded_files, active_api_key)
+                    run_scan(uploaded_files, active_api_key, current_user_id)
 
     with tab_camera:
         cam_front = st.camera_input(
@@ -974,8 +1233,15 @@ def main() -> None:
                 f"Scan Captured Photo{'s' if len(captured_photos) > 1 else ''} ({len(captured_photos)})",
                 type="primary",
                 key="btn_scan_camera",
+                disabled=(scans_remaining == 0),
             ):
-                run_scan(captured_photos, active_api_key)
+                run_scan(captured_photos, active_api_key, current_user_id)
+
+    if scans_remaining == 0:
+        st.info(
+            f"You have used all {daily_limit} AI scans for today. "
+            "Click **Fill Details Manually** above to keep adding cards, or scan again after reset."
+        )
 
     # ---- Step 2: Verification Form & Duplicate Confirmation ----
     if st.session_state["extracted_card"] is not None:
@@ -985,7 +1251,6 @@ def main() -> None:
         pending_dup = st.session_state["pending_duplicate_save"]
 
         if pending_dup is not None:
-            # Show duplicate warning & Yes/No confirmation prompt
             st.warning(
                 "**Duplicate Card Detected!** A card with the same phone number or email "
                 "is already saved in your account."
@@ -997,9 +1262,7 @@ def main() -> None:
                 hide_index=True,
             )
 
-            st.markdown(
-                "**Do you want to upload this same card data again?**"
-            )
+            st.markdown("**Do you want to upload this same card data again?**")
             dup_col1, dup_col2, _ = st.columns([1.3, 1.3, 3.4])
             with dup_col1:
                 if st.button(
@@ -1027,8 +1290,8 @@ def main() -> None:
                             f"Saved '{data['company_name']}' to your account."
                         )
                         st.rerun()
-                    except Exception as sheet_err:
-                        st.error(f"Could not save to Google Sheets: {sheet_err}")
+                    except Exception:
+                        st.error("Could not save right now. Please try again.")
 
             with dup_col2:
                 if st.button(
@@ -1053,7 +1316,6 @@ def main() -> None:
             suffix = st.session_state["scan_counter"]
 
             with st.form(key=f"verify_card_form_{suffix}"):
-                # Row 1: Company Name & Contact Person
                 r1_c1, r1_c2 = st.columns(2)
                 with r1_c1:
                     company_name = st.text_input(
@@ -1068,7 +1330,6 @@ def main() -> None:
                         key=f"contact_{suffix}",
                     )
 
-                # Row 2: WhatsApp Number & Normal Call Number
                 r2_c1, r2_c2 = st.columns(2)
                 with r2_c1:
                     whatsapp_phone = st.text_input(
@@ -1083,7 +1344,6 @@ def main() -> None:
                         key=f"call_{suffix}",
                     )
 
-                # Row 3: Products / Services & Additional Notes
                 r3_c1, r3_c2 = st.columns(2)
                 with r3_c1:
                     products_services = st.text_input(
@@ -1157,8 +1417,8 @@ def main() -> None:
                                 f"Saved '{company_name}' to your account."
                             )
                             st.rerun()
-                    except Exception as sheet_err:
-                        st.error(f"Could not save to Google Sheets: {sheet_err}")
+                    except Exception:
+                        st.error("Could not save right now. Please try again.")
 
                 if discarded:
                     st.session_state["extracted_card"] = None
@@ -1173,12 +1433,13 @@ def main() -> None:
     with refresh_col:
         if st.button("Refresh", use_container_width=True):
             _fetch_all_card_rows.clear()
+            _fetch_all_usage_rows.clear()
             st.rerun()
 
     try:
         all_records_df = fetch_user_records(current_user_id)
-    except Exception as sheet_err:
-        st.error(f"Failed to load your records from Google Sheets: {sheet_err}")
+    except Exception:
+        st.error("Unable to load your saved cards right now. Please click Refresh.")
         return
 
     search_col, export_col = st.columns([3, 1])
@@ -1251,8 +1512,8 @@ def main() -> None:
                     st.rerun()
                 else:
                     st.warning("Record not found or does not belong to your account.")
-            except Exception as sheet_err:
-                st.error(f"Could not delete record: {sheet_err}")
+            except Exception:
+                st.error("Could not delete record right now. Please try again.")
 
 
 if __name__ == "__main__":
