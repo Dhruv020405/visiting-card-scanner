@@ -10,9 +10,11 @@ import smtplib
 import time
 import unicodedata
 import uuid
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from typing import Any, Optional, Tuple
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import gspread
@@ -28,7 +30,7 @@ from pydantic import BaseModel, Field
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-SCHEMA_VERSION = "v6_extra_data_and_clean_ui"
+SCHEMA_VERSION = "v7_analyze_marketing_hub"
 
 MODEL_CHAIN = [
     "gemini-3.5-flash-lite",
@@ -57,7 +59,7 @@ REGISTER_OTPS_WORKSHEET = "register_otps"
 PBKDF2_ITERATIONS = 260_000
 MAX_CARD_IMAGES = 2
 
-# Google Sheet column order (adds single `extra_data` JSON column at the end)
+# Google Sheet column order (includes `extra_data` JSON column at the end)
 CARD_HEADERS = [
     "record_id",
     "user_id",
@@ -249,7 +251,7 @@ EXCEL_COLUMN_ALIASES: dict[str, list[str]] = {
     ],
 }
 
-# Realistic dummy placeholders used across Scan, Manual Entry, and Update forms
+# Dummy placeholders used across Scan, Manual Entry, and Update forms
 FIELD_PLACEHOLDERS = {
     "company_name": "e.g., Apex Industrial Solutions",
     "contact_person": "e.g., Rajesh Patel (Sales Manager)",
@@ -272,7 +274,7 @@ st.set_page_config(
 
 
 # ---------------------------------------------------------------------------
-# Clean Responsive UI Styling (Phone + Laptop) & Toolbar Cleanup
+# Clean Responsive UI Styling (Phone + Laptop) & Compact Image Previews
 # ---------------------------------------------------------------------------
 def inject_clean_ui_css() -> None:
     st.markdown(
@@ -310,6 +312,20 @@ def inject_clean_ui_css() -> None:
                 font-weight: 500;
             }
 
+            /* Keep card image previews & camera compact on laptop and phone */
+            [data-testid="stImage"] img {
+                max-height: 240px !important;
+                max-width: min(300px, 100%) !important;
+                width: auto !important;
+                height: auto !important;
+                object-fit: contain;
+                border-radius: 8px;
+                border: 1px solid rgba(128, 128, 128, 0.25);
+            }
+            [data-testid="stCameraInput"] {
+                max-width: 420px;
+            }
+
             /* Compact summary pill strip */
             .vcard-stat-strip {
                 display: flex;
@@ -318,7 +334,7 @@ def inject_clean_ui_css() -> None:
                 margin: 0.35rem 0 1rem 0;
             }
             .vcard-stat-pill {
-                flex: 1 1 160px;
+                flex: 1 1 150px;
                 padding: 0.65rem 0.95rem;
                 border-radius: 10px;
                 border: 1px solid rgba(128, 128, 128, 0.22);
@@ -332,6 +348,33 @@ def inject_clean_ui_css() -> None:
             .vcard-stat-value {
                 font-size: 1.15rem;
                 font-weight: 600;
+            }
+
+            /* Outreach action pills */
+            .vcard-outreach-card {
+                padding: 0.85rem 1rem;
+                border-radius: 10px;
+                border: 1px solid rgba(128, 128, 128, 0.22);
+                background: rgba(128, 128, 128, 0.04);
+                margin-bottom: 0.65rem;
+            }
+            .vcard-action-link {
+                display: inline-block;
+                padding: 0.38rem 0.8rem;
+                border-radius: 6px;
+                text-decoration: none !important;
+                font-size: 0.86rem;
+                font-weight: 600;
+                margin-right: 0.5rem;
+                margin-top: 0.4rem;
+            }
+            .vcard-wa-btn {
+                background: #16a34a;
+                color: #ffffff !important;
+            }
+            .vcard-mail-btn {
+                background: #2563eb;
+                color: #ffffff !important;
             }
 
             /* Smooth slide-down reveal for the card form */
@@ -363,19 +406,6 @@ def inject_clean_ui_css() -> None:
                 h2, h3 {
                     font-size: 1.2rem !important;
                 }
-            }
-            /* Keep card image previews & camera compact on laptop and phone */
-            [data-testid="stImage"] img {
-                max-height: 240px !important;
-                max-width: min(300px, 100%) !important;
-                width: auto !important;
-                height: auto !important;
-                object-fit: contain;
-                border-radius: 8px;
-                border: 1px solid rgba(128, 128, 128, 0.25);
-            }
-            [data-testid="stCameraInput"] {
-                max-width: 420px;
             }
         </style>
         """,
@@ -494,7 +524,6 @@ _UI_BRIDGE = (
 
 
 def trigger_ui_bridge() -> None:
-    """Run lightweight browser actions (mobile sidebar auto-close & scroll-to-form)."""
     if _UI_BRIDGE is None:
         return
     _UI_BRIDGE(
@@ -510,7 +539,6 @@ def trigger_ui_bridge() -> None:
 # Secret, Session Token, Hashing, Phone & Extra-Data Helpers
 # ---------------------------------------------------------------------------
 def get_secret(key: str, default: Any = None) -> Any:
-    """Safely read a key from st.secrets or environment variables."""
     try:
         if key in st.secrets:
             return st.secrets[key]
@@ -528,7 +556,6 @@ def get_daily_scan_limit() -> int:
 
 
 def get_quota_date_str() -> str:
-    """Return today's date in Pacific Time to match Google's free-tier quota reset."""
     try:
         tz = ZoneInfo("America/Los_Angeles")
     except Exception:
@@ -593,7 +620,6 @@ def logout_user_session() -> None:
 
 
 def sync_and_restore_session() -> Tuple[Optional[dict[str, str]], bool]:
-    """Synchronize hidden browser localStorage session without touching URL params."""
     try:
         if "session" in st.query_params:
             st.query_params.pop("session", None)
@@ -693,7 +719,6 @@ def is_valid_username(username: str) -> bool:
 
 
 def has_at_least_one_field(*values: str) -> bool:
-    """Return True if at least one field contains real user input (not empty or N/A)."""
     for val in values:
         cleaned = str(val or "").strip()
         if cleaned and cleaned.upper() != "N/A":
@@ -702,7 +727,6 @@ def has_at_least_one_field(*values: str) -> bool:
 
 
 def normalize_digits(text: str) -> str:
-    """Convert regional Unicode digits (Gujarati ૦-૯, Hindi ०-९, etc.) to ASCII 0-9."""
     return "".join(
         str(unicodedata.digit(ch)) if ch.isdecimal() and not ch.isascii() else ch
         for ch in text
@@ -710,10 +734,7 @@ def normalize_digits(text: str) -> str:
 
 
 def format_phone_numbers(raw: str) -> str:
-    """
-    Format phone/WhatsApp numbers cleanly as '9876543210 / 9123456789'.
-    Strips +91 / 91 Indian mobile prefixes, trailing Excel '.0', spaces, and dashes.
-    """
+    """Format phone/WhatsApp numbers cleanly as '9876543210 / 9123456789'."""
     if not raw or str(raw).strip().upper() in ("N/A", "NAN", "NONE"):
         return "N/A"
     text = normalize_digits(str(raw)).strip()
@@ -753,6 +774,21 @@ def extract_normalized_phones(phone_str: str) -> set[str]:
     return phones
 
 
+def extract_primary_wa_dial_number(wp_str: str, fallback_call_str: str = "") -> str:
+    """Return a clean 10-digit Indian or international digits string for wa.me links."""
+    for candidate in (wp_str, fallback_call_str):
+        formatted = format_phone_numbers(candidate)
+        if formatted == "N/A":
+            continue
+        for part in formatted.split(" / "):
+            digits = re.sub(r"\D", "", part)
+            if len(digits) == 10 and digits[0] in "6789":
+                return f"91{digits}"
+            if len(digits) >= 10:
+                return digits
+    return ""
+
+
 def extract_normalized_emails(email_str: str) -> set[str]:
     if not email_str or email_str.strip().upper() == "N/A":
         return set()
@@ -761,10 +797,9 @@ def extract_normalized_emails(email_str: str) -> set[str]:
 
 
 # ---------------------------------------------------------------------------
-# Extra Data (Option 1: JSON Column -> Auto-Expanded Excel Columns)
+# Extra Data (JSON Column -> Auto-Expanded Columns in Table & Excel Export)
 # ---------------------------------------------------------------------------
 def parse_extra_data(raw_json: str) -> dict[str, str]:
-    """Safely parse the JSON stored in Google Sheets' `extra_data` column."""
     if not raw_json or not str(raw_json).strip():
         return {}
     try:
@@ -783,7 +818,6 @@ def parse_extra_data(raw_json: str) -> dict[str, str]:
 
 
 def serialize_extra_data(extra: dict[str, str]) -> str:
-    """Serialize extra key-value pairs to compact JSON for Google Sheets storage."""
     cleaned = {
         str(k).strip(): normalize_digits(str(v)).strip()
         for k, v in extra.items()
@@ -797,14 +831,12 @@ def serialize_extra_data(extra: dict[str, str]) -> str:
 
 
 def format_extra_data_for_input(extra: dict[str, str]) -> str:
-    """Format extra fields as editable `Key: Value` lines for form text areas."""
     if not extra:
         return ""
     return "\n".join(f"{k}: {v}" for k, v in extra.items())
 
 
 def parse_extra_data_from_input(text: str) -> dict[str, str]:
-    """Parse user-entered `Key: Value` lines into a clean extra-fields dictionary."""
     if not text or not text.strip():
         return {}
     result: dict[str, str] = {}
@@ -838,14 +870,12 @@ def parse_extra_data_from_input(text: str) -> dict[str, str]:
 
 
 def format_extra_data_summary(extra: dict[str, str]) -> str:
-    """Compact one-line summary for search indexing."""
     if not extra:
         return ""
     return " | ".join(f"{k}: {v}" for k, v in extra.items())
 
 
 def collect_extra_column_names(df: pd.DataFrame) -> list[str]:
-    """Collect unique extra column names present in a user's records (case-normalized)."""
     if df.empty or "Extra Data JSON" not in df.columns:
         return []
     standard_lower = {c.lower() for c in DEFAULT_TABLE_COLUMNS}
@@ -861,13 +891,9 @@ def collect_extra_column_names(df: pd.DataFrame) -> list[str]:
 
 
 def build_expanded_dataframe(
-    df: pd.DataFrame, include_extra_columns: bool
+    df: pd.DataFrame, include_extra_columns: bool = True
 ) -> pd.DataFrame:
-    """
-    Build the display or Excel export DataFrame.
-    When `include_extra_columns=True`, expands all `extra_data` keys into real columns
-    at the right end (filling 'N/A' where absent).
-    """
+    """Expand all `extra_data` keys into real columns at the right end (filling 'N/A' where absent)."""
     base_df = df[DEFAULT_TABLE_COLUMNS].copy()
     if not include_extra_columns or df.empty or "Extra Data JSON" not in df.columns:
         return base_df
@@ -893,7 +919,6 @@ def build_expanded_dataframe(
 
 
 def optimize_card_image(raw_bytes: bytes, fallback_mime: str) -> Tuple[bytes, str]:
-    """Auto-orient and compress visiting card photos to JPEG (max 1400px side)."""
     try:
         with Image.open(io.BytesIO(raw_bytes)) as img:
             img = ImageOps.exif_transpose(img)
@@ -919,20 +944,19 @@ def optimize_card_image(raw_bytes: bytes, fallback_mime: str) -> Tuple[bytes, st
 
 
 def clear_uploaded_inputs() -> None:
-    """Reset file uploaders and camera inputs so previous photos clear after save/discard."""
     st.session_state["uploader_reset_counter"] = (
         st.session_state.get("uploader_reset_counter", 0) + 1
     )
 
 
 # ---------------------------------------------------------------------------
-# Pydantic Schema for Gemini Structured Outputs (Includes Extra Printed Details)
+# Pydantic Schema for Gemini Structured Outputs
 # ---------------------------------------------------------------------------
 class ExtraDetail(BaseModel):
     label: str = Field(
         description=(
             "Short clean English Title Case label for an extra detail on the card "
-            "(e.g., 'Website', 'GSTIN', 'PAN', 'Instagram', 'LinkedIn', 'Branch', 'Timings')."
+            "(e.g., 'Website', 'GSTIN', 'PAN', 'Instagram', 'LinkedIn', 'Fax', 'Branch', 'Timings')."
         )
     )
     value: str = Field(
@@ -993,7 +1017,7 @@ class VisitingCard(BaseModel):
     city: str = Field(
         description=(
             "Only the City or Town name in standard English Title Case (e.g., 'Ahmedabad', 'Mumbai', "
-            "'Kapadvanj', 'Dakor', 'Surat', 'Vadodara'). Do NOT include street, state, country, or PIN code here. "
+            "'Kapadvanj', 'Dakor', 'Surat', 'Vadodara'). Do NOT include street, state, or PIN code here. "
             "Infer from the address or PIN code if clear; return 'N/A' if completely absent."
         )
     )
@@ -1001,7 +1025,7 @@ class VisitingCard(BaseModel):
         default_factory=list,
         description=(
             "Any additional useful details printed on the card that do NOT belong in the standard fields "
-            "(such as Website, GSTIN, PAN, Instagram, LinkedIn, Facebook, Branch, Office Timings, ISO Certification). "
+            "(such as Website, GSTIN, PAN, Fax, Instagram, LinkedIn, Facebook, Branch, Office Timings, ISO Certification). "
             "Do NOT repeat company name, contact person, phone, email, products, address, or city here. "
             "Return an empty list [] if none are printed."
         ),
@@ -1061,7 +1085,6 @@ def get_spreadsheet(_schema_version: str = SCHEMA_VERSION) -> gspread.Spreadshee
 
 
 def _migrate_cards_worksheet_if_needed(cards_ws: gspread.Worksheet) -> None:
-    """Align `visiting_cards` rows to CARD_HEADERS (adds `extra_data` column safely)."""
     all_rows = cards_ws.get_all_values()
     if not all_rows:
         cards_ws.append_row(CARD_HEADERS, value_input_option="RAW")
@@ -1075,15 +1098,22 @@ def _migrate_cards_worksheet_if_needed(cards_ws: gspread.Worksheet) -> None:
         cards_ws.insert_row(CARD_HEADERS, index=1, value_input_option="RAW")
         return
 
-    if current_headers == CARD_HEADERS:
+    normalized_headers = [
+        "extra_data" if col == "Extra Details" else col for col in current_headers
+    ]
+    if normalized_headers == CARD_HEADERS:
+        if normalized_headers != current_headers:
+            cards_ws.update(
+                values=[CARD_HEADERS], range_name="A1", value_input_option="RAW"
+            )
         return
 
     migrated_rows = [CARD_HEADERS]
     for row in all_rows[1:]:
         if not any(cell.strip() for cell in row):
             continue
-        padded = row + [""] * (len(current_headers) - len(row))
-        old_rec = dict(zip(current_headers, padded))
+        padded = row + [""] * (len(normalized_headers) - len(row))
+        old_rec = dict(zip(normalized_headers, padded))
 
         wp_val = format_phone_numbers(
             old_rec.get("whatsapp_phone") or old_rec.get("phone") or "N/A"
@@ -1566,6 +1596,13 @@ def _fetch_all_card_rows() -> list[list[str]]:
         ws.insert_row(CARD_HEADERS, index=1, value_input_option="RAW")
         return [CARD_HEADERS, *all_rows]
 
+    if "Extra Details" in first_row and "extra_data" not in first_row:
+        fixed_headers = [
+            "extra_data" if col == "Extra Details" else col for col in first_row
+        ]
+        ws.update(values=[fixed_headers], range_name="A1", value_input_option="RAW")
+        all_rows[0] = fixed_headers
+
     return all_rows
 
 
@@ -1583,7 +1620,8 @@ def fetch_user_records(user_id: str) -> pd.DataFrame:
         padded = row + [""] * (len(headers) - len(row))
         record = dict(zip(headers, padded))
         if record.get("user_id") == user_id:
-            extra_dict = parse_extra_data(record.get("extra_data", ""))
+            raw_extra = record.get("extra_data") or record.get("Extra Details") or ""
+            extra_dict = parse_extra_data(raw_extra)
             data_rows.append(
                 {
                     "Record ID": record.get("record_id", ""),
@@ -1611,7 +1649,6 @@ def fetch_user_records(user_id: str) -> pd.DataFrame:
 
 
 def search_records_df(df: pd.DataFrame, query: str) -> pd.DataFrame:
-    """Search across all standard and extra card fields (case-insensitive)."""
     q = query.strip()
     if not q or df.empty:
         return df.iloc[0:0]
@@ -1732,7 +1769,6 @@ def save_record(
 
 
 def save_records_batch(user_id: str, records: list[dict[str, Any]]) -> int:
-    """Append multiple merged Excel/CSV records in one Google Sheets API call."""
     if not records:
         return 0
     ws = get_cards_worksheet()
@@ -1838,13 +1874,13 @@ def delete_record(record_id: str, user_id: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Excel Export & Existing Excel Merge Helpers (With Extra-Column Preservation)
+# Excel Export & Existing Excel Merge Helpers
 # ---------------------------------------------------------------------------
-def build_excel_bytes(df: pd.DataFrame) -> bytes:
+def build_excel_bytes(df: pd.DataFrame, sheet_name: str = "Visiting Cards") -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Visiting Cards")
-        worksheet = writer.sheets["Visiting Cards"]
+        df.to_excel(writer, index=False, sheet_name=sheet_name[:31])
+        worksheet = writer.sheets[sheet_name[:31]]
 
         for col_idx, col_name in enumerate(df.columns, start=1):
             max_cell_len = (
@@ -1854,6 +1890,23 @@ def build_excel_bytes(df: pd.DataFrame) -> bytes:
             col_letter = worksheet.cell(row=1, column=col_idx).column_letter
             worksheet.column_dimensions[col_letter].width = col_width
 
+    return output.getvalue()
+
+
+def build_multi_sheet_excel_bytes(sheets: dict[str, pd.DataFrame]) -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        for raw_name, df in sheets.items():
+            safe_name = raw_name[:31]
+            df.to_excel(writer, index=False, sheet_name=safe_name)
+            worksheet = writer.sheets[safe_name]
+            for col_idx, col_name in enumerate(df.columns, start=1):
+                max_cell_len = (
+                    df[col_name].astype(str).map(len).max() if not df.empty else 0
+                )
+                col_width = min(max(len(str(col_name)), max_cell_len) + 4, 52)
+                col_letter = worksheet.cell(row=1, column=col_idx).column_letter
+                worksheet.column_dimensions[col_letter].width = col_width
     return output.getvalue()
 
 
@@ -1905,10 +1958,6 @@ def prepare_excel_merge_rows(
     user_id: str,
     skip_duplicates: bool,
 ) -> Tuple[list[dict[str, Any]], int, int]:
-    """
-    Convert an uploaded Excel/CSV DataFrame into our standard format while saving any
-    unmapped extra columns (e.g., Website, GSTIN) inside `extra_data`.
-    """
     existing_phones: set[str] = set()
     existing_emails: set[str] = set()
 
@@ -1982,7 +2031,7 @@ def prepare_excel_merge_rows(
 
 
 # ---------------------------------------------------------------------------
-# Anti-504 Gemini AI Extraction Helper
+# Anti-504 Gemini AI Extraction & Marketing Text Generation Helpers
 # ---------------------------------------------------------------------------
 class ScanUnavailableError(Exception):
     """Raised when all free models are temporarily busy or timed out."""
@@ -2034,7 +2083,7 @@ def extract_card_details(
         "- Put ONLY the clean English city/town name in `city` (e.g., 'Ahmedabad', 'Mumbai', 'Kapadvanj', 'Dakor'). "
         "Do not put street, state, or PIN code in `city`. Infer from the address or PIN code if unambiguous; else 'N/A'.\n\n"
         "EXTRA DETAILS RULE:\n"
-        "- Put any extra printed details (like Website, GSTIN, PAN, Instagram, LinkedIn, Branch, Office Timings, "
+        "- Put any extra printed details (like Website, GSTIN, PAN, Fax, Instagram, LinkedIn, Branch, Office Timings, "
         "ISO certification) into `extra_details` as {label, value} items so nothing printed on the card is lost.\n\n"
         "OTHER RULES:\n"
         "- For `products_services`: if not explicitly listed, infer what the company offers from the company name, "
@@ -2108,6 +2157,47 @@ def extract_card_details(
     )
 
 
+def generate_marketing_ai_text(prompt: str, api_key: str) -> str:
+    """Run a fast, timeout-protected Gemini text call across the free model chain."""
+    if not api_key or not api_key.strip():
+        raise ValueError("Gemini API key is missing. Add it in Sidebar → Settings.")
+
+    started_at = time.monotonic()
+    for model in MODEL_CHAIN:
+        elapsed = time.monotonic() - started_at
+        remaining_sec = TOTAL_SCAN_BUDGET_SEC - elapsed
+        if remaining_sec < 4.0:
+            break
+
+        attempt_timeout_ms = min(PER_REQUEST_TIMEOUT_MS, int(remaining_sec * 1000))
+        client = genai.Client(
+            api_key=api_key.strip(),
+            http_options=types.HttpOptions(timeout=attempt_timeout_ms),
+        )
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=types.GenerateContentConfig(max_output_tokens=1600),
+            )
+            if response.text and response.text.strip():
+                return response.text.strip()
+        except genai_errors.APIError as api_err:
+            if api_err.code in (401, 403):
+                raise ValueError(
+                    "The configured Gemini API key was rejected. Please check your key in Settings."
+                ) from api_err
+            time.sleep(0.4)
+            continue
+        except Exception:
+            time.sleep(0.4)
+            continue
+
+    raise ScanUnavailableError(
+        "The AI assistant is momentarily busy. Please try again in a few seconds."
+    )
+
+
 def run_scan(image_files: list, api_key: str, user_id: str) -> None:
     if not api_key:
         st.warning("Scanner API key is not configured yet. Add it in Sidebar → Settings.")
@@ -2172,7 +2262,6 @@ def run_scan(image_files: list, api_key: str, user_id: str) -> None:
 
 
 def open_blank_manual_form() -> None:
-    """Open an empty manual entry form (no N/A defaults) and smoothly scroll down to it."""
     st.session_state["extracted_card"] = {
         "company_name": "",
         "contact_person": "",
@@ -2203,7 +2292,7 @@ def render_auth_screen() -> None:
     with center_col:
         st.title("Company Visiting Card Scanner")
         st.caption(
-            "Sign in or create an account to scan, organize, and export your visiting cards."
+            "Sign in or create an account to scan, organize, analyze, and export your visiting cards."
         )
 
         with st.container(border=True):
@@ -2431,6 +2520,639 @@ def render_auth_screen() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Analyze & Growth Hub (Marketing Intelligence, Outreach & AI Strategist)
+# ---------------------------------------------------------------------------
+def _compute_analytics_tables(
+    df: pd.DataFrame,
+) -> Tuple[dict[str, Any], pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Compute marketing KPIs, city territories, product demand, and growth timeline."""
+    total_leads = len(df)
+    if total_leads == 0:
+        return {}, pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    has_wp = df["WhatsApp No."].apply(lambda x: str(x).strip().upper() != "N/A")
+    has_call = df["Contact No."].apply(lambda x: str(x).strip().upper() != "N/A")
+    has_any_phone = has_wp | has_call
+    has_email = df["Email"].apply(lambda x: str(x).strip().upper() != "N/A")
+    has_city = df["City"].apply(lambda x: str(x).strip().upper() != "N/A")
+    has_website = df["Extra Details"].str.contains(
+        r"website|www\.|http|\.com|\.in|\.org|\.net", case=False, na=False
+    )
+
+    # Data completeness score across 6 core fields per lead
+    core_cols = [
+        "Company Name",
+        "Contact Person",
+        "WhatsApp No.",
+        "Email",
+        "Product / Services",
+        "City",
+    ]
+    filled_cells = 0
+    for col in core_cols:
+        filled_cells += int(
+            df[col].apply(lambda x: bool(str(x).strip()) and str(x).strip().upper() != "N/A").sum()
+        )
+    completeness_pct = round((filled_cells / (total_leads * len(core_cols))) * 100)
+
+    kpis = {
+        "total_leads": total_leads,
+        "wp_count": int(has_wp.sum()),
+        "wp_pct": round((has_wp.sum() / total_leads) * 100),
+        "phone_count": int(has_any_phone.sum()),
+        "email_count": int(has_email.sum()),
+        "email_pct": round((has_email.sum() / total_leads) * 100),
+        "city_count": int(
+            df.loc[has_city, "City"].astype(str).str.strip().str.title().nunique()
+        ),
+        "website_count": int(has_website.sum()),
+        "completeness_pct": completeness_pct,
+        "missing_city_count": int((~has_city).sum()),
+        "missing_email_count": int((~has_email).sum()),
+    }
+
+    # City-Wise Territory Breakdown
+    city_rows = []
+    temp_df = df.copy()
+    temp_df["_clean_city"] = temp_df["City"].apply(
+        lambda x: str(x).strip().title()
+        if str(x).strip() and str(x).strip().upper() != "N/A"
+        else "Unspecified"
+    )
+    temp_df["_has_wp"] = has_wp
+    temp_df["_has_email"] = has_email
+
+    for city_name, grp in temp_df.groupby("_clean_city", sort=False):
+        cnt = len(grp)
+        city_rows.append(
+            {
+                "City": city_name,
+                "Leads": cnt,
+                "Share (%)": round((cnt / total_leads) * 100, 1),
+                "WhatsApp Ready": int(grp["_has_wp"].sum()),
+                "Email Ready": int(grp["_has_email"].sum()),
+            }
+        )
+    city_df = pd.DataFrame(city_rows).sort_values(
+        by=["Leads", "WhatsApp Ready"], ascending=[False, False]
+    )
+
+    # Product / Services Demand Breakdown
+    prod_counter: Counter[str] = Counter()
+    for raw_prod in df["Product / Services"].tolist():
+        txt = str(raw_prod or "").strip()
+        if not txt or txt.upper() == "N/A":
+            continue
+        tokens = [
+            t.strip().title()
+            for t in re.split(r"[,;/|\n]+", txt)
+            if t.strip() and t.strip().upper() != "N/A"
+        ]
+        for tok in set(tokens):
+            prod_counter[tok] += 1
+
+    prod_df = pd.DataFrame(
+        [
+            {
+                "Product / Service": prod_name,
+                "Companies": count,
+                "Portfolio Share (%)": round((count / total_leads) * 100, 1),
+            }
+            for prod_name, count in prod_counter.most_common(15)
+        ]
+    )
+
+    # Daily Capture Timeline
+    parsed_dates = pd.to_datetime(df["Saved On"], errors="coerce").dropna()
+    if not parsed_dates.empty:
+        date_counts = parsed_dates.dt.strftime("%Y-%m-%d").value_counts().sort_index()
+        timeline_df = pd.DataFrame(
+            {"Date": date_counts.index.tolist(), "New Leads": date_counts.values.tolist()}
+        )
+    else:
+        timeline_df = pd.DataFrame(columns=["Date", "New Leads"])
+
+    return kpis, city_df, prod_df, timeline_df
+
+
+def _render_campaign_message(template: str, row: pd.Series) -> str:
+    company = (
+        str(row["Company Name"]).strip()
+        if str(row["Company Name"]).strip().upper() != "N/A"
+        else "your team"
+    )
+    raw_person = str(row["Contact Person"]).strip()
+    person = (
+        raw_person.split(",")[0].split("(")[0].strip()
+        if raw_person.upper() != "N/A"
+        else "Sir/Madam"
+    )
+    city = (
+        str(row["City"]).strip()
+        if str(row["City"]).strip().upper() != "N/A"
+        else "your city"
+    )
+    product = (
+        str(row["Product / Services"]).strip()
+        if str(row["Product / Services"]).strip().upper() != "N/A"
+        else "your business offerings"
+    )
+
+    msg = template
+    for key, val in (
+        ("{company}", company),
+        ("{person}", person),
+        ("{city}", city),
+        ("{product}", product),
+    ):
+        msg = msg.replace(key, val)
+    return msg
+
+
+def render_analyze_section(
+    all_records_df: pd.DataFrame,
+    current_username: str,
+    current_user_id: str,
+    active_api_key: str,
+    scans_remaining: int,
+) -> None:
+    with st.container(border=True):
+        hdr_col, exp_col = st.columns([3.8, 1.4])
+        with hdr_col:
+            st.subheader("Analyze & Growth Hub")
+            st.caption(
+                "Market intelligence, 1-click WhatsApp/Email campaigns, and AI growth playbooks built from your saved leads."
+            )
+
+        if all_records_df.empty:
+            st.info(
+                "Save or merge at least a few visiting cards first to unlock territory analytics, "
+                "campaign launchers, and AI marketing playbooks."
+            )
+            return
+
+        kpis, city_df, prod_df, timeline_df = _compute_analytics_tables(all_records_df)
+        full_export_df = build_expanded_dataframe(
+            all_records_df, include_extra_columns=True
+        )
+
+        with exp_col:
+            summary_df = pd.DataFrame(
+                [
+                    {"Metric": "Total Saved Leads", "Value": kpis["total_leads"]},
+                    {"Metric": "Cities Covered", "Value": kpis["city_count"]},
+                    {
+                        "Metric": "WhatsApp-Ready Leads",
+                        "Value": f"{kpis['wp_count']} ({kpis['wp_pct']}%)",
+                    },
+                    {
+                        "Metric": "Email-Ready Leads",
+                        "Value": f"{kpis['email_count']} ({kpis['email_pct']}%)",
+                    },
+                    {
+                        "Metric": "Leads with Website / Digital Presence",
+                        "Value": kpis["website_count"],
+                    },
+                    {
+                        "Metric": "Lead Data Completeness Score",
+                        "Value": f"{kpis['completeness_pct']}%",
+                    },
+                ]
+            )
+            sheets_pack: dict[str, pd.DataFrame] = {
+                "Executive Summary": summary_df,
+                "City Territories": city_df,
+                "All Leads": full_export_df,
+            }
+            if not prod_df.empty:
+                sheets_pack["Product Demand"] = prod_df
+
+            report_bytes = build_multi_sheet_excel_bytes(sheets_pack)
+            st.download_button(
+                label="Download Growth Report (.xlsx)",
+                data=report_bytes,
+                file_name=f"marketing_growth_report_{current_username}_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="btn_download_growth_report",
+            )
+
+        # Top Marketing KPIs
+        m1, m2, m3, m4 = st.columns(4)
+        with m1:
+            st.metric("Total Leads", kpis["total_leads"])
+        with m2:
+            st.metric(
+                "WhatsApp Reachable",
+                f"{kpis['wp_count']} ({kpis['wp_pct']}%)",
+            )
+        with m3:
+            st.metric(
+                "Email Reachable",
+                f"{kpis['email_count']} ({kpis['email_pct']}%)",
+            )
+        with m4:
+            st.metric(
+                "Lead Data Health",
+                f"{kpis['completeness_pct']}%",
+            )
+
+        if kpis["missing_city_count"] > 0 or kpis["missing_email_count"] > 0:
+            st.info(
+                f"**Quick-Win Data Enrichment:** **{kpis['missing_city_count']}** lead(s) are missing a City "
+                f"and **{kpis['missing_email_count']}** lead(s) are missing an Email. "
+                "Updating those records unlocks stronger city-targeted campaigns."
+            )
+
+        tab_market, tab_outreach, tab_ai_growth = st.tabs(
+            [
+                "Market & Territory Insights",
+                "1-Click WhatsApp & Email Campaigns",
+                "AI Marketing Strategist & Pitch",
+            ]
+        )
+
+        # ---- Sub-Tab 1: Market & Territory Insights ----
+        with tab_market:
+            c_left, c_right = st.columns(2)
+
+            with c_left:
+                st.markdown("#### City Territory Breakdown")
+                if not city_df.empty:
+                    top_cities_chart = city_df.head(10).set_index("City")["Leads"]
+                    st.bar_chart(top_cities_chart, use_container_width=True)
+                    st.dataframe(city_df, use_container_width=True, hide_index=True)
+
+            with c_right:
+                st.markdown("#### Top Products / Services in Network")
+                if not prod_df.empty:
+                    top_prods_chart = prod_df.head(10).set_index("Product / Service")[
+                        "Companies"
+                    ]
+                    st.bar_chart(top_prods_chart, use_container_width=True)
+                    st.dataframe(prod_df, use_container_width=True, hide_index=True)
+                else:
+                    st.info("Add Product / Services details to leads to see niche demand trends.")
+
+            if len(timeline_df) >= 2:
+                st.markdown("#### Lead Capture Velocity (Daily Growth)")
+                st.area_chart(
+                    timeline_df.set_index("Date")["New Leads"],
+                    use_container_width=True,
+                )
+
+        # ---- Sub-Tab 2: 1-Click WhatsApp & Email Campaign Launcher ----
+        with tab_outreach:
+            st.caption(
+                "Segment your contacts and launch instant personalized WhatsApp or Email outreach—zero third-party tools needed."
+            )
+
+            unique_cities = sorted(
+                {
+                    str(c).strip()
+                    for c in all_records_df["City"].dropna().tolist()
+                    if str(c).strip() and str(c).strip().upper() != "N/A"
+                }
+            )
+
+            f1, f2, f3 = st.columns([1.3, 1.5, 1.4])
+            with f1:
+                camp_city = st.selectbox(
+                    "Target City",
+                    options=["All Cities", *unique_cities],
+                    key="camp_target_city",
+                )
+            with f2:
+                camp_keyword = st.text_input(
+                    "Filter by Product / Company",
+                    placeholder="e.g., Educational, PVC, Ahmedabad...",
+                    key="camp_keyword_filter",
+                )
+            with f3:
+                camp_channel = st.selectbox(
+                    "Channel Filter",
+                    options=[
+                        "All Contacts",
+                        "WhatsApp Ready Only",
+                        "Email Ready Only",
+                    ],
+                    key="camp_channel_filter",
+                )
+
+            camp_df = all_records_df.copy()
+            if camp_city != "All Cities":
+                camp_df = camp_df[
+                    camp_df["City"].astype(str).str.strip().str.lower()
+                    == camp_city.lower()
+                ]
+            if camp_keyword.strip():
+                camp_df = search_records_df(camp_df, camp_keyword)
+            if camp_channel == "WhatsApp Ready Only":
+                camp_df = camp_df[
+                    camp_df["WhatsApp No."].apply(
+                        lambda x: str(x).strip().upper() != "N/A"
+                    )
+                ]
+            elif camp_channel == "Email Ready Only":
+                camp_df = camp_df[
+                    camp_df["Email"].apply(lambda x: str(x).strip().upper() != "N/A")
+                ]
+
+            templates = {
+                "Business Intro & Catalog": (
+                    "Hello {person},\n\n"
+                    "Greetings! We saved your contact from {company} ({city}). "
+                    "We'd love to share our latest product catalog and explore working together "
+                    "around {product}.\n\n"
+                    "Please let us know a good time to connect!"
+                ),
+                "Trade Fair / Meeting Follow-Up": (
+                    "Hello {person},\n\n"
+                    "It was great connecting with {company}! Following up on our discussion "
+                    "regarding {product} in {city}. Sharing our details here so we stay in touch."
+                ),
+                "Seasonal / Special Offer": (
+                    "Hello {person},\n\n"
+                    "Special update for our partners in {city}! We have fresh stock and priority pricing "
+                    "available this month. Reply 'CATALOG' to receive our latest price list for {company}."
+                ),
+                "Distributor / B2B Partnership": (
+                    "Hello {person},\n\n"
+                    "We are expanding our partner network in {city} and noticed {company}'s strong presence in "
+                    "{product}. Would you be open to a quick 5-minute call this week?"
+                ),
+            }
+
+            tpl_col1, tpl_col2 = st.columns([1.4, 2.6])
+            with tpl_col1:
+                chosen_tpl_name = st.selectbox(
+                    "Campaign Template",
+                    options=[*templates.keys(), "Custom Message"],
+                    key="camp_template_select",
+                )
+                st.caption(
+                    "Available tags: `{person}`, `{company}`, `{city}`, `{product}`"
+                )
+            with tpl_col2:
+                default_body = (
+                    "Hello {person}, reaching out to {company} regarding {product}."
+                    if chosen_tpl_name == "Custom Message"
+                    else templates[chosen_tpl_name]
+                )
+                message_template = st.text_area(
+                    "Message Template (editable)",
+                    value=default_body,
+                    height=115,
+                    key=f"camp_msg_box_{chosen_tpl_name}",
+                )
+
+            if camp_df.empty:
+                st.warning("No leads match the selected campaign filters.")
+            else:
+                # Build personalized campaign export sheet
+                campaign_rows = []
+                for _, r in camp_df.iterrows():
+                    personalized = _render_campaign_message(message_template, r)
+                    campaign_rows.append(
+                        {
+                            "Company Name": r["Company Name"],
+                            "Contact Person": r["Contact Person"],
+                            "WhatsApp No.": r["WhatsApp No."],
+                            "Contact No.": r["Contact No."],
+                            "Email": r["Email"],
+                            "City": r["City"],
+                            "Product / Services": r["Product / Services"],
+                            "Personalized Message": personalized,
+                        }
+                    )
+                campaign_export_df = pd.DataFrame(campaign_rows)
+
+                c_info, c_dl = st.columns([3, 1.5])
+                with c_info:
+                    st.markdown(
+                        f"**{len(camp_df)}** target contact(s) ready — tap **Send WhatsApp** or **Send Email** below:"
+                    )
+                with c_dl:
+                    st.download_button(
+                        label="Export Campaign List (.xlsx)",
+                        data=build_excel_bytes(campaign_export_df, "Campaign Leads"),
+                        file_name=f"campaign_outreach_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                        key="btn_export_campaign_xlsx",
+                    )
+
+                for idx, (_, r) in enumerate(camp_df.head(25).iterrows()):
+                    personalized = _render_campaign_message(message_template, r)
+                    wa_dial = extract_primary_wa_dial_number(
+                        str(r["WhatsApp No."]), str(r["Contact No."])
+                    )
+                    email_val = (
+                        str(r["Email"]).strip()
+                        if str(r["Email"]).strip().upper() != "N/A"
+                        else ""
+                    )
+
+                    links_html = ""
+                    if wa_dial:
+                        wa_url = f"https://wa.me/{wa_dial}?text={quote(personalized)}"
+                        links_html += (
+                            f'<a class="vcard-action-link vcard-wa-btn" '
+                            f'href="{wa_url}" target="_blank">Send WhatsApp ({r["WhatsApp No."] if r["WhatsApp No."] != "N/A" else r["Contact No."]})</a>'
+                        )
+                    if email_val:
+                        subj = quote(
+                            f"Connecting with {r['Company Name']} — {r['Product / Services']}"
+                        )
+                        mail_url = f"mailto:{email_val}?subject={subj}&body={quote(personalized)}"
+                        links_html += (
+                            f'<a class="vcard-action-link vcard-mail-btn" '
+                            f'href="{mail_url}" target="_blank">Send Email ({email_val})</a>'
+                        )
+                    if not links_html:
+                        links_html = '<span style="opacity:0.65;font-size:0.85rem;">No WhatsApp or Email saved for this contact.</span>'
+
+                    st.markdown(
+                        f"""
+                        <div class="vcard-outreach-card">
+                            <strong>{r['Company Name']}</strong> · {r['Contact Person']}
+                            <span style="opacity:0.75;">({r['City']} | {r['Product / Services']})</span><br/>
+                            {links_html}
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+                if len(camp_df) > 25:
+                    st.caption(
+                        f"Showing top 25 contacts on screen. Download the Excel sheet above to access all {len(camp_df)} personalized messages."
+                    )
+
+        # ---- Sub-Tab 3: AI Marketing Strategist & 1-to-1 Pitch Builder ----
+        with tab_ai_growth:
+            st.caption(
+                "Uses your free Gemini AI setup to generate growth strategies and custom sales pitches from your real lead data."
+            )
+
+            ai_mode = st.radio(
+                "Choose AI Marketing Tool",
+                options=[
+                    "Portfolio Growth & Campaign Playbook",
+                    "1-to-1 Company Sales Pitch Generator",
+                ],
+                horizontal=True,
+                key="ai_marketing_mode",
+            )
+
+            if ai_mode == "Portfolio Growth & Campaign Playbook":
+                goal_choice = st.selectbox(
+                    "Primary Marketing Goal",
+                    options=[
+                        "Increase Repeat B2B Orders & WhatsApp Conversions",
+                        "Expand into Top Cities & Appoint New Dealers/Distributors",
+                        "Re-engage Cold Contacts & Exhibition Leads",
+                        "Cross-Sell & Upsell Across Existing Product Categories",
+                    ],
+                    key="ai_growth_goal",
+                )
+
+                if st.button(
+                    "Generate AI Growth Playbook",
+                    type="primary",
+                    key="btn_gen_growth_playbook",
+                    disabled=(scans_remaining == 0),
+                ):
+                    top_cities_list = [
+                        f"{row['City']} ({row['Leads']} leads)"
+                        for _, row in city_df.head(6).iterrows()
+                    ]
+                    top_prods_list = [
+                        f"{row['Product / Service']} ({row['Companies']} companies)"
+                        for _, row in prod_df.head(8).iterrows()
+                    ]
+                    sample_companies = [
+                        f"- {r['Company Name']} ({r['City']}): {r['Product / Services']}"
+                        for _, r in all_records_df.head(8).iterrows()
+                    ]
+
+                    prompt = (
+                        "You are a senior B2B growth & marketing strategist for an Indian business.\n"
+                        f"Marketing Goal: {goal_choice}\n"
+                        f"Portfolio Metrics: {kpis['total_leads']} total leads across {kpis['city_count']} cities; "
+                        f"{kpis['wp_count']} WhatsApp-reachable ({kpis['wp_pct']}%); "
+                        f"{kpis['email_count']} Email-reachable ({kpis['email_pct']}%).\n"
+                        f"Top Cities: {', '.join(top_cities_list) if top_cities_list else 'Not specified'}.\n"
+                        f"Top Product/Service Categories: {', '.join(top_prods_list) if top_prods_list else 'Various'}.\n"
+                        f"Sample Accounts:\n" + "\n".join(sample_companies) + "\n\n"
+                        "Provide a crisp, practical, high-impact marketing action plan with:\n"
+                        "1. **Top 3 Territory & Segment Growth Moves** tailored to these exact cities and industries.\n"
+                        "2. **Ready-to-Send WhatsApp Broadcast Script** (under 90 words, warm Indian B2B tone, with clear CTA).\n"
+                        "3. **High-Converting Email Subject Lines & Cold/Warm Follow-Up Email**.\n"
+                        "4. **7-Day Execution Checklist** for the sales & marketing team."
+                    )
+
+                    with st.spinner("Building your custom marketing playbook..."):
+                        try:
+                            playbook_md = generate_marketing_ai_text(
+                                prompt, active_api_key
+                            )
+                            try:
+                                increment_user_scan_count(current_user_id)
+                            except Exception:
+                                pass
+                            st.session_state["ai_growth_output"] = playbook_md
+                        except ValueError as v_err:
+                            st.warning(str(v_err))
+                        except ScanUnavailableError as b_err:
+                            st.warning(str(b_err))
+                        except Exception:
+                            st.warning(
+                                "Could not generate the playbook right now. Please try again."
+                            )
+
+                if st.session_state.get("ai_growth_output"):
+                    st.markdown(st.session_state["ai_growth_output"])
+
+            else:
+                pitch_query = st.text_input(
+                    "Search company for 1-to-1 pitch",
+                    placeholder="Type company name, contact person, or city...",
+                    key="ai_pitch_search",
+                )
+                pitch_candidates = (
+                    search_records_df(all_records_df, pitch_query)
+                    if pitch_query.strip()
+                    else all_records_df.head(15)
+                )
+
+                if pitch_candidates.empty:
+                    st.info("No matching company found.")
+                else:
+                    pitch_options = {
+                        _record_summary_label(pitch_candidates.iloc[i]): pitch_candidates.iloc[
+                            i
+                        ].to_dict()
+                        for i in range(len(pitch_candidates))
+                    }
+                    chosen_pitch_label = st.selectbox(
+                        "Select target company",
+                        options=list(pitch_options.keys()),
+                        key="ai_pitch_company_select",
+                    )
+                    offer_context = st.text_input(
+                        "What are you pitching to them? (optional)",
+                        placeholder="e.g., Bulk supply discount, dealership partnership, new product line...",
+                        key="ai_pitch_offer_input",
+                    )
+
+                    if st.button(
+                        "Generate Custom Sales Pitch",
+                        type="primary",
+                        key="btn_gen_company_pitch",
+                        disabled=(scans_remaining == 0),
+                    ):
+                        target = pitch_options[chosen_pitch_label]
+                        prompt = (
+                            "You are an expert B2B sales copywriter in India. Write a tailored 1-to-1 outreach kit "
+                            "for this specific visiting card contact:\n"
+                            f"- Company: {target['Company Name']}\n"
+                            f"- Contact Person: {target['Contact Person']}\n"
+                            f"- City: {target['City']}\n"
+                            f"- Their Products/Services: {target['Product / Services']}\n"
+                            f"- Extra Info: {target.get('Extra Details') or 'N/A'}\n"
+                            f"- Notes: {target['Notes']}\n"
+                            f"- Our Offer/Angle: {offer_context.strip() or 'Introduce our products/services and explore B2B collaboration'}\n\n"
+                            "Deliver:\n"
+                            "1. **WhatsApp First-Touch Message** (short, personalized, non-spammy).\n"
+                            "2. **30-Second Phone Call Opening Script**.\n"
+                            "3. **Follow-Up Email (Subject + Body)**.\n"
+                            "4. **2 Smart Discovery Questions** to ask on the call."
+                        )
+
+                        with st.spinner("Crafting personalized pitch..."):
+                            try:
+                                pitch_md = generate_marketing_ai_text(
+                                    prompt, active_api_key
+                                )
+                                try:
+                                    increment_user_scan_count(current_user_id)
+                                except Exception:
+                                    pass
+                                st.session_state["ai_pitch_output"] = pitch_md
+                            except ValueError as v_err:
+                                st.warning(str(v_err))
+                            except ScanUnavailableError as b_err:
+                                st.warning(str(b_err))
+                            except Exception:
+                                st.warning(
+                                    "Could not generate the pitch right now. Please try again."
+                                )
+
+                if st.session_state.get("ai_pitch_output"):
+                    st.markdown(st.session_state["ai_pitch_output"])
+
+
+# ---------------------------------------------------------------------------
 # Reusable UI Sections: Show Records, Search-Based Update, Search-Based Delete
 # ---------------------------------------------------------------------------
 def _record_summary_label(row: pd.Series) -> str:
@@ -2507,14 +3229,13 @@ def render_show_records_section(
             filtered_df = search_records_df(filtered_df, search_query)
 
         is_filtered = bool(search_query.strip()) or selected_city != "All Cities"
-        extra_col_names = collect_extra_column_names(filtered_df)
 
-        # Excel export ALWAYS expands extra_data keys (e.g., Website, GSTIN) into real columns
-        export_df = build_expanded_dataframe(filtered_df, include_extra_columns=True)
+        # Permanently expand all extra_data keys (e.g., Fax, Website, GSTIN) into table & Excel export
+        display_df = build_expanded_dataframe(filtered_df, include_extra_columns=True)
 
         with export_col:
-            if not export_df.empty:
-                excel_bytes = build_excel_bytes(export_df)
+            if not display_df.empty:
+                excel_bytes = build_excel_bytes(display_df)
                 city_suffix = (
                     f"_{re.sub(r'[^A-Za-z0-9]+', '_', selected_city).strip('_')}"
                     if selected_city != "All Cities"
@@ -2544,36 +3265,13 @@ def render_show_records_section(
                     key=f"{key_prefix}_download_disabled",
                 )
 
-        # Keep default 10-column table clean; offer quick toggle when extra columns exist
-        show_extra_in_table = False
-        if extra_col_names:
-            meta_col1, meta_col2 = st.columns([2.2, 2.8])
-            with meta_col1:
-                if is_filtered:
-                    st.caption(
-                        f"Showing **{len(filtered_df)}** of {len(all_records_df)} saved cards"
-                    )
-                else:
-                    st.caption(f"Total saved cards: **{len(all_records_df)}**")
-            with meta_col2:
-                preview_names = ", ".join(extra_col_names[:3])
-                more = f" +{len(extra_col_names) - 3} more" if len(extra_col_names) > 3 else ""
-                show_extra_in_table = st.checkbox(
-                    f"Show extra columns ({preview_names}{more}) — always included in Excel export",
-                    value=False,
-                    key=f"{key_prefix}_toggle_extra_cols",
-                )
+        if is_filtered:
+            st.caption(
+                f"Showing **{len(display_df)}** of {len(all_records_df)} saved cards"
+            )
         else:
-            if is_filtered:
-                st.caption(
-                    f"Showing **{len(filtered_df)}** of {len(all_records_df)} saved cards"
-                )
-            else:
-                st.caption(f"Total saved cards: **{len(all_records_df)}**")
+            st.caption(f"Total saved cards: **{len(all_records_df)}**")
 
-        display_df = build_expanded_dataframe(
-            filtered_df, include_extra_columns=show_extra_in_table
-        )
         st.dataframe(display_df, use_container_width=True, hide_index=True)
 
 
@@ -2705,7 +3403,7 @@ def _render_update_record_body(
             )
 
         upd_extra_text = st.text_area(
-            "Extra Details (Optional — Website, GSTIN, etc., one per line as Label: Value)",
+            "Extra Details (Optional — Website, GSTIN, Fax, etc., one per line as Label: Value)",
             value=existing_extra_text,
             placeholder=FIELD_PLACEHOLDERS["extra_details"],
             height=75,
@@ -2885,6 +3583,8 @@ def main() -> None:
         ("flash_info", None),
         ("scan_notice", None),
         ("reset_email_target", ""),
+        ("ai_growth_output", None),
+        ("ai_pitch_output", None),
     ):
         if key not in st.session_state:
             st.session_state[key] = default
@@ -2929,14 +3629,13 @@ def main() -> None:
         scans_used_today = 0
     scans_remaining = max(0, daily_limit - scans_used_today)
 
-    # Fetch user records once so both summary strip and sections stay in sync
     try:
         all_records_df = fetch_user_records(current_user_id)
     except Exception:
         st.error("Unable to load your saved cards right now. Please refresh.")
         return
 
-    # ---- Sidebar: Menu (with Logout), Account Info, Collapsible Settings ----
+    # ---- Sidebar: Menu (with Analyze & Logout), Account Info, Collapsible Settings ----
     with st.sidebar:
         st.markdown("### Menu")
         active_view = st.session_state["active_view"]
@@ -2944,6 +3643,7 @@ def main() -> None:
         nav_items = [
             ("home", "Home"),
             ("show", "Show Records"),
+            ("analyze", "Analyze & Growth"),
             ("update", "Update Record"),
             ("delete", "Delete Record"),
         ]
@@ -2958,7 +3658,6 @@ def main() -> None:
                 st.session_state["close_sidebar_seq"] += 1
                 st.rerun()
 
-        # Logout grouped cleanly with Menu navigation buttons (not inside Account)
         if st.button("Logout", use_container_width=True, key="nav_btn_logout"):
             logout_user_session()
             st.session_state["extracted_card"] = None
@@ -3040,13 +3739,23 @@ def main() -> None:
         st.info(st.session_state["flash_info"])
         st.session_state["flash_info"] = None
 
-    # ---- Dedicated Sidebar Views (Show / Update / Delete) ----
+    # ---- Dedicated Sidebar Views (Show / Analyze / Update / Delete) ----
     if active_view == "show":
         render_show_records_section(
             all_records_df=all_records_df,
             current_username=current_username,
             title="Your Saved Visiting Cards",
             key_prefix="nav_show",
+        )
+        return
+
+    if active_view == "analyze":
+        render_analyze_section(
+            all_records_df=all_records_df,
+            current_username=current_username,
+            current_user_id=current_user_id,
+            active_api_key=active_api_key,
+            scans_remaining=scans_remaining,
         )
         return
 
@@ -3252,7 +3961,6 @@ def main() -> None:
                             key=f"skip_excel_dups_{upload_rev}",
                         )
 
-                        # Preview top 5 formatted rows including any preserved extra columns
                         preview_records, _, _ = prepare_excel_merge_rows(
                             raw_excel_df.head(5),
                             chosen_mapping,
@@ -3513,7 +4221,7 @@ def main() -> None:
                         )
 
                     extra_details_text = st.text_area(
-                        "Extra Details (Optional — Website, GSTIN, etc., one per line as Label: Value)",
+                        "Extra Details (Optional — Website, GSTIN, Fax, etc., one per line as Label: Value)",
                         value="" if is_manual else card.get("extra_details_text", ""),
                         placeholder=FIELD_PLACEHOLDERS["extra_details"],
                         height=75,
