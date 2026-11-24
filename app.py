@@ -3073,12 +3073,7 @@ def generate_marketing_ai_text(prompt: str, api_key: str) -> str:
 
 
 def run_scan(image_files: list, api_key: str, user_id: str) -> None:
-    if not st.session_state.get("ai_consent_enabled", False):
-        st.warning(
-            "Please check the AI Data Notice box above to allow sending card images to Google Gemini AI, "
-            "or use **Fill Details Manually**."
-        )
-        return
+    
     if not api_key:
         st.warning("Scanner API key is not configured yet. Add it in Sidebar → Settings.")
         return
@@ -3170,21 +3165,6 @@ def open_blank_manual_form() -> None:
         "Manual entry — fill in at least one field below and click Save Card."
     )
 
-
-def render_ai_disclosure_control(key_suffix: str) -> bool:
-    """Render an explicit AI data disclosure and opt-in toggle so users can run AI-free."""
-    st.info(
-        "**AI Data Notice:** Scanning cards sends uploaded images to **Google Gemini API** for text extraction, "
-        "and AI Marketing tools send summary lead details (company, city, products/services) to **Google Gemini API**. "
-        "Leave the box below unchecked to use the app completely without AI (Manual Entry, Excel Merge, Search, Export & Campaigns)."
-    )
-    opted_in = st.checkbox(
-        "Allow sending card images / lead summaries to Google Gemini AI",
-        value=bool(st.session_state.get("ai_consent_enabled", False)),
-        key=f"ai_consent_chk_{key_suffix}",
-    )
-    st.session_state["ai_consent_enabled"] = opted_in
-    return opted_in
 
 
 # ---------------------------------------------------------------------------
@@ -3897,7 +3877,6 @@ def render_analyze_section(
                     )
 
         with tab_ai_growth:
-            ai_allowed = render_ai_disclosure_control("analyze_tab")
 
             ai_mode = st.radio(
                 "Choose AI Marketing Tool",
@@ -3925,7 +3904,7 @@ def render_analyze_section(
                     "Generate AI Growth Playbook",
                     type="primary",
                     key="btn_gen_growth_playbook",
-                    disabled=(scans_remaining == 0 or not ai_allowed),
+                    disabled=(scans_remaining == 0),
                 ):
                     try:
                         reserve_user_scan_slot(current_user_id, daily_limit)
@@ -4022,7 +4001,7 @@ def render_analyze_section(
                         "Generate Custom Sales Pitch",
                         type="primary",
                         key="btn_gen_company_pitch",
-                        disabled=(scans_remaining == 0 or not ai_allowed),
+                        disabled=(scans_remaining == 0),
                     ):
                         try:
                             reserve_user_scan_slot(current_user_id, daily_limit)
@@ -4620,7 +4599,6 @@ def main() -> None:
         ("reset_email_target", ""),
         ("ai_growth_output", None),
         ("ai_pitch_output", None),
-        ("ai_consent_enabled", False),
         ("otp_sends_this_session", 0),
     ):
         if key not in st.session_state:
@@ -4869,7 +4847,6 @@ def main() -> None:
         )
 
         with tab_upload:
-            ai_ok_upload = render_ai_disclosure_control("home_upload")
             uploaded_files = st.file_uploader(
                 "Upload 1 or 2 card photos (Front & Back — JPG or PNG, max 5 MB each)",
                 type=["jpg", "jpeg", "png"],
@@ -4901,12 +4878,11 @@ def main() -> None:
                         type="primary",
                         use_container_width=True,
                         key=f"btn_scan_upload_{upload_rev}",
-                        disabled=(scans_remaining == 0 or not ai_ok_upload),
+                        disabled=(scans_remaining == 0),
                     ):
                         run_scan(uploaded_files, active_api_key, current_user_id)
 
         with tab_camera:
-            ai_ok_camera = render_ai_disclosure_control("home_camera")
             cam_front = st.camera_input(
                 "Side 1 (Front) — Capture front of the visiting card",
                 key=f"card_camera_front_{upload_rev}",
@@ -4929,7 +4905,7 @@ def main() -> None:
                     type="primary",
                     use_container_width=True,
                     key=f"btn_scan_camera_{upload_rev}",
-                    disabled=(scans_remaining == 0 or not ai_ok_camera),
+                    disabled=(scans_remaining == 0),
                 ):
                     run_scan(captured_photos, active_api_key, current_user_id)
 
