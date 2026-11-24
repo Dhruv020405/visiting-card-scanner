@@ -1,2 +1,7 @@
+[server]
+enableCORS = true
+enableXsrfProtection = true
+maxUploadSize = 10
+
 [client]
 toolbarMode = "minimal"

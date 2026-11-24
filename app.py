@@ -1,12 +1,13 @@
-import base64
 import hashlib
 import hmac
+import html
 import io
 import json
 import os
 import re
 import secrets
 import smtplib
+import threading
 import time
 import unicodedata
 import uuid
@@ -28,9 +29,9 @@ from PIL import Image, ImageOps
 from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Configuration & Security Constants
 # ---------------------------------------------------------------------------
-SCHEMA_VERSION = "v7_analyze_marketing_hub"
+SCHEMA_VERSION = "v8_hardened_production"
 
 MODEL_CHAIN = [
     "gemini-3.5-flash-lite",
@@ -45,21 +46,41 @@ TOTAL_SCAN_BUDGET_SEC = 45.0
 MAX_IMAGE_SIDE_PX = 1400
 JPEG_QUALITY = 82
 
-# Free-tier protection, session & OTP settings
-DEFAULT_DAILY_SCAN_LIMIT = 40
-SESSION_TTL_SECONDS = 7 * 24 * 60 * 60  # 7-day browser session
-OTP_TTL_SECONDS = 10 * 60               # 10-minute email OTP validity
+# Upload & Import Safeguards
+MAX_CARD_IMAGES = 2
+MAX_IMAGE_FILE_BYTES = 5 * 1024 * 1024     # 5 MB max per card image
+MAX_EXCEL_FILE_BYTES = 2 * 1024 * 1024     # 2 MB max per Excel/CSV upload
+MAX_EXCEL_IMPORT_ROWS = 500                # Max 500 rows per import batch
+MAX_FIELD_LEN = 250
+MAX_LONG_FIELD_LEN = 800
 
+# Auth, Session & Rate-Limiting Constants
+MIN_SESSION_SECRET_LEN = 32
+MIN_PASSWORD_LENGTH = 10
+PBKDF2_ITERATIONS = 260_000
+DEFAULT_DAILY_SCAN_LIMIT = 40
+SESSION_TTL_SECONDS = 7 * 24 * 60 * 60     # 7-day revocable session
+OTP_TTL_SECONDS = 10 * 60                  # 10-minute OTP expiry
+MAX_OTP_GUESS_ATTEMPTS = 5                 # Lock OTP after 5 wrong guesses
+OTP_RESEND_COOLDOWN_SEC = 60               # 60s cooldown between OTP sends
+MAX_OTP_SENDS_PER_HOUR = 4                 # Max 4 OTP emails per hour per email
+MAX_LOGIN_ATTEMPTS = 5                     # Lock login after 5 failed guesses
+LOGIN_LOCKOUT_SECONDS = 15 * 60            # 15-minute login lockout
+
+# Google Sheets Worksheet Names
 CARDS_WORKSHEET = "visiting_cards"
 USERS_WORKSHEET = "users"
 USAGE_WORKSHEET = "scan_usage"
 RESETS_WORKSHEET = "password_resets"
 REGISTER_OTPS_WORKSHEET = "register_otps"
+SESSIONS_WORKSHEET = "sessions"
+RATE_LIMITS_WORKSHEET = "auth_rate_limits"
+AUDIT_LOGS_WORKSHEET = "audit_logs"
 
-PBKDF2_ITERATIONS = 260_000
-MAX_CARD_IMAGES = 2
+# Process-level lock to serialize quota, session, and duplicate write operations
+_WRITE_LOCK = threading.Lock()
 
-# Google Sheet column order (includes `extra_data` JSON column at the end)
+# Worksheet Schemas
 CARD_HEADERS = [
     "record_id",
     "user_id",
@@ -74,9 +95,9 @@ CARD_HEADERS = [
     "notes",
     "created_at",
     "extra_data",
+    "deleted_at",
 ]
 
-# Exact default table column order
 DEFAULT_TABLE_COLUMNS = [
     "Company Name",
     "Contact Person",
@@ -95,6 +116,7 @@ ALL_RECORD_COLUMNS = [
     *DEFAULT_TABLE_COLUMNS,
     "Extra Details",
     "Extra Data JSON",
+    "Deleted At",
 ]
 
 STANDARD_FIELD_LABELS_LOWER = {
@@ -119,6 +141,7 @@ STANDARD_FIELD_LABELS_LOWER = {
     "saved on",
     "record id",
     "user id",
+    "deleted at",
 }
 
 USER_HEADERS = [
@@ -142,10 +165,35 @@ OTP_HEADERS = [
     "code_hash",
     "expires_at",
     "used",
+    "attempts",
     "created_at",
 ]
 
-# Aliases for auto-mapping uploaded Excel/CSV columns to our standard fields
+SESSION_HEADERS = [
+    "session_id",
+    "user_id",
+    "token_hash",
+    "expires_at",
+    "revoked",
+    "created_at",
+]
+
+RATE_LIMIT_HEADERS = [
+    "limit_key",
+    "attempt_count",
+    "window_start",
+    "locked_until",
+]
+
+AUDIT_HEADERS = [
+    "log_id",
+    "user_id",
+    "action",
+    "record_id",
+    "details",
+    "created_at",
+]
+
 EXCEL_COLUMN_ALIASES: dict[str, list[str]] = {
     "company_name": [
         "company name",
@@ -251,7 +299,6 @@ EXCEL_COLUMN_ALIASES: dict[str, list[str]] = {
     ],
 }
 
-# Dummy placeholders used across Scan, Manual Entry, and Update forms
 FIELD_PLACEHOLDERS = {
     "company_name": "e.g., Apex Industrial Solutions",
     "contact_person": "e.g., Rajesh Patel (Sales Manager)",
@@ -280,7 +327,6 @@ def inject_clean_ui_css() -> None:
     st.markdown(
         """
         <style>
-            /* Hide GitHub, Fork, Deploy & extra chrome while keeping sidebar toggle intact */
             [data-testid="stToolbarActions"],
             [data-testid="stActionButtonIcon"],
             [data-testid="stAppDeployButton"],
@@ -296,14 +342,12 @@ def inject_clean_ui_css() -> None:
                 visibility: hidden !important;
             }
 
-            /* Balanced layout spacing for desktop and mobile */
             .block-container {
                 padding-top: 1.4rem;
                 padding-bottom: 2.5rem;
                 max-width: 1200px;
             }
 
-            /* Touch-friendly rounded buttons */
             .stButton > button,
             .stDownloadButton > button,
             .stFormSubmitButton > button {
@@ -312,7 +356,6 @@ def inject_clean_ui_css() -> None:
                 font-weight: 500;
             }
 
-            /* Keep card image previews & camera compact on laptop and phone */
             [data-testid="stImage"] img {
                 max-height: 240px !important;
                 max-width: min(300px, 100%) !important;
@@ -326,7 +369,6 @@ def inject_clean_ui_css() -> None:
                 max-width: 420px;
             }
 
-            /* Compact summary pill strip */
             .vcard-stat-strip {
                 display: flex;
                 flex-wrap: wrap;
@@ -350,7 +392,6 @@ def inject_clean_ui_css() -> None:
                 font-weight: 600;
             }
 
-            /* Outreach action pills */
             .vcard-outreach-card {
                 padding: 0.85rem 1rem;
                 border-radius: 10px;
@@ -377,35 +418,23 @@ def inject_clean_ui_css() -> None:
                 color: #ffffff !important;
             }
 
-            /* Smooth slide-down reveal for the card form */
             @keyframes vcardSlideDown {
-                from {
-                    opacity: 0;
-                    transform: translateY(-10px);
-                }
-                to {
-                    opacity: 1;
-                    transform: translateY(0);
-                }
+                from { opacity: 0; transform: translateY(-10px); }
+                to { opacity: 1; transform: translateY(0); }
             }
             .vcard-form-anchor {
                 scroll-margin-top: 1rem;
                 animation: vcardSlideDown 0.3s ease-out;
             }
 
-            /* Mobile tweaks */
             @media (max-width: 768px) {
                 .block-container {
                     padding-top: 0.9rem;
                     padding-left: 0.85rem;
                     padding-right: 0.85rem;
                 }
-                h1 {
-                    font-size: 1.65rem !important;
-                }
-                h2, h3 {
-                    font-size: 1.2rem !important;
-                }
+                h1 { font-size: 1.65rem !important; }
+                h2, h3 { font-size: 1.2rem !important; }
             }
         </style>
         """,
@@ -419,7 +448,7 @@ def inject_clean_ui_css() -> None:
 _SESSION_BRIDGE_JS = """
 export default function(component) {
     const { data, setStateValue } = component;
-    const STORAGE_KEY = "vcard_scanner_auth_token_v1";
+    const STORAGE_KEY = "vcard_scanner_auth_token_v2";
     const action = (data && data.action) || "read";
     const desiredToken = (data && data.token) || "";
 
@@ -536,7 +565,7 @@ def trigger_ui_bridge() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Secret, Session Token, Hashing, Phone & Extra-Data Helpers
+# Secret, Session Signing, Password Policy & Normalization Helpers
 # ---------------------------------------------------------------------------
 def get_secret(key: str, default: Any = None) -> Any:
     try:
@@ -563,127 +592,26 @@ def get_quota_date_str() -> str:
     return datetime.now(tz).strftime("%Y-%m-%d")
 
 
-def _get_session_signing_key() -> bytes:
-    explicit = get_secret("SESSION_SECRET")
-    if explicit:
-        material = str(explicit)
-    else:
-        creds = get_secret("gcp_service_account")
-        if creds and "private_key" in creds:
-            material = str(creds["private_key"])
-        else:
-            material = str(get_secret("GEMINI_API_KEY", "local-dev-session-key"))
-    return hashlib.sha256(f"vcard-session-v2:{material}".encode("utf-8")).digest()
-
-
-def create_session_token(user_id: str) -> str:
-    expires_at = int(time.time()) + SESSION_TTL_SECONDS
-    payload = f"{user_id}|{expires_at}"
-    sig = hmac.new(
-        _get_session_signing_key(), payload.encode("utf-8"), hashlib.sha256
-    ).hexdigest()[:32]
-    raw = f"{payload}|{sig}".encode("utf-8")
-    return base64.urlsafe_b64encode(raw).decode("ascii")
-
-
-def verify_session_token(token: str) -> Optional[str]:
-    try:
-        decoded = base64.urlsafe_b64decode(token.encode("ascii")).decode("utf-8")
-        user_id, exp_str, sig = decoded.split("|")
-        expires_at = int(exp_str)
-        if expires_at < int(time.time()):
-            return None
-        payload = f"{user_id}|{expires_at}"
-        expected_sig = hmac.new(
-            _get_session_signing_key(), payload.encode("utf-8"), hashlib.sha256
-        ).hexdigest()[:32]
-        if hmac.compare_digest(sig, expected_sig):
-            return user_id
-    except Exception:
-        return None
-    return None
-
-
-def login_user_session(user: dict[str, str]) -> None:
-    token = create_session_token(user["user_id"])
-    st.session_state["auth_user"] = user
-    st.session_state["session_token"] = token
-    st.session_state["session_action"] = "set"
-    st.session_state["active_view"] = "home"
-
-
-def logout_user_session() -> None:
-    st.session_state["auth_user"] = None
-    st.session_state["session_token"] = None
-    st.session_state["session_action"] = "clear"
-    st.session_state["active_view"] = "home"
-
-
-def sync_and_restore_session() -> Tuple[Optional[dict[str, str]], bool]:
-    try:
-        if "session" in st.query_params:
-            st.query_params.pop("session", None)
-    except Exception:
-        pass
-
-    if _SESSION_BRIDGE is None:
-        return st.session_state.get("auth_user"), False
-
-    action = st.session_state.get("session_action", "read")
-    token_to_write = st.session_state.get("session_token") or ""
-
-    if action == "set" and st.session_state.get("auth_user") and token_to_write:
-        _SESSION_BRIDGE(
-            data={"action": "set", "token": token_to_write},
-            default={"token": token_to_write},
-            key="session_bridge",
-            on_token_change=lambda: None,
+def get_required_session_signing_key() -> bytes:
+    """
+    Require an explicit, dedicated SESSION_SECRET (>= 32 chars) in Secrets/Env.
+    Never falls back to API keys or hardcoded defaults.
+    """
+    raw_secret = str(get_secret("SESSION_SECRET", "") or "").strip()
+    if len(raw_secret) < MIN_SESSION_SECRET_LEN:
+        raise ValueError(
+            f"`SESSION_SECRET` is missing or shorter than {MIN_SESSION_SECRET_LEN} characters. "
+            "Generate a random 64-character secret and add `SESSION_SECRET = \"...\"` to Streamlit Secrets."
         )
-        return st.session_state["auth_user"], False
+    return hashlib.sha256(f"vcard-session-v3:{raw_secret}".encode("utf-8")).digest()
 
-    if action == "clear":
-        res = _SESSION_BRIDGE(
-            data={"action": "clear"},
-            default={"token": "__clearing__"},
-            key="session_bridge",
-            on_token_change=lambda: None,
-        )
-        if res and res.get("token") == "__none__":
-            st.session_state["session_action"] = "read"
-        return None, False
 
-    if st.session_state.get("auth_user") is not None:
-        return st.session_state["auth_user"], False
-
-    res = _SESSION_BRIDGE(
-        data={"action": "read"},
-        default={"token": "__loading__"},
-        key="session_bridge",
-        on_token_change=lambda: None,
-    )
-    stored_token = res.get("token", "__loading__") if res else "__loading__"
-
-    if stored_token == "__loading__":
-        return None, True
-
-    if stored_token and stored_token not in ("__none__", "__clearing__"):
-        user_id = verify_session_token(stored_token)
-        if user_id:
-            for user in fetch_all_users():
-                if user.get("user_id") == user_id:
-                    restored = {
-                        "user_id": user.get("user_id", ""),
-                        "username": user.get("username", ""),
-                        "email": user.get("email", ""),
-                        "role": user.get("role", "user"),
-                    }
-                    st.session_state["auth_user"] = restored
-                    st.session_state["session_token"] = stored_token
-                    st.session_state["session_action"] = "set"
-                    return restored, False
-        st.session_state["session_action"] = "clear"
-
-    return None, False
+def _hash_session_secret(raw_token_secret: str) -> str:
+    return hmac.new(
+        get_required_session_signing_key(),
+        raw_token_secret.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
 
 
 def hash_password(password: str) -> str:
@@ -710,12 +638,35 @@ def verify_password(password: str, stored_hash: str) -> bool:
         return False
 
 
+def validate_password_strength(password: str) -> Tuple[bool, str]:
+    """Enforce strong business account passwords (10+ chars, upper, lower, digit)."""
+    if len(password) < MIN_PASSWORD_LENGTH:
+        return False, f"Password must be at least {MIN_PASSWORD_LENGTH} characters long."
+    if not re.search(r"[A-Z]", password):
+        return False, "Password must include at least one uppercase letter (A–Z)."
+    if not re.search(r"[a-z]", password):
+        return False, "Password must include at least one lowercase letter (a–z)."
+    if not re.search(r"\d", password):
+        return False, "Password must include at least one number (0–9)."
+    return True, ""
+
+
 def is_valid_email(email: str) -> bool:
     return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email))
 
 
 def is_valid_username(username: str) -> bool:
     return bool(re.match(r"^[A-Za-z0-9_.-]{3,30}$", username))
+
+
+def sanitize_text_field(val: Any, max_len: int = MAX_FIELD_LEN) -> str:
+    """Normalize digits, strip control characters, and enforce length bounds."""
+    if val is None:
+        return ""
+    cleaned = normalize_digits(str(val)).replace("\x00", "").strip()
+    if len(cleaned) > max_len:
+        cleaned = cleaned[:max_len].strip()
+    return cleaned
 
 
 def has_at_least_one_field(*values: str) -> bool:
@@ -734,7 +685,6 @@ def normalize_digits(text: str) -> str:
 
 
 def format_phone_numbers(raw: str) -> str:
-    """Format phone/WhatsApp numbers cleanly as '9876543210 / 9123456789'."""
     if not raw or str(raw).strip().upper() in ("N/A", "NAN", "NONE"):
         return "N/A"
     text = normalize_digits(str(raw)).strip()
@@ -775,7 +725,6 @@ def extract_normalized_phones(phone_str: str) -> set[str]:
 
 
 def extract_primary_wa_dial_number(wp_str: str, fallback_call_str: str = "") -> str:
-    """Return a clean 10-digit Indian or international digits string for wa.me links."""
     for candidate in (wp_str, fallback_call_str):
         formatted = format_phone_numbers(candidate)
         if formatted == "N/A":
@@ -797,7 +746,7 @@ def extract_normalized_emails(email_str: str) -> set[str]:
 
 
 # ---------------------------------------------------------------------------
-# Extra Data (JSON Column -> Auto-Expanded Columns in Table & Excel Export)
+# Extra Data Helpers (JSON Column -> Auto-Expanded Columns)
 # ---------------------------------------------------------------------------
 def parse_extra_data(raw_json: str) -> dict[str, str]:
     if not raw_json or not str(raw_json).strip():
@@ -808,8 +757,8 @@ def parse_extra_data(raw_json: str) -> dict[str, str]:
             return {}
         cleaned: dict[str, str] = {}
         for k, v in parsed.items():
-            ck = str(k).strip()
-            cv = normalize_digits(str(v)).strip()
+            ck = sanitize_text_field(k, 80)
+            cv = sanitize_text_field(v, MAX_FIELD_LEN)
             if ck and cv and cv.upper() != "N/A":
                 cleaned[ck] = cv
         return cleaned
@@ -819,15 +768,15 @@ def parse_extra_data(raw_json: str) -> dict[str, str]:
 
 def serialize_extra_data(extra: dict[str, str]) -> str:
     cleaned = {
-        str(k).strip(): normalize_digits(str(v)).strip()
+        sanitize_text_field(k, 80): sanitize_text_field(v, MAX_FIELD_LEN)
         for k, v in extra.items()
-        if str(k).strip()
-        and normalize_digits(str(v)).strip()
-        and normalize_digits(str(v)).strip().upper() != "N/A"
+        if sanitize_text_field(k, 80)
+        and sanitize_text_field(v, MAX_FIELD_LEN)
+        and sanitize_text_field(v, MAX_FIELD_LEN).upper() != "N/A"
     }
     if not cleaned:
         return ""
-    return json.dumps(cleaned, ensure_ascii=False)
+    return json.dumps(cleaned, ensure_ascii=False)[:MAX_LONG_FIELD_LEN]
 
 
 def format_extra_data_for_input(extra: dict[str, str]) -> str:
@@ -848,23 +797,23 @@ def parse_extra_data_from_input(text: str) -> dict[str, str]:
             continue
         if ":" in line:
             k, v = line.split(":", 1)
-            ck = k.strip()
-            cv = normalize_digits(v).strip()
+            ck = sanitize_text_field(k, 80)
+            cv = sanitize_text_field(v, MAX_FIELD_LEN)
             if ck and cv and cv.upper() != "N/A":
                 result[ck] = cv
         elif "=" in line:
             k, v = line.split("=", 1)
-            ck = k.strip()
-            cv = normalize_digits(v).strip()
+            ck = sanitize_text_field(k, 80)
+            cv = sanitize_text_field(v, MAX_FIELD_LEN)
             if ck and cv and cv.upper() != "N/A":
                 result[ck] = cv
         else:
-            other_lines.append(normalize_digits(line))
+            other_lines.append(sanitize_text_field(line, MAX_FIELD_LEN))
 
     if other_lines:
         existing_other = result.get("Other Info", "")
         combined = " | ".join([x for x in [existing_other, *other_lines] if x])
-        result["Other Info"] = combined
+        result["Other Info"] = sanitize_text_field(combined, MAX_FIELD_LEN)
 
     return result
 
@@ -893,7 +842,6 @@ def collect_extra_column_names(df: pd.DataFrame) -> list[str]:
 def build_expanded_dataframe(
     df: pd.DataFrame, include_extra_columns: bool = True
 ) -> pd.DataFrame:
-    """Expand all `extra_data` keys into real columns at the right end (filling 'N/A' where absent)."""
     base_df = df[DEFAULT_TABLE_COLUMNS].copy()
     if not include_extra_columns or df.empty or "Extra Data JSON" not in df.columns:
         return base_df
@@ -1033,13 +981,13 @@ class VisitingCard(BaseModel):
 
 
 def _clean_card_output(card: VisitingCard) -> Tuple[VisitingCard, dict[str, str]]:
-    raw_city = normalize_digits(card.city).strip()
+    raw_city = sanitize_text_field(card.city, 100)
     clean_city = raw_city if raw_city and raw_city.upper() != "N/A" else "N/A"
 
     extra_dict: dict[str, str] = {}
     for item in card.extra_details or []:
-        lbl = normalize_digits(item.label).strip()
-        val = normalize_digits(item.value).strip()
+        lbl = sanitize_text_field(item.label, 80)
+        val = sanitize_text_field(item.value, MAX_FIELD_LEN)
         if (
             lbl
             and val
@@ -1050,13 +998,13 @@ def _clean_card_output(card: VisitingCard) -> Tuple[VisitingCard, dict[str, str]
 
     cleaned = card.model_copy(
         update={
-            "company_name": normalize_digits(card.company_name).strip() or "N/A",
-            "contact_person": normalize_digits(card.contact_person).strip() or "N/A",
+            "company_name": sanitize_text_field(card.company_name, MAX_FIELD_LEN) or "N/A",
+            "contact_person": sanitize_text_field(card.contact_person, MAX_FIELD_LEN) or "N/A",
             "call_phone": format_phone_numbers(card.call_phone),
             "whatsapp_phone": format_phone_numbers(card.whatsapp_phone),
-            "email": normalize_digits(card.email).strip() or "N/A",
-            "products_services": normalize_digits(card.products_services).strip() or "N/A",
-            "address": normalize_digits(card.address).strip() or "N/A",
+            "email": sanitize_text_field(card.email, 160) or "N/A",
+            "products_services": sanitize_text_field(card.products_services, MAX_FIELD_LEN) or "N/A",
+            "address": sanitize_text_field(card.address, MAX_LONG_FIELD_LEN) or "N/A",
             "city": clean_city,
         }
     )
@@ -1068,6 +1016,9 @@ def _clean_card_output(card: VisitingCard) -> Tuple[VisitingCard, dict[str, str]
 # ---------------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def get_spreadsheet(_schema_version: str = SCHEMA_VERSION) -> gspread.Spreadsheet:
+    # Validate dedicated SESSION_SECRET upfront before opening storage
+    get_required_session_signing_key()
+
     creds_section = get_secret("gcp_service_account")
     sheet_url = get_secret("GSHEET_URL")
 
@@ -1134,6 +1085,7 @@ def _migrate_cards_worksheet_if_needed(cards_ws: gspread.Worksheet) -> None:
             "notes": old_rec.get("notes", ""),
             "created_at": old_rec.get("created_at", ""),
             "extra_data": old_rec.get("extra_data", ""),
+            "deleted_at": old_rec.get("deleted_at", ""),
         }
         migrated_rows.append([new_rec[col] for col in CARD_HEADERS])
 
@@ -1161,14 +1113,20 @@ def ensure_worksheets(spreadsheet: gspread.Spreadsheet) -> None:
         (USAGE_WORKSHEET, USAGE_HEADERS),
         (RESETS_WORKSHEET, OTP_HEADERS),
         (REGISTER_OTPS_WORKSHEET, OTP_HEADERS),
+        (SESSIONS_WORKSHEET, SESSION_HEADERS),
+        (RATE_LIMITS_WORKSHEET, RATE_LIMIT_HEADERS),
+        (AUDIT_LOGS_WORKSHEET, AUDIT_HEADERS),
     ):
         if ws_name not in existing_titles:
             ws = spreadsheet.add_worksheet(title=ws_name, rows=500, cols=len(headers))
             ws.append_row(headers, value_input_option="RAW")
         else:
             ws = spreadsheet.worksheet(ws_name)
-            if not ws.row_values(1):
+            first_row = ws.row_values(1)
+            if not first_row:
                 ws.append_row(headers, value_input_option="RAW")
+            elif first_row != headers and ws.col_count < len(headers):
+                ws.resize(cols=len(headers))
 
 
 def _get_or_create_worksheet(title: str, headers: list[str]) -> gspread.Worksheet:
@@ -1205,67 +1163,407 @@ def get_register_otps_worksheet() -> gspread.Worksheet:
     return _get_or_create_worksheet(REGISTER_OTPS_WORKSHEET, OTP_HEADERS)
 
 
+def get_sessions_worksheet() -> gspread.Worksheet:
+    return _get_or_create_worksheet(SESSIONS_WORKSHEET, SESSION_HEADERS)
+
+
+def get_rate_limits_worksheet() -> gspread.Worksheet:
+    return _get_or_create_worksheet(RATE_LIMITS_WORKSHEET, RATE_LIMIT_HEADERS)
+
+
+def get_audit_logs_worksheet() -> gspread.Worksheet:
+    return _get_or_create_worksheet(AUDIT_LOGS_WORKSHEET, AUDIT_HEADERS)
+
+
 # ---------------------------------------------------------------------------
-# Per-User Daily Scan Quota Tracking
+# Audit History Logger
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=60, show_spinner=False)
-def _fetch_all_usage_rows() -> list[list[str]]:
+def append_audit_log(
+    user_id: str, action: str, record_id: str, details: str
+) -> None:
+    """Append an immutable audit log entry for create, edit, merge, delete, restore, or export."""
+    try:
+        ws = get_audit_logs_worksheet()
+        log_id = f"log_{uuid.uuid4().hex[:10]}"
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ws.append_row(
+            [
+                log_id,
+                user_id,
+                action,
+                record_id,
+                sanitize_text_field(details, 300),
+                timestamp,
+            ],
+            value_input_option="RAW",
+            table_range="A1",
+        )
+    except Exception:
+        pass
+
+
+def fetch_user_audit_logs(user_id: str, limit: int = 50) -> pd.DataFrame:
+    ws = get_audit_logs_worksheet()
+    rows = ws.get_all_values()
+    if len(rows) <= 1:
+        return pd.DataFrame(columns=["Timestamp", "Action", "Record ID", "Details"])
+
+    out = []
+    for row in rows[1:]:
+        if len(row) >= 6 and row[1] == user_id:
+            out.append(
+                {
+                    "Timestamp": row[5],
+                    "Action": row[2],
+                    "Record ID": row[3],
+                    "Details": row[4],
+                }
+            )
+    if not out:
+        return pd.DataFrame(columns=["Timestamp", "Action", "Record ID", "Details"])
+    return pd.DataFrame(out[::-1][:limit])
+
+
+# ---------------------------------------------------------------------------
+# Rate Limiting & Lockout Protection (Login & OTP Send)
+# ---------------------------------------------------------------------------
+def _check_rate_limit(
+    limit_key: str,
+    max_attempts: int,
+    window_seconds: int,
+    cooldown_seconds: int = 0,
+) -> Tuple[bool, str]:
+    """Check whether `limit_key` is locked out or in a cooldown period."""
+    ws = get_rate_limits_worksheet()
+    rows = ws.get_all_values()
+    now = int(time.time())
+
+    for row in rows[1:]:
+        if len(row) >= 4 and row[0] == limit_key:
+            try:
+                attempts = int(row[1])
+                window_start = int(row[2])
+                locked_until = int(row[3])
+            except ValueError:
+                return True, ""
+
+            if locked_until > now:
+                wait_sec = locked_until - now
+                mins, secs = divmod(wait_sec, 60)
+                wait_str = f"{mins}m {secs}s" if mins else f"{secs}s"
+                return False, f"Too many attempts. Please wait {wait_str} before trying again."
+
+            if now - window_start <= window_seconds:
+                if cooldown_seconds > 0 and (now - window_start) < cooldown_seconds:
+                    wait_cd = cooldown_seconds - (now - window_start)
+                    return False, f"Please wait {wait_cd}s before requesting another code."
+                if attempts >= max_attempts:
+                    return False, "Rate limit reached. Please try again later."
+            return True, ""
+
+    return True, ""
+
+
+def _record_rate_limit_event(
+    limit_key: str,
+    max_attempts: int,
+    window_seconds: int,
+    lockout_seconds: int,
+    reset_window_on_each_event: bool = False,
+) -> None:
+    """Increment attempt counter and apply lockout if threshold is reached."""
+    with _WRITE_LOCK:
+        ws = get_rate_limits_worksheet()
+        rows = ws.get_all_values()
+        now = int(time.time())
+
+        for row_idx, row in enumerate(rows[1:], start=2):
+            if len(row) >= 4 and row[0] == limit_key:
+                try:
+                    attempts = int(row[1])
+                    window_start = int(row[2])
+                except ValueError:
+                    attempts, window_start = 0, now
+
+                if now - window_start > window_seconds:
+                    new_attempts = 1
+                    new_window_start = now
+                else:
+                    new_attempts = attempts + 1
+                    new_window_start = now if reset_window_on_each_event else window_start
+
+                locked_until = (
+                    now + lockout_seconds if new_attempts >= max_attempts else 0
+                )
+                ws.update(
+                    values=[
+                        [
+                            limit_key,
+                            str(new_attempts),
+                            str(new_window_start),
+                            str(locked_until),
+                        ]
+                    ],
+                    range_name=f"A{row_idx}:D{row_idx}",
+                    value_input_option="RAW",
+                )
+                return
+
+        locked_until = now + lockout_seconds if 1 >= max_attempts else 0
+        ws.append_row(
+            [limit_key, "1", str(now), str(locked_until)],
+            value_input_option="RAW",
+            table_range="A1",
+        )
+
+
+def _clear_rate_limit(limit_key: str) -> None:
+    with _WRITE_LOCK:
+        ws = get_rate_limits_worksheet()
+        rows = ws.get_all_values()
+        for row_idx, row in enumerate(rows[1:], start=2):
+            if len(row) >= 1 and row[0] == limit_key:
+                ws.update(
+                    values=[[limit_key, "0", "0", "0"]],
+                    range_name=f"A{row_idx}:D{row_idx}",
+                    value_input_option="RAW",
+                )
+                return
+
+
+# ---------------------------------------------------------------------------
+# Server-Backed Revocable Sessions + Browser localStorage Bridge
+# ---------------------------------------------------------------------------
+def create_server_session(user_id: str) -> str:
+    """Create a revocable server-tracked session row and return `session_id.raw_secret`."""
+    session_id = f"sess_{uuid.uuid4().hex[:12]}"
+    raw_secret = secrets.token_urlsafe(32)
+    token_hash = _hash_session_secret(raw_secret)
+    expires_at = str(int(time.time()) + SESSION_TTL_SECONDS)
+    created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    with _WRITE_LOCK:
+        ws = get_sessions_worksheet()
+        ws.append_row(
+            [session_id, user_id, token_hash, expires_at, "no", created_at],
+            value_input_option="RAW",
+            table_range="A1",
+        )
+
+    return f"{session_id}.{raw_secret}"
+
+
+def verify_server_session(composite_token: str) -> Optional[str]:
+    """Verify session signature, expiry, and non-revoked status in Google Sheets."""
+    try:
+        if "." not in composite_token:
+            return None
+        session_id, raw_secret = composite_token.split(".", 1)
+        if not session_id.startswith("sess_") or not raw_secret:
+            return None
+
+        expected_hash = _hash_session_secret(raw_secret)
+        ws = get_sessions_worksheet()
+        rows = ws.get_all_values()
+        now = int(time.time())
+
+        for row in rows[1:]:
+            if len(row) >= 5 and row[0] == session_id:
+                user_id, stored_hash, exp_str, revoked = (
+                    row[1],
+                    row[2],
+                    row[3],
+                    row[4],
+                )
+                if revoked.strip().lower() == "yes":
+                    return None
+                if int(exp_str) < now:
+                    return None
+                if hmac.compare_digest(stored_hash, expected_hash):
+                    return user_id
+                return None
+    except Exception:
+        return None
+    return None
+
+
+def revoke_server_session(composite_token: Optional[str]) -> None:
+    """Revoke a specific session token server-side so it can never be reused."""
+    if not composite_token or "." not in composite_token:
+        return
+    session_id = composite_token.split(".", 1)[0]
+    try:
+        with _WRITE_LOCK:
+            ws = get_sessions_worksheet()
+            rows = ws.get_all_values()
+            for row_idx, row in enumerate(rows[1:], start=2):
+                if len(row) >= 5 and row[0] == session_id:
+                    ws.update(
+                        values=[["yes"]],
+                        range_name=f"E{row_idx}",
+                        value_input_option="RAW",
+                    )
+                    return
+    except Exception:
+        pass
+
+
+def revoke_all_user_sessions(user_id: str) -> int:
+    """Revoke every active session belonging to `user_id`."""
+    revoked_count = 0
+    with _WRITE_LOCK:
+        ws = get_sessions_worksheet()
+        rows = ws.get_all_values()
+        for row_idx, row in enumerate(rows[1:], start=2):
+            if (
+                len(row) >= 5
+                and row[1] == user_id
+                and row[4].strip().lower() != "yes"
+            ):
+                ws.update(
+                    values=[["yes"]],
+                    range_name=f"E{row_idx}",
+                    value_input_option="RAW",
+                )
+                revoked_count += 1
+    return revoked_count
+
+
+def login_user_session(user: dict[str, str]) -> None:
+    composite_token = create_server_session(user["user_id"])
+    st.session_state["auth_user"] = user
+    st.session_state["session_token"] = composite_token
+    st.session_state["session_action"] = "set"
+    st.session_state["active_view"] = "home"
+
+
+def logout_user_session() -> None:
+    revoke_server_session(st.session_state.get("session_token"))
+    st.session_state["auth_user"] = None
+    st.session_state["session_token"] = None
+    st.session_state["session_action"] = "clear"
+    st.session_state["active_view"] = "home"
+
+
+def sync_and_restore_session() -> Tuple[Optional[dict[str, str]], bool]:
+    try:
+        if "session" in st.query_params:
+            st.query_params.pop("session", None)
+    except Exception:
+        pass
+
+    if _SESSION_BRIDGE is None:
+        return st.session_state.get("auth_user"), False
+
+    action = st.session_state.get("session_action", "read")
+    token_to_write = st.session_state.get("session_token") or ""
+
+    if action == "set" and st.session_state.get("auth_user") and token_to_write:
+        _SESSION_BRIDGE(
+            data={"action": "set", "token": token_to_write},
+            default={"token": token_to_write},
+            key="session_bridge",
+            on_token_change=lambda: None,
+        )
+        return st.session_state["auth_user"], False
+
+    if action == "clear":
+        res = _SESSION_BRIDGE(
+            data={"action": "clear"},
+            default={"token": "__clearing__"},
+            key="session_bridge",
+            on_token_change=lambda: None,
+        )
+        if res and res.get("token") == "__none__":
+            st.session_state["session_action"] = "read"
+        return None, False
+
+    if st.session_state.get("auth_user") is not None:
+        return st.session_state["auth_user"], False
+
+    res = _SESSION_BRIDGE(
+        data={"action": "read"},
+        default={"token": "__loading__"},
+        key="session_bridge",
+        on_token_change=lambda: None,
+    )
+    stored_token = res.get("token", "__loading__") if res else "__loading__"
+
+    if stored_token == "__loading__":
+        return None, True
+
+    if stored_token and stored_token not in ("__none__", "__clearing__"):
+        user_id = verify_server_session(stored_token)
+        if user_id:
+            for user in fetch_all_users():
+                if user.get("user_id") == user_id:
+                    restored = {
+                        "user_id": user.get("user_id", ""),
+                        "username": user.get("username", ""),
+                        "email": user.get("email", ""),
+                        "role": user.get("role", "user"),
+                    }
+                    st.session_state["auth_user"] = restored
+                    st.session_state["session_token"] = stored_token
+                    st.session_state["session_action"] = "set"
+                    return restored, False
+        st.session_state["session_action"] = "clear"
+
+    return None, False
+
+
+# ---------------------------------------------------------------------------
+# Fail-Closed Per-User Daily Scan Quota Tracking
+# ---------------------------------------------------------------------------
+def get_user_scans_today(user_id: str) -> int:
+    """
+    Read today's successful scan count directly from Google Sheets (fail-closed:
+    raises on storage failure so quotas never silently reset to 0).
+    """
+    today = get_quota_date_str()
     ws = get_usage_worksheet()
     rows = ws.get_all_values()
-    if not rows:
-        ws.append_row(USAGE_HEADERS, value_input_option="RAW")
-        return [USAGE_HEADERS]
-    return rows
-
-
-def get_user_scans_today(user_id: str) -> int:
-    today = get_quota_date_str()
-    rows = _fetch_all_usage_rows()
     if len(rows) <= 1:
         return 0
     for row in rows[1:]:
         if len(row) >= 3 and row[0] == user_id and row[1] == today:
-            try:
-                return int(row[2])
-            except ValueError:
-                return 0
+            return int(row[2])
     return 0
 
 
 def increment_user_scan_count(user_id: str) -> int:
-    ws = get_usage_worksheet()
-    today = get_quota_date_str()
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    """Atomically increment `user_id`'s daily scan counter under lock (fail-closed)."""
+    with _WRITE_LOCK:
+        ws = get_usage_worksheet()
+        today = get_quota_date_str()
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    rows = ws.get_all_values()
-    if not rows:
-        ws.append_row(USAGE_HEADERS, value_input_option="RAW")
-        rows = [USAGE_HEADERS]
+        rows = ws.get_all_values()
+        if not rows:
+            ws.append_row(USAGE_HEADERS, value_input_option="RAW")
+            rows = [USAGE_HEADERS]
 
-    for row_idx, row in enumerate(rows[1:], start=2):
-        if len(row) >= 3 and row[0] == user_id and row[1] == today:
-            try:
+        for row_idx, row in enumerate(rows[1:], start=2):
+            if len(row) >= 3 and row[0] == user_id and row[1] == today:
                 current = int(row[2])
-            except ValueError:
-                current = 0
-            new_count = current + 1
-            ws.update(
-                values=[[str(new_count), now_str]],
-                range_name=f"C{row_idx}:D{row_idx}",
-                value_input_option="RAW",
-            )
-            _fetch_all_usage_rows.clear()
-            return new_count
+                new_count = current + 1
+                ws.update(
+                    values=[[str(new_count), now_str]],
+                    range_name=f"C{row_idx}:D{row_idx}",
+                    value_input_option="RAW",
+                )
+                return new_count
 
-    ws.append_row(
-        [user_id, today, "1", now_str], value_input_option="RAW", table_range="A1"
-    )
-    _fetch_all_usage_rows.clear()
-    return 1
+        ws.append_row(
+            [user_id, today, "1", now_str],
+            value_input_option="RAW",
+            table_range="A1",
+        )
+        return 1
 
 
 # ---------------------------------------------------------------------------
-# Email OTP Delivery & Verification Helpers (Register + Forgot Password)
+# Email OTP Delivery & Verification (With Resend Cooldown & Attempt Lockout)
 # ---------------------------------------------------------------------------
 def _send_otp_email(
     recipient_email: str, username: str, code: str, subject: str, purpose_line: str
@@ -1288,8 +1586,8 @@ def _send_otp_email(
     msg.set_content(
         f"Hello {username},\n\n"
         f"{purpose_line}: {code}\n\n"
-        f"This code is valid for 10 minutes. If you did not request this code, "
-        f"you can safely ignore this email.\n"
+        f"This code is valid for 10 minutes (maximum {MAX_OTP_GUESS_ATTEMPTS} verification attempts). "
+        f"If you did not request this code, please ignore this email.\n"
     )
 
     with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=15) as server:
@@ -1299,11 +1597,22 @@ def _send_otp_email(
 
 def _issue_otp(
     ws: gspread.Worksheet,
+    purpose_key: str,
     email: str,
     username: str,
     subject: str,
     purpose_line: str,
 ) -> Tuple[bool, str]:
+    rate_key = f"otp_send:{purpose_key}:{email}"
+    allowed, rate_msg = _check_rate_limit(
+        limit_key=rate_key,
+        max_attempts=MAX_OTP_SENDS_PER_HOUR,
+        window_seconds=3600,
+        cooldown_seconds=OTP_RESEND_COOLDOWN_SEC,
+    )
+    if not allowed:
+        return False, rate_msg
+
     code = f"{secrets.randbelow(900000) + 100000}"
     expires_at = str(int(time.time()) + OTP_TTL_SECONDS)
     created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1319,10 +1628,19 @@ def _issue_otp(
             "Could not send the verification email. Please check your SMTP settings and try again.",
         )
 
-    ws.append_row(
-        [email, code_hash, expires_at, "no", created_at],
-        value_input_option="RAW",
-        table_range="A1",
+    with _WRITE_LOCK:
+        ws.append_row(
+            [email, code_hash, expires_at, "no", "0", created_at],
+            value_input_option="RAW",
+            table_range="A1",
+        )
+
+    _record_rate_limit_event(
+        limit_key=rate_key,
+        max_attempts=MAX_OTP_SENDS_PER_HOUR,
+        window_seconds=3600,
+        lockout_seconds=3600,
+        reset_window_on_each_event=True,
     )
     return True, f"A 6-digit verification code has been sent to {email} (valid for 10 minutes)."
 
@@ -1336,43 +1654,68 @@ def _verify_and_consume_otp(
     if not re.match(r"^\d{6}$", clean_code):
         return False, "Please enter the 6-digit verification code from your email."
 
-    otp_rows = ws.get_all_values()
-    if len(otp_rows) <= 1:
-        return False, "No verification code found. Please request a new code."
+    with _WRITE_LOCK:
+        otp_rows = ws.get_all_values()
+        if len(otp_rows) <= 1:
+            return False, "No verification code found. Please request a new code."
 
-    matched_row_idx: Optional[int] = None
-    matched_data: Optional[list[str]] = None
-    for idx in range(len(otp_rows) - 1, 0, -1):
-        row = otp_rows[idx]
-        if (
-            len(row) >= 4
-            and row[0].strip().lower() == clean_email
-            and row[3].strip().lower() != "yes"
-        ):
-            matched_row_idx = idx + 1
-            matched_data = row
-            break
+        matched_row_idx: Optional[int] = None
+        matched_data: Optional[list[str]] = None
+        for idx in range(len(otp_rows) - 1, 0, -1):
+            row = otp_rows[idx]
+            if (
+                len(row) >= 4
+                and row[0].strip().lower() == clean_email
+                and row[3].strip().lower() == "no"
+            ):
+                matched_row_idx = idx + 1
+                matched_data = row
+                break
 
-    if matched_row_idx is None or matched_data is None:
-        return False, "No active code found for this email. Please request a new code."
+        if matched_row_idx is None or matched_data is None:
+            return False, "No active code found for this email. Please request a new code."
 
-    try:
-        expires_at = int(matched_data[2])
-    except ValueError:
-        return False, "Verification code is invalid. Please request a new code."
+        try:
+            expires_at = int(matched_data[2])
+            attempts = int(matched_data[4]) if len(matched_data) >= 5 and matched_data[4].isdigit() else 0
+        except ValueError:
+            return False, "Verification code is invalid. Please request a new code."
 
-    if int(time.time()) > expires_at:
-        return False, "This verification code has expired. Please request a new code."
+        if attempts >= MAX_OTP_GUESS_ATTEMPTS:
+            ws.update(
+                values=[["locked"]],
+                range_name=f"D{matched_row_idx}",
+                value_input_option="RAW",
+            )
+            return False, "Too many wrong attempts. This code is locked — please request a new code."
 
-    if not verify_password(clean_code, matched_data[1]):
-        return False, "Incorrect verification code. Please check your email and try again."
+        if int(time.time()) > expires_at:
+            ws.update(
+                values=[["expired"]],
+                range_name=f"D{matched_row_idx}",
+                value_input_option="RAW",
+            )
+            return False, "This verification code has expired. Please request a new code."
 
-    ws.update(
-        values=[["yes"]],
-        range_name=f"D{matched_row_idx}",
-        value_input_option="RAW",
-    )
-    return True, "Verified."
+        if not verify_password(clean_code, matched_data[1]):
+            new_attempts = attempts + 1
+            new_status = "locked" if new_attempts >= MAX_OTP_GUESS_ATTEMPTS else "no"
+            ws.update(
+                values=[[new_status, str(new_attempts)]],
+                range_name=f"D{matched_row_idx}:E{matched_row_idx}",
+                value_input_option="RAW",
+            )
+            remaining = MAX_OTP_GUESS_ATTEMPTS - new_attempts
+            if remaining <= 0:
+                return False, "Too many wrong attempts. This code is locked — please request a new code."
+            return False, f"Incorrect verification code ({remaining} attempt(s) remaining)."
+
+        ws.update(
+            values=[["yes", str(attempts + 1)]],
+            range_name=f"D{matched_row_idx}:E{matched_row_idx}",
+            value_input_option="RAW",
+        )
+        return True, "Verified."
 
 
 # ---------------------------------------------------------------------------
@@ -1409,8 +1752,10 @@ def start_registration_otp(
         )
     if not is_valid_email(clean_email):
         return False, "Please enter a valid email address.", None
-    if len(password) < 6:
-        return False, "Password must be at least 6 characters long.", None
+
+    pw_ok, pw_msg = validate_password_strength(password)
+    if not pw_ok:
+        return False, pw_msg, None
 
     fetch_all_users.clear()
     for user in fetch_all_users():
@@ -1421,6 +1766,7 @@ def start_registration_otp(
 
     ok, msg = _issue_otp(
         ws=get_register_otps_worksheet(),
+        purpose_key="register",
         email=clean_email,
         username=clean_username,
         subject="Verify Your Email — Visiting Card Scanner",
@@ -1440,6 +1786,7 @@ def start_registration_otp(
 def resend_registration_otp(pending_data: dict[str, str]) -> Tuple[bool, str]:
     return _issue_otp(
         ws=get_register_otps_worksheet(),
+        purpose_key="register",
         email=pending_data["email"],
         username=pending_data["username"],
         subject="Verify Your Email — Visiting Card Scanner",
@@ -1462,23 +1809,24 @@ def complete_registration_with_otp(
     if not ok:
         return False, msg, None
 
-    fetch_all_users.clear()
-    for user in fetch_all_users():
-        if user.get("username", "").strip().lower() == clean_username.lower():
-            return False, "That username was just taken. Please pick another one.", None
-        if user.get("email", "").strip().lower() == clean_email:
-            return False, "An account with this email already exists. Please log in.", None
+    with _WRITE_LOCK:
+        fetch_all_users.clear()
+        for user in fetch_all_users():
+            if user.get("username", "").strip().lower() == clean_username.lower():
+                return False, "That username was just taken. Please pick another one.", None
+            if user.get("email", "").strip().lower() == clean_email:
+                return False, "An account with this email already exists. Please log in.", None
 
-    user_id = f"usr_{uuid.uuid4().hex[:10]}"
-    created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        user_id = f"usr_{uuid.uuid4().hex[:10]}"
+        created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    ws = get_users_worksheet()
-    ws.append_row(
-        [user_id, clean_username, clean_email, pw_hash, "user", created_at],
-        value_input_option="RAW",
-        table_range="A1",
-    )
-    fetch_all_users.clear()
+        ws = get_users_worksheet()
+        ws.append_row(
+            [user_id, clean_username, clean_email, pw_hash, "user", created_at],
+            value_input_option="RAW",
+            table_range="A1",
+        )
+        fetch_all_users.clear()
 
     new_user = {
         "user_id": user_id,
@@ -1496,12 +1844,22 @@ def authenticate_user(
     if not clean_id or not password:
         return False, "Please enter both username/email and password.", None
 
+    rate_key = f"login:{clean_id}"
+    allowed, lock_msg = _check_rate_limit(
+        limit_key=rate_key,
+        max_attempts=MAX_LOGIN_ATTEMPTS,
+        window_seconds=LOGIN_LOCKOUT_SECONDS,
+    )
+    if not allowed:
+        return False, lock_msg, None
+
     fetch_all_users.clear()
     for user in fetch_all_users():
         uname = user.get("username", "").strip().lower()
         uemail = user.get("email", "").strip().lower()
         if clean_id in (uname, uemail):
             if verify_password(password, user.get("password_hash", "")):
+                _clear_rate_limit(rate_key)
                 return (
                     True,
                     "Logged in successfully.",
@@ -1512,9 +1870,21 @@ def authenticate_user(
                         "role": user.get("role", "user"),
                     },
                 )
-            return False, "Incorrect password. Please try again.", None
+            _record_rate_limit_event(
+                limit_key=rate_key,
+                max_attempts=MAX_LOGIN_ATTEMPTS,
+                window_seconds=LOGIN_LOCKOUT_SECONDS,
+                lockout_seconds=LOGIN_LOCKOUT_SECONDS,
+            )
+            return False, "Invalid username/email or password.", None
 
-    return False, "No account found with that username or email.", None
+    _record_rate_limit_event(
+        limit_key=rate_key,
+        max_attempts=MAX_LOGIN_ATTEMPTS,
+        window_seconds=LOGIN_LOCKOUT_SECONDS,
+        lockout_seconds=LOGIN_LOCKOUT_SECONDS,
+    )
+    return False, "Invalid username/email or password.", None
 
 
 def request_password_reset(email: str) -> Tuple[bool, str]:
@@ -1534,6 +1904,7 @@ def request_password_reset(email: str) -> Tuple[bool, str]:
 
     return _issue_otp(
         ws=get_resets_worksheet(),
+        purpose_key="reset",
         email=clean_email,
         username=matched_user.get("username", "User"),
         subject="Your Visiting Card Scanner Password Reset Code",
@@ -1548,8 +1919,10 @@ def confirm_password_reset(
 
     if not is_valid_email(clean_email):
         return False, "Please enter a valid email address."
-    if len(new_password) < 6:
-        return False, "New password must be at least 6 characters long."
+
+    pw_ok, pw_msg = validate_password_strength(new_password)
+    if not pw_ok:
+        return False, pw_msg
 
     ok, msg = _verify_and_consume_otp(
         ws=get_resets_worksheet(),
@@ -1559,29 +1932,37 @@ def confirm_password_reset(
     if not ok:
         return False, msg
 
-    users_ws = get_users_worksheet()
-    user_rows = users_ws.get_all_values()
-    updated_user = False
-    for row_idx, row in enumerate(user_rows[1:], start=2):
-        if len(row) >= 4 and row[2].strip().lower() == clean_email:
-            new_hash = hash_password(new_password)
-            users_ws.update(
-                values=[[new_hash]],
-                range_name=f"D{row_idx}",
-                value_input_option="RAW",
-            )
-            updated_user = True
-            break
+    target_user_id = ""
+    with _WRITE_LOCK:
+        users_ws = get_users_worksheet()
+        user_rows = users_ws.get_all_values()
+        updated_user = False
+        for row_idx, row in enumerate(user_rows[1:], start=2):
+            if len(row) >= 4 and row[2].strip().lower() == clean_email:
+                target_user_id = row[0]
+                new_hash = hash_password(new_password)
+                users_ws.update(
+                    values=[[new_hash]],
+                    range_name=f"D{row_idx}",
+                    value_input_option="RAW",
+                )
+                updated_user = True
+                break
 
-    if not updated_user:
-        return False, "Account could not be found."
+        if not updated_user:
+            return False, "Account could not be found."
 
-    fetch_all_users.clear()
-    return True, "Password updated successfully! You can now log in with your new password."
+        fetch_all_users.clear()
+
+    if target_user_id:
+        revoke_all_user_sessions(target_user_id)
+        _clear_rate_limit(f"login:{clean_email}")
+
+    return True, "Password updated and all prior sessions signed out. Please log in with your new password."
 
 
 # ---------------------------------------------------------------------------
-# Visiting Card CRUD, Search, Excel Merge & Duplicate Detection
+# Visiting Card CRUD, Soft-Delete/Restore, Audit & Duplicate Detection
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=60, show_spinner=False)
 def _fetch_all_card_rows() -> list[list[str]]:
@@ -1606,8 +1987,8 @@ def _fetch_all_card_rows() -> list[list[str]]:
     return all_rows
 
 
-def fetch_user_records(user_id: str) -> pd.DataFrame:
-    """Return ONLY visiting cards uploaded by `user_id`, newest first."""
+def fetch_user_records(user_id: str, include_deleted: bool = False) -> pd.DataFrame:
+    """Return visiting cards owned by `user_id` (active only by default, newest first)."""
     all_rows = _fetch_all_card_rows()
     if len(all_rows) <= 1:
         return pd.DataFrame(columns=ALL_RECORD_COLUMNS)
@@ -1620,6 +2001,9 @@ def fetch_user_records(user_id: str) -> pd.DataFrame:
         padded = row + [""] * (len(headers) - len(row))
         record = dict(zip(headers, padded))
         if record.get("user_id") == user_id:
+            deleted_at = str(record.get("deleted_at", "")).strip()
+            if not include_deleted and deleted_at:
+                continue
             raw_extra = record.get("extra_data") or record.get("Extra Details") or ""
             extra_dict = parse_extra_data(raw_extra)
             data_rows.append(
@@ -1639,6 +2023,7 @@ def fetch_user_records(user_id: str) -> pd.DataFrame:
                     "Saved On": record.get("created_at", ""),
                     "Extra Details": format_extra_data_summary(extra_dict),
                     "Extra Data JSON": serialize_extra_data(extra_dict),
+                    "Deleted At": deleted_at,
                 }
             )
 
@@ -1683,7 +2068,7 @@ def find_duplicate_records(
         return []
 
     _fetch_all_card_rows.clear()
-    existing_df = fetch_user_records(user_id)
+    existing_df = fetch_user_records(user_id, include_deleted=False)
     if existing_df.empty:
         return []
 
@@ -1740,65 +2125,81 @@ def save_record(
     notes: str,
     extra_data: Optional[dict[str, str]] = None,
 ) -> str:
-    ws = get_cards_worksheet()
-    _ensure_cards_header(ws)
+    with _WRITE_LOCK:
+        ws = get_cards_worksheet()
+        _ensure_cards_header(ws)
 
-    record_id = uuid.uuid4().hex[:8]
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    extra_json = serialize_extra_data(extra_data or {})
+        record_id = uuid.uuid4().hex[:8]
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        extra_json = serialize_extra_data(extra_data or {})
 
-    row = [
-        record_id,
-        user_id,
-        normalize_digits(company_name).strip() or "N/A",
-        normalize_digits(contact_person).strip() or "N/A",
-        format_phone_numbers(call_phone),
-        format_phone_numbers(whatsapp_phone),
-        normalize_digits(email).strip() or "N/A",
-        normalize_digits(products_services).strip() or "N/A",
-        normalize_digits(address).strip() or "N/A",
-        normalize_digits(city).strip() or "N/A",
-        notes.strip() or "N/A",
-        timestamp,
-        extra_json,
-    ]
+        clean_company = sanitize_text_field(company_name, MAX_FIELD_LEN) or "N/A"
+        row = [
+            record_id,
+            user_id,
+            clean_company,
+            sanitize_text_field(contact_person, MAX_FIELD_LEN) or "N/A",
+            format_phone_numbers(call_phone),
+            format_phone_numbers(whatsapp_phone),
+            sanitize_text_field(email, 160) or "N/A",
+            sanitize_text_field(products_services, MAX_FIELD_LEN) or "N/A",
+            sanitize_text_field(address, MAX_LONG_FIELD_LEN) or "N/A",
+            sanitize_text_field(city, 100) or "N/A",
+            sanitize_text_field(notes, MAX_LONG_FIELD_LEN) or "N/A",
+            timestamp,
+            extra_json,
+            "",
+        ]
 
-    ws.append_row(row, value_input_option="RAW", table_range="A1")
-    _fetch_all_card_rows.clear()
+        ws.append_row(row, value_input_option="RAW", table_range="A1")
+        _fetch_all_card_rows.clear()
+
+    append_audit_log(user_id, "CREATE", record_id, f"Saved card: {clean_company}")
     return record_id
 
 
-def save_records_batch(user_id: str, records: list[dict[str, Any]]) -> int:
+def save_records_batch(
+    user_id: str, records: list[dict[str, Any]], source_name: str = "Excel"
+) -> int:
     if not records:
         return 0
-    ws = get_cards_worksheet()
-    _ensure_cards_header(ws)
+    with _WRITE_LOCK:
+        ws = get_cards_worksheet()
+        _ensure_cards_header(ws)
 
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    rows_to_append: list[list[str]] = []
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        rows_to_append: list[list[str]] = []
 
-    for rec in records:
-        extra_json = serialize_extra_data(rec.get("extra_data") or {})
-        rows_to_append.append(
-            [
-                uuid.uuid4().hex[:8],
-                user_id,
-                normalize_digits(rec.get("company_name", "")).strip() or "N/A",
-                normalize_digits(rec.get("contact_person", "")).strip() or "N/A",
-                format_phone_numbers(rec.get("call_phone", "")),
-                format_phone_numbers(rec.get("whatsapp_phone", "")),
-                normalize_digits(rec.get("email", "")).strip() or "N/A",
-                normalize_digits(rec.get("products_services", "")).strip() or "N/A",
-                normalize_digits(rec.get("address", "")).strip() or "N/A",
-                normalize_digits(rec.get("city", "")).strip() or "N/A",
-                normalize_digits(rec.get("notes", "")).strip() or "N/A",
-                timestamp,
-                extra_json,
-            ]
-        )
+        for rec in records:
+            extra_json = serialize_extra_data(rec.get("extra_data") or {})
+            rows_to_append.append(
+                [
+                    uuid.uuid4().hex[:8],
+                    user_id,
+                    sanitize_text_field(rec.get("company_name", ""), MAX_FIELD_LEN) or "N/A",
+                    sanitize_text_field(rec.get("contact_person", ""), MAX_FIELD_LEN) or "N/A",
+                    format_phone_numbers(rec.get("call_phone", "")),
+                    format_phone_numbers(rec.get("whatsapp_phone", "")),
+                    sanitize_text_field(rec.get("email", ""), 160) or "N/A",
+                    sanitize_text_field(rec.get("products_services", ""), MAX_FIELD_LEN) or "N/A",
+                    sanitize_text_field(rec.get("address", ""), MAX_LONG_FIELD_LEN) or "N/A",
+                    sanitize_text_field(rec.get("city", ""), 100) or "N/A",
+                    sanitize_text_field(rec.get("notes", ""), MAX_LONG_FIELD_LEN) or "N/A",
+                    timestamp,
+                    extra_json,
+                    "",
+                ]
+            )
 
-    ws.append_rows(rows_to_append, value_input_option="RAW", table_range="A1")
-    _fetch_all_card_rows.clear()
+        ws.append_rows(rows_to_append, value_input_option="RAW", table_range="A1")
+        _fetch_all_card_rows.clear()
+
+    append_audit_log(
+        user_id,
+        "BATCH_MERGE",
+        f"batch_{len(rows_to_append)}",
+        f"Merged {len(rows_to_append)} records from {source_name}",
+    )
     return len(rows_to_append)
 
 
@@ -1816,75 +2217,173 @@ def update_record(
     notes: str,
     extra_data: Optional[dict[str, str]] = None,
 ) -> bool:
-    ws = get_cards_worksheet()
-    all_rows = ws.get_all_values()
-    if len(all_rows) <= 1:
-        return False
+    with _WRITE_LOCK:
+        ws = get_cards_worksheet()
+        all_rows = ws.get_all_values()
+        if len(all_rows) <= 1:
+            return False
 
-    headers = all_rows[0]
-    for sheet_row_idx, row in enumerate(all_rows[1:], start=2):
-        padded = row + [""] * (len(headers) - len(row))
-        existing = dict(zip(headers, padded))
+        headers = all_rows[0]
+        for sheet_row_idx, row in enumerate(all_rows[1:], start=2):
+            padded = row + [""] * (len(headers) - len(row))
+            existing = dict(zip(headers, padded))
 
-        if existing.get("record_id") == record_id and existing.get("user_id") == user_id:
-            original_created_at = existing.get(
-                "created_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            )
-            extra_json = serialize_extra_data(extra_data or {})
-            updated_row = [
-                record_id,
-                user_id,
-                normalize_digits(company_name).strip() or "N/A",
-                normalize_digits(contact_person).strip() or "N/A",
-                format_phone_numbers(call_phone),
-                format_phone_numbers(whatsapp_phone),
-                normalize_digits(email).strip() or "N/A",
-                normalize_digits(products_services).strip() or "N/A",
-                normalize_digits(address).strip() or "N/A",
-                normalize_digits(city).strip() or "N/A",
-                notes.strip() or "N/A",
-                original_created_at,
-                extra_json,
-            ]
-            end_cell = rowcol_to_a1(sheet_row_idx, len(CARD_HEADERS))
-            ws.update(
-                values=[updated_row],
-                range_name=f"A{sheet_row_idx}:{end_cell}",
-                value_input_option="RAW",
-            )
-            _fetch_all_card_rows.clear()
-            return True
+            if (
+                existing.get("record_id") == record_id
+                and existing.get("user_id") == user_id
+                and not str(existing.get("deleted_at", "")).strip()
+            ):
+                original_created_at = existing.get(
+                    "created_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                )
+                extra_json = serialize_extra_data(extra_data or {})
+                clean_company = sanitize_text_field(company_name, MAX_FIELD_LEN) or "N/A"
+                updated_row = [
+                    record_id,
+                    user_id,
+                    clean_company,
+                    sanitize_text_field(contact_person, MAX_FIELD_LEN) or "N/A",
+                    format_phone_numbers(call_phone),
+                    format_phone_numbers(whatsapp_phone),
+                    sanitize_text_field(email, 160) or "N/A",
+                    sanitize_text_field(products_services, MAX_FIELD_LEN) or "N/A",
+                    sanitize_text_field(address, MAX_LONG_FIELD_LEN) or "N/A",
+                    sanitize_text_field(city, 100) or "N/A",
+                    sanitize_text_field(notes, MAX_LONG_FIELD_LEN) or "N/A",
+                    original_created_at,
+                    extra_json,
+                    "",
+                ]
+                end_cell = rowcol_to_a1(sheet_row_idx, len(CARD_HEADERS))
+                ws.update(
+                    values=[updated_row],
+                    range_name=f"A{sheet_row_idx}:{end_cell}",
+                    value_input_option="RAW",
+                )
+                _fetch_all_card_rows.clear()
+                append_audit_log(
+                    user_id, "UPDATE", record_id, f"Updated card: {clean_company}"
+                )
+                return True
 
     return False
 
 
-def delete_record(record_id: str, user_id: str) -> bool:
-    ws = get_cards_worksheet()
-    all_rows = ws.get_all_values()
+def soft_delete_record(record_id: str, user_id: str) -> bool:
+    """Move a card to Trash (`deleted_at` timestamp) so it can be restored anytime."""
+    with _WRITE_LOCK:
+        ws = get_cards_worksheet()
+        all_rows = ws.get_all_values()
+        if len(all_rows) <= 1:
+            return False
 
-    for sheet_row_idx, row in enumerate(all_rows[1:], start=2):
-        row_record_id = row[0] if len(row) > 0 else ""
-        row_user_id = row[1] if len(row) > 1 else ""
-        if row_record_id == record_id and row_user_id == user_id:
-            ws.delete_rows(sheet_row_idx)
-            _fetch_all_card_rows.clear()
-            return True
+        headers = all_rows[0]
+        del_col_idx = (
+            headers.index("deleted_at") + 1
+            if "deleted_at" in headers
+            else len(CARD_HEADERS)
+        )
+        del_cell_col = rowcol_to_a1(1, del_col_idx)[0]
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        for sheet_row_idx, row in enumerate(all_rows[1:], start=2):
+            row_record_id = row[0] if len(row) > 0 else ""
+            row_user_id = row[1] if len(row) > 1 else ""
+            company_label = row[2] if len(row) > 2 else ""
+            if row_record_id == record_id and row_user_id == user_id:
+                ws.update(
+                    values=[[now_str]],
+                    range_name=f"{del_cell_col}{sheet_row_idx}",
+                    value_input_option="RAW",
+                )
+                _fetch_all_card_rows.clear()
+                append_audit_log(
+                    user_id,
+                    "SOFT_DELETE",
+                    record_id,
+                    f"Moved to Trash: {company_label}",
+                )
+                return True
+
+    return False
+
+
+def restore_deleted_record(record_id: str, user_id: str) -> bool:
+    """Restore a soft-deleted card from Trash back to active records."""
+    with _WRITE_LOCK:
+        ws = get_cards_worksheet()
+        all_rows = ws.get_all_values()
+        if len(all_rows) <= 1:
+            return False
+
+        headers = all_rows[0]
+        del_col_idx = (
+            headers.index("deleted_at") + 1
+            if "deleted_at" in headers
+            else len(CARD_HEADERS)
+        )
+        del_cell_col = rowcol_to_a1(1, del_col_idx)[0]
+
+        for sheet_row_idx, row in enumerate(all_rows[1:], start=2):
+            row_record_id = row[0] if len(row) > 0 else ""
+            row_user_id = row[1] if len(row) > 1 else ""
+            company_label = row[2] if len(row) > 2 else ""
+            if row_record_id == record_id and row_user_id == user_id:
+                ws.update(
+                    values=[[""]],
+                    range_name=f"{del_cell_col}{sheet_row_idx}",
+                    value_input_option="RAW",
+                )
+                _fetch_all_card_rows.clear()
+                append_audit_log(
+                    user_id,
+                    "RESTORE",
+                    record_id,
+                    f"Restored from Trash: {company_label}",
+                )
+                return True
 
     return False
 
 
 # ---------------------------------------------------------------------------
-# Excel Export & Existing Excel Merge Helpers
+# Formula-Safe Excel Export & Existing Excel Merge Helpers
 # ---------------------------------------------------------------------------
+_FORMULA_TRIGGER_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def sanitize_excel_cell(val: Any) -> Any:
+    """
+    Prevent CSV/Excel formula injection (DDE / macro execution) by prefixing
+    untrusted strings that begin with '=', '+', '-', '@', '\\t', or '\\r' with `'`.
+    """
+    if not isinstance(val, str):
+        return val
+    stripped = val.lstrip()
+    if stripped and stripped[0] in _FORMULA_TRIGGER_PREFIXES:
+        return f"'{val}"
+    return val
+
+
+def sanitize_df_for_excel(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+    safe_df = df.copy()
+    for col in safe_df.columns:
+        safe_df[col] = safe_df[col].map(sanitize_excel_cell)
+    return safe_df
+
+
 def build_excel_bytes(df: pd.DataFrame, sheet_name: str = "Visiting Cards") -> bytes:
+    safe_df = sanitize_df_for_excel(df)
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name=sheet_name[:31])
+        safe_df.to_excel(writer, index=False, sheet_name=sheet_name[:31])
         worksheet = writer.sheets[sheet_name[:31]]
 
-        for col_idx, col_name in enumerate(df.columns, start=1):
+        for col_idx, col_name in enumerate(safe_df.columns, start=1):
             max_cell_len = (
-                df[col_name].astype(str).map(len).max() if not df.empty else 0
+                safe_df[col_name].astype(str).map(len).max() if not safe_df.empty else 0
             )
             col_width = min(max(len(str(col_name)), max_cell_len) + 4, 50)
             col_letter = worksheet.cell(row=1, column=col_idx).column_letter
@@ -1897,12 +2396,15 @@ def build_multi_sheet_excel_bytes(sheets: dict[str, pd.DataFrame]) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         for raw_name, df in sheets.items():
+            safe_df = sanitize_df_for_excel(df)
             safe_name = raw_name[:31]
-            df.to_excel(writer, index=False, sheet_name=safe_name)
+            safe_df.to_excel(writer, index=False, sheet_name=safe_name)
             worksheet = writer.sheets[safe_name]
-            for col_idx, col_name in enumerate(df.columns, start=1):
+            for col_idx, col_name in enumerate(safe_df.columns, start=1):
                 max_cell_len = (
-                    df[col_name].astype(str).map(len).max() if not df.empty else 0
+                    safe_df[col_name].astype(str).map(len).max()
+                    if not safe_df.empty
+                    else 0
                 )
                 col_width = min(max(len(str(col_name)), max_cell_len) + 4, 52)
                 col_letter = worksheet.cell(row=1, column=col_idx).column_letter
@@ -1945,7 +2447,7 @@ def _auto_detect_excel_mapping(columns: list[str]) -> dict[str, str]:
 def _clean_excel_cell(val: Any) -> str:
     if val is None or pd.isna(val):
         return ""
-    s = str(val).strip()
+    s = sanitize_text_field(val, MAX_LONG_FIELD_LEN)
     if s.lower() in ("nan", "none", "nat"):
         return ""
     return s
@@ -1963,7 +2465,7 @@ def prepare_excel_merge_rows(
 
     if skip_duplicates:
         _fetch_all_card_rows.clear()
-        existing_df = fetch_user_records(user_id)
+        existing_df = fetch_user_records(user_id, include_deleted=False)
         for _, ex_row in existing_df.iterrows():
             existing_phones |= extract_normalized_phones(str(ex_row.get("Contact No.", "")))
             existing_phones |= extract_normalized_phones(str(ex_row.get("WhatsApp No.", "")))
@@ -1986,7 +2488,9 @@ def prepare_excel_merge_rows(
             if extra_col in raw_df.columns:
                 val = _clean_excel_cell(row[extra_col])
                 if val and val.upper() != "N/A":
-                    extra_dict[extra_col.strip()] = normalize_digits(val)
+                    extra_dict[sanitize_text_field(extra_col, 80)] = sanitize_text_field(
+                        val, MAX_FIELD_LEN
+                    )
 
         if not has_at_least_one_field(*raw_vals.values(), *extra_dict.values()):
             skipped_empty += 1
@@ -1994,7 +2498,8 @@ def prepare_excel_merge_rows(
 
         formatted_call = format_phone_numbers(raw_vals["call_phone"])
         formatted_wp = format_phone_numbers(raw_vals["whatsapp_phone"])
-        clean_email = normalize_digits(raw_vals["email"]).strip() or "N/A"
+        raw_email = sanitize_text_field(raw_vals["email"], 160)
+        clean_email = raw_email if is_valid_email(raw_email.lower()) else "N/A"
 
         row_phones = extract_normalized_phones(formatted_call) | extract_normalized_phones(
             formatted_wp
@@ -2013,16 +2518,15 @@ def prepare_excel_merge_rows(
 
         prepared.append(
             {
-                "company_name": normalize_digits(raw_vals["company_name"]).strip() or "N/A",
-                "contact_person": normalize_digits(raw_vals["contact_person"]).strip() or "N/A",
+                "company_name": sanitize_text_field(raw_vals["company_name"], MAX_FIELD_LEN) or "N/A",
+                "contact_person": sanitize_text_field(raw_vals["contact_person"], MAX_FIELD_LEN) or "N/A",
                 "call_phone": formatted_call,
                 "whatsapp_phone": formatted_wp,
                 "email": clean_email,
-                "products_services": normalize_digits(raw_vals["products_services"]).strip()
-                or "N/A",
-                "address": normalize_digits(raw_vals["address"]).strip() or "N/A",
-                "city": normalize_digits(raw_vals["city"]).strip() or "N/A",
-                "notes": normalize_digits(raw_vals["notes"]).strip() or "N/A",
+                "products_services": sanitize_text_field(raw_vals["products_services"], MAX_FIELD_LEN) or "N/A",
+                "address": sanitize_text_field(raw_vals["address"], MAX_LONG_FIELD_LEN) or "N/A",
+                "city": sanitize_text_field(raw_vals["city"], 100) or "N/A",
+                "notes": sanitize_text_field(raw_vals["notes"], MAX_LONG_FIELD_LEN) or "N/A",
                 "extra_data": extra_dict,
             }
         )
@@ -2034,7 +2538,7 @@ def prepare_excel_merge_rows(
 # Anti-504 Gemini AI Extraction & Marketing Text Generation Helpers
 # ---------------------------------------------------------------------------
 class ScanUnavailableError(Exception):
-    """Raised when all free models are temporarily busy or timed out."""
+    pass
 
 
 def extract_card_details(
@@ -2158,7 +2662,6 @@ def extract_card_details(
 
 
 def generate_marketing_ai_text(prompt: str, api_key: str) -> str:
-    """Run a fast, timeout-protected Gemini text call across the free model chain."""
     if not api_key or not api_key.strip():
         raise ValueError("Gemini API key is missing. Add it in Sidebar → Settings.")
 
@@ -2209,11 +2712,22 @@ def run_scan(image_files: list, api_key: str, user_id: str) -> None:
         st.warning(f"Maximum {MAX_CARD_IMAGES} images (Front & Back) are allowed.")
         return
 
+    for f in image_files:
+        if getattr(f, "size", 0) > MAX_IMAGE_FILE_BYTES:
+            st.warning(
+                f"Image '{f.name}' exceeds the 5 MB upload limit. Please upload a smaller photo."
+            )
+            return
+
+    # Fail-closed daily quota verification
     daily_limit = get_daily_scan_limit()
     try:
         used_today = get_user_scans_today(user_id)
     except Exception:
-        used_today = 0
+        st.error(
+            "Unable to verify your daily AI scan quota right now. Please try again in a moment."
+        )
+        return
 
     if used_today >= daily_limit:
         st.warning(
@@ -2231,10 +2745,8 @@ def run_scan(image_files: list, api_key: str, user_id: str) -> None:
             extracted, extra_dict, _used_model = extract_card_details(
                 images_payload, api_key
             )
-            try:
-                increment_user_scan_count(user_id)
-            except Exception:
-                pass
+            # Fail-closed quota increment
+            increment_user_scan_count(user_id)
 
             card_dict = extracted.model_dump(exclude={"extra_details"})
             card_dict["notes"] = ""
@@ -2256,7 +2768,7 @@ def run_scan(image_files: list, api_key: str, user_id: str) -> None:
             st.warning(str(busy_err))
         except Exception:
             st.warning(
-                "Could not read the card right now. Try a clearer photo, "
+                "Could not complete the scan right now. Try a clearer photo, "
                 "tap Scan again in a moment, or use 'Fill Details Manually'."
             )
 
@@ -2351,7 +2863,7 @@ def render_auth_screen() -> None:
                         reg_password = st.text_input(
                             "Password",
                             type="password",
-                            placeholder="Minimum 6 characters",
+                            placeholder="Min 10 chars, 1 uppercase, 1 lowercase, 1 number",
                         )
                         reg_confirm = st.text_input(
                             "Confirm Password",
@@ -2493,7 +3005,7 @@ def render_auth_screen() -> None:
                     new_pw = st.text_input(
                         "New Password",
                         type="password",
-                        placeholder="Minimum 6 characters",
+                        placeholder="Min 10 chars, 1 uppercase, 1 lowercase, 1 number",
                     )
                     confirm_new_pw = st.text_input(
                         "Confirm New Password",
@@ -2520,12 +3032,11 @@ def render_auth_screen() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Analyze & Growth Hub (Marketing Intelligence, Outreach & AI Strategist)
+# Analyze & Growth Hub (With Escaped HTML & Fail-Closed Quota)
 # ---------------------------------------------------------------------------
 def _compute_analytics_tables(
     df: pd.DataFrame,
 ) -> Tuple[dict[str, Any], pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Compute marketing KPIs, city territories, product demand, and growth timeline."""
     total_leads = len(df)
     if total_leads == 0:
         return {}, pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
@@ -2539,7 +3050,6 @@ def _compute_analytics_tables(
         r"website|www\.|http|\.com|\.in|\.org|\.net", case=False, na=False
     )
 
-    # Data completeness score across 6 core fields per lead
     core_cols = [
         "Company Name",
         "Contact Person",
@@ -2571,7 +3081,6 @@ def _compute_analytics_tables(
         "missing_email_count": int((~has_email).sum()),
     }
 
-    # City-Wise Territory Breakdown
     city_rows = []
     temp_df = df.copy()
     temp_df["_clean_city"] = temp_df["City"].apply(
@@ -2597,7 +3106,6 @@ def _compute_analytics_tables(
         by=["Leads", "WhatsApp Ready"], ascending=[False, False]
     )
 
-    # Product / Services Demand Breakdown
     prod_counter: Counter[str] = Counter()
     for raw_prod in df["Product / Services"].tolist():
         txt = str(raw_prod or "").strip()
@@ -2622,7 +3130,6 @@ def _compute_analytics_tables(
         ]
     )
 
-    # Daily Capture Timeline
     parsed_dates = pd.to_datetime(df["Saved On"], errors="coerce").dropna()
     if not parsed_dates.empty:
         date_counts = parsed_dates.dt.strftime("%Y-%m-%d").value_counts().sort_index()
@@ -2737,25 +3244,15 @@ def render_analyze_section(
                 key="btn_download_growth_report",
             )
 
-        # Top Marketing KPIs
         m1, m2, m3, m4 = st.columns(4)
         with m1:
             st.metric("Total Leads", kpis["total_leads"])
         with m2:
-            st.metric(
-                "WhatsApp Reachable",
-                f"{kpis['wp_count']} ({kpis['wp_pct']}%)",
-            )
+            st.metric("WhatsApp Reachable", f"{kpis['wp_count']} ({kpis['wp_pct']}%)")
         with m3:
-            st.metric(
-                "Email Reachable",
-                f"{kpis['email_count']} ({kpis['email_pct']}%)",
-            )
+            st.metric("Email Reachable", f"{kpis['email_count']} ({kpis['email_pct']}%)")
         with m4:
-            st.metric(
-                "Lead Data Health",
-                f"{kpis['completeness_pct']}%",
-            )
+            st.metric("Lead Data Health", f"{kpis['completeness_pct']}%")
 
         if kpis["missing_city_count"] > 0 or kpis["missing_email_count"] > 0:
             st.info(
@@ -2772,10 +3269,8 @@ def render_analyze_section(
             ]
         )
 
-        # ---- Sub-Tab 1: Market & Territory Insights ----
         with tab_market:
             c_left, c_right = st.columns(2)
-
             with c_left:
                 st.markdown("#### City Territory Breakdown")
                 if not city_df.empty:
@@ -2801,10 +3296,9 @@ def render_analyze_section(
                     use_container_width=True,
                 )
 
-        # ---- Sub-Tab 2: 1-Click WhatsApp & Email Campaign Launcher ----
         with tab_outreach:
             st.caption(
-                "Segment your contacts and launch instant personalized WhatsApp or Email outreach—zero third-party tools needed."
+                "Segment your contacts and launch instant personalized WhatsApp or Email outreach."
             )
 
             unique_cities = sorted(
@@ -2909,7 +3403,6 @@ def render_analyze_section(
             if camp_df.empty:
                 st.warning("No leads match the selected campaign filters.")
             else:
-                # Build personalized campaign export sheet
                 campaign_rows = []
                 for _, r in camp_df.iterrows():
                     personalized = _render_campaign_message(message_template, r)
@@ -2942,32 +3435,55 @@ def render_analyze_section(
                         key="btn_export_campaign_xlsx",
                     )
 
-                for idx, (_, r) in enumerate(camp_df.head(25).iterrows()):
+                for _, r in camp_df.head(25).iterrows():
                     personalized = _render_campaign_message(message_template, r)
                     wa_dial = extract_primary_wa_dial_number(
                         str(r["WhatsApp No."]), str(r["Contact No."])
                     )
+                    raw_email_val = str(r["Email"]).strip()
                     email_val = (
-                        str(r["Email"]).strip()
-                        if str(r["Email"]).strip().upper() != "N/A"
+                        raw_email_val
+                        if raw_email_val.upper() != "N/A"
+                        and is_valid_email(raw_email_val)
                         else ""
                     )
 
+                    # HTML-escape all user-controlled values before rendering
+                    safe_company = html.escape(str(r["Company Name"]), quote=True)
+                    safe_person = html.escape(str(r["Contact Person"]), quote=True)
+                    safe_city = html.escape(str(r["City"]), quote=True)
+                    safe_product = html.escape(str(r["Product / Services"]), quote=True)
+                    display_phone_raw = (
+                        str(r["WhatsApp No."])
+                        if str(r["WhatsApp No."]).strip().upper() != "N/A"
+                        else str(r["Contact No."])
+                    )
+                    safe_phone_label = html.escape(display_phone_raw, quote=True)
+                    safe_email_label = html.escape(email_val, quote=True)
+
                     links_html = ""
-                    if wa_dial:
-                        wa_url = f"https://wa.me/{wa_dial}?text={quote(personalized)}"
+                    if wa_dial and re.fullmatch(r"\d{10,15}", wa_dial):
+                        wa_url = html.escape(
+                            f"https://wa.me/{wa_dial}?text={quote(personalized)}",
+                            quote=True,
+                        )
                         links_html += (
                             f'<a class="vcard-action-link vcard-wa-btn" '
-                            f'href="{wa_url}" target="_blank">Send WhatsApp ({r["WhatsApp No."] if r["WhatsApp No."] != "N/A" else r["Contact No."]})</a>'
+                            f'href="{wa_url}" target="_blank" rel="noopener noreferrer">'
+                            f"Send WhatsApp ({safe_phone_label})</a>"
                         )
                     if email_val:
                         subj = quote(
                             f"Connecting with {r['Company Name']} — {r['Product / Services']}"
                         )
-                        mail_url = f"mailto:{email_val}?subject={subj}&body={quote(personalized)}"
+                        mail_url = html.escape(
+                            f"mailto:{quote(email_val)}?subject={subj}&body={quote(personalized)}",
+                            quote=True,
+                        )
                         links_html += (
                             f'<a class="vcard-action-link vcard-mail-btn" '
-                            f'href="{mail_url}" target="_blank">Send Email ({email_val})</a>'
+                            f'href="{mail_url}" target="_blank" rel="noopener noreferrer">'
+                            f"Send Email ({safe_email_label})</a>"
                         )
                     if not links_html:
                         links_html = '<span style="opacity:0.65;font-size:0.85rem;">No WhatsApp or Email saved for this contact.</span>'
@@ -2975,8 +3491,8 @@ def render_analyze_section(
                     st.markdown(
                         f"""
                         <div class="vcard-outreach-card">
-                            <strong>{r['Company Name']}</strong> · {r['Contact Person']}
-                            <span style="opacity:0.75;">({r['City']} | {r['Product / Services']})</span><br/>
+                            <strong>{safe_company}</strong> · {safe_person}
+                            <span style="opacity:0.75;">({safe_city} | {safe_product})</span><br/>
                             {links_html}
                         </div>
                         """,
@@ -2988,7 +3504,6 @@ def render_analyze_section(
                         f"Showing top 25 contacts on screen. Download the Excel sheet above to access all {len(camp_df)} personalized messages."
                     )
 
-        # ---- Sub-Tab 3: AI Marketing Strategist & 1-to-1 Pitch Builder ----
         with tab_ai_growth:
             st.caption(
                 "Uses your free Gemini AI setup to generate growth strategies and custom sales pitches from your real lead data."
@@ -3056,10 +3571,7 @@ def render_analyze_section(
                             playbook_md = generate_marketing_ai_text(
                                 prompt, active_api_key
                             )
-                            try:
-                                increment_user_scan_count(current_user_id)
-                            except Exception:
-                                pass
+                            increment_user_scan_count(current_user_id)
                             st.session_state["ai_growth_output"] = playbook_md
                         except ValueError as v_err:
                             st.warning(str(v_err))
@@ -3134,10 +3646,7 @@ def render_analyze_section(
                                 pitch_md = generate_marketing_ai_text(
                                     prompt, active_api_key
                                 )
-                                try:
-                                    increment_user_scan_count(current_user_id)
-                                except Exception:
-                                    pass
+                                increment_user_scan_count(current_user_id)
                                 st.session_state["ai_pitch_output"] = pitch_md
                             except ValueError as v_err:
                                 st.warning(str(v_err))
@@ -3153,7 +3662,7 @@ def render_analyze_section(
 
 
 # ---------------------------------------------------------------------------
-# Reusable UI Sections: Show Records, Search-Based Update, Search-Based Delete
+# Reusable UI Sections: Show Records, Update, Soft-Delete, Trash & Audit
 # ---------------------------------------------------------------------------
 def _record_summary_label(row: pd.Series) -> str:
     phones = [
@@ -3182,7 +3691,6 @@ def render_show_records_section(
         with refresh_col:
             if st.button("Refresh", use_container_width=True, key=f"{key_prefix}_refresh"):
                 _fetch_all_card_rows.clear()
-                _fetch_all_usage_rows.clear()
                 st.rerun()
 
         if all_records_df.empty:
@@ -3229,8 +3737,6 @@ def render_show_records_section(
             filtered_df = search_records_df(filtered_df, search_query)
 
         is_filtered = bool(search_query.strip()) or selected_city != "All Cities"
-
-        # Permanently expand all extra_data keys (e.g., Fax, Website, GSTIN) into table & Excel export
         display_df = build_expanded_dataframe(filtered_df, include_extra_columns=True)
 
         with export_col:
@@ -3414,7 +3920,14 @@ def _render_update_record_body(
 
         if update_submitted:
             parsed_extra = parse_extra_data_from_input(upd_extra_text)
-            if not has_at_least_one_field(
+            clean_upd_email = sanitize_text_field(upd_email, 160)
+            if (
+                clean_upd_email
+                and clean_upd_email.upper() != "N/A"
+                and not is_valid_email(clean_upd_email)
+            ):
+                st.error("Please enter a valid email address (or leave it as N/A).")
+            elif not has_at_least_one_field(
                 upd_company,
                 upd_contact,
                 upd_call,
@@ -3481,13 +3994,13 @@ def _render_delete_record_body(
         return
 
     del_query = st.text_input(
-        "Search card to delete",
+        "Search card to move to Trash",
         placeholder="Type company name, person, phone, email, city, or website...",
         key=f"{key_prefix}_search_record_to_delete",
     )
 
     if not del_query.strip():
-        st.caption("Enter any keyword above to find the record you want to delete.")
+        st.caption("Enter any keyword above to find the record you want to move to Trash.")
         return
 
     del_matches = search_records_df(all_records_df, del_query)
@@ -3500,7 +4013,7 @@ def _render_delete_record_body(
         selected_del_row = del_matches.iloc[0]
     else:
         st.info(
-            f"Found {len(del_matches)} matching records. Choose which one to delete:"
+            f"Found {len(del_matches)} matching records. Choose which one to move to Trash:"
         )
         del_indices = list(range(len(del_matches)))
         del_labels = [
@@ -3522,19 +4035,20 @@ def _render_delete_record_body(
 
     del_id = str(selected_del_row["Record ID"])
     st.warning(
-        f"Are you sure you want to delete **{selected_del_row['Company Name']}** "
-        f"({selected_del_row['Contact Person']} • {selected_del_row['City']})?"
+        f"Move **{selected_del_row['Company Name']}** "
+        f"({selected_del_row['Contact Person']} • {selected_del_row['City']}) to Trash? "
+        "(You can restore it anytime from **Trash & Audit History**.)"
     )
     if st.button(
-        "Confirm Delete",
+        "Move to Trash",
         type="primary",
         key=f"{key_prefix}_btn_confirm_delete_{del_id}",
     ):
         try:
-            deleted = delete_record(del_id, current_user_id)
+            deleted = soft_delete_record(del_id, current_user_id)
             if deleted:
                 st.session_state["flash_success"] = (
-                    f"Deleted '{selected_del_row['Company Name']}'."
+                    f"Moved '{selected_del_row['Company Name']}' to Trash."
                 )
                 st.rerun()
             else:
@@ -3556,6 +4070,106 @@ def render_delete_record_section(
         with st.container(border=True):
             st.subheader("Delete a Record")
             _render_delete_record_body(all_records_df, current_user_id, key_prefix)
+
+
+def render_trash_and_audit_section(
+    current_user_id: str, current_username: str, key_prefix: str
+) -> None:
+    """Render Trash (with 1-click Restore), Full Backup (.xlsx), and Audit History."""
+    with st.container(border=True):
+        st.subheader("Trash, Backups & Audit History")
+
+        all_with_deleted = fetch_user_records(current_user_id, include_deleted=True)
+        deleted_df = (
+            all_with_deleted[all_with_deleted["Deleted At"].astype(str).str.strip() != ""]
+            if not all_with_deleted.empty
+            else pd.DataFrame(columns=ALL_RECORD_COLUMNS)
+        )
+        active_df = (
+            all_with_deleted[all_with_deleted["Deleted At"].astype(str).str.strip() == ""]
+            if not all_with_deleted.empty
+            else pd.DataFrame(columns=ALL_RECORD_COLUMNS)
+        )
+        audit_df = fetch_user_audit_logs(current_user_id, limit=50)
+
+        b_col1, b_col2 = st.columns([2.8, 1.5])
+        with b_col1:
+            st.caption(
+                "Download a complete multi-tab Excel backup containing all active cards, Trash items, and your audit history."
+            )
+        with b_col2:
+            backup_sheets = {
+                "Active Cards": build_expanded_dataframe(active_df, include_extra_columns=True),
+                "Trash": build_expanded_dataframe(deleted_df, include_extra_columns=True),
+                "Audit History": audit_df,
+            }
+            backup_bytes = build_multi_sheet_excel_bytes(backup_sheets)
+            if st.download_button(
+                label="Download Full Backup (.xlsx)",
+                data=backup_bytes,
+                file_name=f"full_backup_{current_username}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key=f"{key_prefix}_full_backup",
+            ):
+                append_audit_log(
+                    current_user_id,
+                    "BACKUP_EXPORT",
+                    "all",
+                    f"Downloaded full backup ({len(active_df)} active, {len(deleted_df)} trash)",
+                )
+
+        tab_trash, tab_audit = st.tabs(
+            [f"Trash ({len(deleted_df)})", f"Audit History ({len(audit_df)})"]
+        )
+
+        with tab_trash:
+            if deleted_df.empty:
+                st.info("Trash is empty.")
+            else:
+                st.dataframe(
+                    deleted_df[
+                        [
+                            "Record ID",
+                            "Company Name",
+                            "Contact Person",
+                            "WhatsApp No.",
+                            "City",
+                            "Deleted At",
+                        ]
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                restore_options = {
+                    f"{r['Company Name']} — {r['Contact Person']} (Deleted: {r['Deleted At']}) [{r['Record ID']}]": r[
+                        "Record ID"
+                    ]
+                    for _, r in deleted_df.iterrows()
+                }
+                chosen_restore = st.selectbox(
+                    "Select card to restore",
+                    options=list(restore_options.keys()),
+                    key=f"{key_prefix}_restore_select",
+                )
+                if st.button(
+                    "Restore Selected Card",
+                    type="primary",
+                    key=f"{key_prefix}_btn_restore",
+                ):
+                    if restore_deleted_record(
+                        restore_options[chosen_restore], current_user_id
+                    ):
+                        st.session_state["flash_success"] = "Card restored successfully."
+                        st.rerun()
+                    else:
+                        st.error("Could not restore record.")
+
+        with tab_audit:
+            if audit_df.empty:
+                st.info("No audit history recorded yet.")
+            else:
+                st.dataframe(audit_df, use_container_width=True, hide_index=True)
 
 
 # ---------------------------------------------------------------------------
@@ -3589,7 +4203,6 @@ def main() -> None:
         if key not in st.session_state:
             st.session_state[key] = default
 
-    # Verify Google Sheets connection & auto-migrate schema if needed
     storage_ready = False
     storage_error = None
     try:
@@ -3601,14 +4214,13 @@ def main() -> None:
 
     if not storage_ready:
         st.title("Company Visiting Card Scanner")
-        st.error(f"Storage setup required: {storage_error}")
+        st.error(f"Storage & Security setup required: {storage_error}")
         st.info(
-            "Check `GSHEET_URL` and `[gcp_service_account]` in Streamlit Secrets, "
-            "and confirm the Google Sheets API is enabled and shared with your service account."
+            "Verify `SESSION_SECRET` (32+ chars), `GSHEET_URL`, and `[gcp_service_account]` "
+            "in Streamlit Secrets, and ensure Google Sheets API is enabled."
         )
         return
 
-    # Restore hidden browser session (clean URL, no session ID in link)
     auth_user, is_checking_session = sync_and_restore_session()
     if is_checking_session:
         st.caption("Checking your session...")
@@ -3625,17 +4237,19 @@ def main() -> None:
     daily_limit = get_daily_scan_limit()
     try:
         scans_used_today = get_user_scans_today(current_user_id)
+        quota_readable = True
     except Exception:
-        scans_used_today = 0
-    scans_remaining = max(0, daily_limit - scans_used_today)
+        scans_used_today = daily_limit  # Fail closed if quota sheet cannot be read
+        quota_readable = False
+    scans_remaining = max(0, daily_limit - scans_used_today) if quota_readable else 0
 
     try:
-        all_records_df = fetch_user_records(current_user_id)
+        all_records_df = fetch_user_records(current_user_id, include_deleted=False)
     except Exception:
         st.error("Unable to load your saved cards right now. Please refresh.")
         return
 
-    # ---- Sidebar: Menu (with Analyze & Logout), Account Info, Collapsible Settings ----
+    # ---- Sidebar: Menu, Account, Security & Collapsible Settings ----
     with st.sidebar:
         st.markdown("### Menu")
         active_view = st.session_state["active_view"]
@@ -3646,6 +4260,7 @@ def main() -> None:
             ("analyze", "Analyze & Growth"),
             ("update", "Update Record"),
             ("delete", "Delete Record"),
+            ("trash", "Trash & Audit"),
         ]
         for view_key, view_label in nav_items:
             if st.button(
@@ -3679,6 +4294,16 @@ def main() -> None:
             "Resets 1:30 PM IST (12:30 PM summer)"
         )
 
+        if st.button(
+            "Sign Out All Devices",
+            use_container_width=True,
+            key="btn_revoke_all_sessions",
+        ):
+            revoke_all_user_sessions(current_user_id)
+            logout_user_session()
+            st.session_state["close_sidebar_seq"] += 1
+            st.rerun()
+
         st.divider()
         server_api_key = str(get_secret("GEMINI_API_KEY", "") or "").strip()
         with st.expander("Settings", expanded=not bool(server_api_key)):
@@ -3706,17 +4331,17 @@ def main() -> None:
 
             st.success("Cloud storage connected")
 
-    # Mount hidden UI bridge for mobile sidebar auto-close & smooth form scroll
     trigger_ui_bridge()
 
-    # ---- Clean Page Header & Quick-Stats Strip ----
+    # ---- Clean Page Header & Escaped Quick-Stats Strip ----
     st.title("Company Visiting Card Scanner")
+    safe_username_html = html.escape(str(current_username), quote=True)
     st.markdown(
         f"""
         <div class="vcard-stat-strip">
             <div class="vcard-stat-pill">
                 <div class="vcard-stat-label">Account</div>
-                <div class="vcard-stat-value">{current_username}</div>
+                <div class="vcard-stat-value">{safe_username_html}</div>
             </div>
             <div class="vcard-stat-pill">
                 <div class="vcard-stat-label">Saved Cards</div>
@@ -3731,6 +4356,11 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
+    if not quota_readable:
+        st.warning(
+            "Could not verify daily AI scan quota from storage — AI scanning is paused until connection recovers."
+        )
+
     if st.session_state["flash_success"]:
         st.success(st.session_state["flash_success"])
         st.session_state["flash_success"] = None
@@ -3739,7 +4369,7 @@ def main() -> None:
         st.info(st.session_state["flash_info"])
         st.session_state["flash_info"] = None
 
-    # ---- Dedicated Sidebar Views (Show / Analyze / Update / Delete) ----
+    # ---- Dedicated Sidebar Views ----
     if active_view == "show":
         render_show_records_section(
             all_records_df=all_records_df,
@@ -3777,6 +4407,14 @@ def main() -> None:
         )
         return
 
+    if active_view == "trash":
+        render_trash_and_audit_section(
+            current_user_id=current_user_id,
+            current_username=current_username,
+            key_prefix="nav_trash",
+        )
+        return
+
     # ---- HOME VIEW: Step 1 (Upload / Camera / Merge Excel + Manual Entry) ----
     upload_rev = st.session_state["uploader_reset_counter"]
 
@@ -3785,7 +4423,7 @@ def main() -> None:
         with step1_col:
             st.subheader("1. Add Visiting Card")
             st.caption(
-                "Scan 1 or 2 card sides with AI, merge an existing Excel sheet, or fill details manually."
+                "Scan 1 or 2 card sides with AI (max 5 MB/photo), merge an Excel sheet (max 500 rows), or fill manually."
             )
         with manual_col:
             st.markdown("<div style='height: 0.35rem'></div>", unsafe_allow_html=True)
@@ -3804,7 +4442,7 @@ def main() -> None:
 
         with tab_upload:
             uploaded_files = st.file_uploader(
-                "Upload 1 or 2 card photos (Front & Back — JPG or PNG)",
+                "Upload 1 or 2 card photos (Front & Back — JPG or PNG, max 5 MB each)",
                 type=["jpg", "jpeg", "png"],
                 accept_multiple_files=True,
                 key=f"card_file_uploader_{upload_rev}",
@@ -3815,6 +4453,10 @@ def main() -> None:
                         f"Maximum {MAX_CARD_IMAGES} images allowed (Front & Back). "
                         f"You selected {len(uploaded_files)} — please remove the extra file(s)."
                     )
+                elif any(
+                    getattr(f, "size", 0) > MAX_IMAGE_FILE_BYTES for f in uploaded_files
+                ):
+                    st.error("Each image must be 5 MB or smaller.")
                 else:
                     preview_cols = st.columns(2)
                     side_labels = ["Side 1 (Front)", "Side 2 (Back)"]
@@ -3863,8 +4505,8 @@ def main() -> None:
 
         with tab_excel:
             st.caption(
-                "Upload any `.xlsx` or `.csv` file. Standard columns auto-map into our format, "
-                "empty cells save as `N/A`, and any extra columns (like `Website` or `GSTIN`) are preserved automatically."
+                f"Upload an `.xlsx` or `.csv` file (max 2 MB, up to {MAX_EXCEL_IMPORT_ROWS} rows). "
+                "Standard columns auto-map into our format, empty cells save as `N/A`, and extra columns are preserved."
             )
             uploaded_excel = st.file_uploader(
                 "Choose an Excel (.xlsx) or CSV file to merge",
@@ -3873,21 +4515,29 @@ def main() -> None:
             )
 
             if uploaded_excel is not None:
-                try:
-                    if uploaded_excel.name.lower().endswith(".csv"):
-                        raw_excel_df = pd.read_csv(uploaded_excel, dtype=str)
-                    else:
-                        raw_excel_df = pd.read_excel(
-                            uploaded_excel, engine="openpyxl", dtype=str
-                        )
-                    raw_excel_df = raw_excel_df.dropna(how="all")
-                except Exception as excel_err:
-                    st.error(f"Could not read the file: {excel_err}")
+                if getattr(uploaded_excel, "size", 0) > MAX_EXCEL_FILE_BYTES:
+                    st.error("Uploaded spreadsheet exceeds the 2 MB limit.")
                     raw_excel_df = None
+                else:
+                    try:
+                        if uploaded_excel.name.lower().endswith(".csv"):
+                            raw_excel_df = pd.read_csv(uploaded_excel, dtype=str)
+                        else:
+                            raw_excel_df = pd.read_excel(
+                                uploaded_excel, engine="openpyxl", dtype=str
+                            )
+                        raw_excel_df = raw_excel_df.dropna(how="all")
+                    except Exception as excel_err:
+                        st.error(f"Could not read the file: {excel_err}")
+                        raw_excel_df = None
 
                 if raw_excel_df is not None:
                     if raw_excel_df.empty:
                         st.warning("The uploaded file has no data rows.")
+                    elif len(raw_excel_df) > MAX_EXCEL_IMPORT_ROWS:
+                        st.error(
+                            f"File has {len(raw_excel_df)} rows. Maximum allowed per import is {MAX_EXCEL_IMPORT_ROWS} rows."
+                        )
                     else:
                         excel_cols = [str(c) for c in raw_excel_df.columns.tolist()]
                         raw_excel_df.columns = excel_cols
@@ -3946,7 +4596,7 @@ def main() -> None:
                         if detected_extra_cols:
                             preserve_extra_cols = st.checkbox(
                                 f"Preserve {len(detected_extra_cols)} extra column(s) automatically "
-                                f"({', '.join(detected_extra_cols)}) — exported as separate columns in Excel",
+                                f"({', '.join(detected_extra_cols)})",
                                 value=True,
                                 key=f"preserve_extra_cols_{upload_rev}_{uploaded_excel.name}",
                             )
@@ -4021,7 +4671,9 @@ def main() -> None:
                                             )
                                         else:
                                             added = save_records_batch(
-                                                current_user_id, ready_rows
+                                                current_user_id,
+                                                ready_rows,
+                                                source_name=uploaded_excel.name,
                                             )
                                             clear_uploaded_inputs()
                                             extra_notes = []
@@ -4051,7 +4703,7 @@ def main() -> None:
                                             "Could not merge the Excel file right now. Please try again."
                                         )
 
-        if scans_remaining == 0:
+        if scans_remaining == 0 and quota_readable:
             st.info(
                 f"You have used all {daily_limit} AI scans for today. "
                 "Use **Fill Details Manually** or **Merge Existing Excel** above to keep adding cards."
@@ -4240,7 +4892,14 @@ def main() -> None:
 
                     if submitted:
                         parsed_extra = parse_extra_data_from_input(extra_details_text)
-                        if not has_at_least_one_field(
+                        clean_email_val = sanitize_text_field(email, 160)
+                        if (
+                            clean_email_val
+                            and clean_email_val.upper() != "N/A"
+                            and not is_valid_email(clean_email_val)
+                        ):
+                            st.error("Please enter a valid email address (or leave it blank / N/A).")
+                        elif not has_at_least_one_field(
                             company_name,
                             contact_person,
                             call_phone,
