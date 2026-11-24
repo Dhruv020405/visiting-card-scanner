@@ -55,6 +55,7 @@ RESETS_WORKSHEET = "password_resets"
 PBKDF2_ITERATIONS = 260_000
 MAX_CARD_IMAGES = 2
 
+# Google Sheet column order (Email directly after WhatsApp No. and before Product / Services)
 CARD_HEADERS = [
     "record_id",
     "user_id",
@@ -70,6 +71,7 @@ CARD_HEADERS = [
     "created_at",
 ]
 
+# Exact default table & Excel export column order
 DEFAULT_TABLE_COLUMNS = [
     "Company Name",
     "Contact Person",
@@ -147,7 +149,7 @@ def inject_clean_ui_css() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Browser localStorage Session Bridge (Zero URL Params, Zero Extra Packages)
+# Browser localStorage Session Bridge (Clean URL, No ?session= Param)
 # ---------------------------------------------------------------------------
 _SESSION_BRIDGE_JS = """
 export default function(component) {
@@ -274,7 +276,7 @@ def verify_session_token(token: str) -> Optional[str]:
 
 
 def login_user_session(user: dict[str, str]) -> None:
-    """Store user in session_state and schedule writing token to browser localStorage."""
+    """Store user in session_state and persist token in browser localStorage."""
     token = create_session_token(user["user_id"])
     st.session_state["auth_user"] = user
     st.session_state["session_token"] = token
@@ -282,7 +284,7 @@ def login_user_session(user: dict[str, str]) -> None:
 
 
 def logout_user_session() -> None:
-    """Clear user from session_state and schedule removing token from browser localStorage."""
+    """Clear user from session_state and remove token from browser localStorage."""
     st.session_state["auth_user"] = None
     st.session_state["session_token"] = None
     st.session_state["session_action"] = "clear"
@@ -290,10 +292,9 @@ def logout_user_session() -> None:
 
 def sync_and_restore_session() -> Tuple[Optional[dict[str, str]], bool]:
     """
-    Synchronize hidden browser localStorage session without ever touching URL params.
+    Synchronize hidden browser localStorage session without showing any token in the URL.
     Returns (auth_user_or_none, is_checking_browser_storage).
     """
-    # Strip any legacy ?session=... parameter if someone opened an old bookmark
     try:
         if "session" in st.query_params:
             st.query_params.pop("session", None)
@@ -326,11 +327,9 @@ def sync_and_restore_session() -> Tuple[Optional[dict[str, str]], bool]:
             st.session_state["session_action"] = "read"
         return None, False
 
-    # Already authenticated in this tab
     if st.session_state.get("auth_user") is not None:
         return st.session_state["auth_user"], False
 
-    # Fresh page load / browser refresh: ask browser localStorage for stored token
     res = _SESSION_BRIDGE(
         data={"action": "read"},
         default={"token": "__loading__"},
@@ -357,7 +356,6 @@ def sync_and_restore_session() -> Tuple[Optional[dict[str, str]], bool]:
                     st.session_state["session_token"] = stored_token
                     st.session_state["session_action"] = "set"
                     return restored, False
-        # Token expired or invalid: clear it from browser
         st.session_state["session_action"] = "clear"
 
     return None, False
@@ -516,6 +514,9 @@ class VisitingCard(BaseModel):
             "put ALL of them here separated by ' / '. Return 'N/A' only if no number applies."
         )
     )
+    email: str = Field(
+        description="Email address in English (Latin script). Return 'N/A' if missing."
+    )
     products_services: str = Field(
         description=(
             "Products or services offered by the company in English (Latin script). "
@@ -538,9 +539,6 @@ class VisitingCard(BaseModel):
             "Infer from the address or PIN code if clear; return 'N/A' if completely absent."
         )
     )
-    email: str = Field(
-        description="Email address in English (Latin script). Return 'N/A' if missing."
-    )
 
 
 def _clean_card_output(card: VisitingCard) -> VisitingCard:
@@ -552,10 +550,10 @@ def _clean_card_output(card: VisitingCard) -> VisitingCard:
             "contact_person": normalize_digits(card.contact_person).strip() or "N/A",
             "call_phone": format_phone_numbers(card.call_phone),
             "whatsapp_phone": format_phone_numbers(card.whatsapp_phone),
+            "email": normalize_digits(card.email).strip() or "N/A",
             "products_services": normalize_digits(card.products_services).strip() or "N/A",
             "address": normalize_digits(card.address).strip() or "N/A",
             "city": clean_city,
-            "email": normalize_digits(card.email).strip() or "N/A",
         }
     )
 
@@ -618,12 +616,12 @@ def _migrate_cards_worksheet_if_needed(cards_ws: gspread.Worksheet) -> None:
             "contact_person": old_rec.get("contact_person", "N/A"),
             "call_phone": call_val,
             "whatsapp_phone": wp_val,
+            "email": old_rec.get("email", "N/A"),
             "products_services": old_rec.get("products_services", "N/A"),
             "address": old_rec.get("address", "N/A"),
             "city": old_rec.get("city", "N/A") or "N/A",
             "notes": old_rec.get("notes", ""),
             "created_at": old_rec.get("created_at", ""),
-            "email": old_rec.get("email", "N/A"),
         }
         migrated_rows.append([new_rec[col] for col in CARD_HEADERS])
 
@@ -932,13 +930,16 @@ def confirm_password_reset(
     if len(reset_rows) <= 1:
         return False, "No reset code found. Please request a new code."
 
-    # Find the most recent unused code for this email
     matched_reset_row_idx: Optional[int] = None
     matched_reset_data: Optional[list[str]] = None
     for idx in range(len(reset_rows) - 1, 0, -1):
         row = reset_rows[idx]
-        if len(row) >= 4 and row[0].strip().lower() == clean_email and row[3].strip().lower() != "yes":
-            matched_reset_row_idx = idx + 1  # 1-indexed sheet row
+        if (
+            len(row) >= 4
+            and row[0].strip().lower() == clean_email
+            and row[3].strip().lower() != "yes"
+        ):
+            matched_reset_row_idx = idx + 1
             matched_reset_data = row
             break
 
@@ -956,7 +957,6 @@ def confirm_password_reset(
     if not verify_password(clean_code, matched_reset_data[1]):
         return False, "Incorrect verification code. Please check your email and try again."
 
-    # Update password hash in `users` worksheet
     users_ws = get_users_worksheet()
     user_rows = users_ws.get_all_values()
     updated_user = False
@@ -974,7 +974,6 @@ def confirm_password_reset(
     if not updated_user:
         return False, "Account could not be found."
 
-    # Mark code as used
     resets_ws.update(
         values=[["yes"]],
         range_name=f"D{matched_reset_row_idx}",
@@ -1026,12 +1025,12 @@ def fetch_user_records(user_id: str) -> pd.DataFrame:
                     "WhatsApp No.": format_phone_numbers(
                         record.get("whatsapp_phone", "N/A")
                     ),
+                    "Email": record.get("email", "N/A"),
                     "Product / Services": record.get("products_services", "N/A"),
                     "Address": record.get("address", "N/A"),
                     "City": record.get("city", "N/A") or "N/A",
                     "Notes": record.get("notes", ""),
                     "Saved On": record.get("created_at", ""),
-                    "Email": record.get("email", "N/A"),
                 }
             )
 
@@ -1052,11 +1051,11 @@ def search_records_df(df: pd.DataFrame, query: str) -> pd.DataFrame:
         | df["Contact Person"].str.contains(q, case=False, na=False)
         | df["Contact No."].str.contains(q, case=False, na=False)
         | df["WhatsApp No."].str.contains(q, case=False, na=False)
+        | df["Email"].str.contains(q, case=False, na=False)
         | df["Product / Services"].str.contains(q, case=False, na=False)
         | df["Address"].str.contains(q, case=False, na=False)
         | df["City"].str.contains(q, case=False, na=False)
         | df["Notes"].str.contains(q, case=False, na=False)
-        | df["Email"].str.contains(q, case=False, na=False)
     )
     return df[mask]
 
@@ -1102,8 +1101,8 @@ def find_duplicate_records(
                     "Contact Person": row["Contact Person"],
                     "Contact No.": row["Contact No."],
                     "WhatsApp No.": row["WhatsApp No."],
-                    "City": row["City"],
                     "Email": row["Email"],
+                    "City": row["City"],
                     "Saved On": row["Saved On"],
                     "Matched By": " | ".join(reasons),
                 }
@@ -1118,11 +1117,11 @@ def save_record(
     contact_person: str,
     call_phone: str,
     whatsapp_phone: str,
+    email: str,
     products_services: str,
     address: str,
     city: str,
     notes: str,
-    email: str,
 ) -> str:
     ws = get_cards_worksheet()
 
@@ -1162,11 +1161,11 @@ def update_record(
     contact_person: str,
     call_phone: str,
     whatsapp_phone: str,
+    email: str,
     products_services: str,
     address: str,
     city: str,
     notes: str,
-    email: str,
 ) -> bool:
     ws = get_cards_worksheet()
     all_rows = ws.get_all_values()
@@ -1430,10 +1429,10 @@ def open_blank_manual_form() -> None:
         "contact_person": "",
         "call_phone": "N/A",
         "whatsapp_phone": "",
+        "email": "N/A",
         "products_services": "",
         "address": "",
         "city": "",
-        "email": "N/A",
     }
     st.session_state["pending_duplicate_save"] = None
     st.session_state["scan_counter"] += 1
@@ -1646,7 +1645,7 @@ def main() -> None:
         )
         return
 
-    # Restore hidden browser session (no session ID in URL)
+    # Restore hidden browser session (clean URL, no session ID in link)
     auth_user, is_checking_session = sync_and_restore_session()
     if is_checking_session:
         st.caption("Checking your session...")
@@ -1841,11 +1840,11 @@ def main() -> None:
                             contact_person=data["contact_person"],
                             call_phone=data["call_phone"],
                             whatsapp_phone=data["whatsapp_phone"],
+                            email=data["email"],
                             products_services=data["products_services"],
                             address=data["address"],
                             city=data["city"],
                             notes=data["notes"],
-                            email=data["email"],
                         )
                         st.session_state["pending_duplicate_save"] = None
                         st.session_state["extracted_card"] = None
@@ -1909,39 +1908,42 @@ def main() -> None:
                         key=f"whatsapp_{suffix}",
                     )
 
+                # Email directly after WhatsApp No. and before Product / Services
                 r3_c1, r3_c2 = st.columns(2)
                 with r3_c1:
+                    email = st.text_input(
+                        "Email",
+                        value=card.get("email", "N/A"),
+                        key=f"email_{suffix}",
+                    )
+                with r3_c2:
                     products_services = st.text_input(
                         "Product / Services",
                         value=card.get("products_services", "N/A"),
                         key=f"products_{suffix}",
                     )
-                with r3_c2:
-                    city = st.text_input(
-                        "City",
-                        value=card.get("city", "N/A"),
-                        placeholder="e.g., Ahmedabad, Mumbai, Surat...",
-                        key=f"city_{suffix}",
-                    )
 
-                notes = st.text_input(
-                    "Notes (Optional)",
-                    placeholder="e.g., Met at trade fair, wholesale supplier...",
-                    key=f"notes_{suffix}",
-                )
-
-                # Email right before Address
-                email = st.text_input(
-                    "Email",
-                    value=card.get("email", "N/A"),
-                    key=f"email_{suffix}",
-                )
                 address = st.text_area(
                     "Address",
                     value=card.get("address", "N/A"),
                     height=85,
                     key=f"address_{suffix}",
                 )
+
+                r4_c1, r4_c2 = st.columns(2)
+                with r4_c1:
+                    city = st.text_input(
+                        "City",
+                        value=card.get("city", "N/A"),
+                        placeholder="e.g., Ahmedabad, Mumbai, Surat...",
+                        key=f"city_{suffix}",
+                    )
+                with r4_c2:
+                    notes = st.text_input(
+                        "Notes (Optional)",
+                        placeholder="e.g., Met at trade fair, wholesale supplier...",
+                        key=f"notes_{suffix}",
+                    )
 
                 btn_col1, btn_col2, _ = st.columns([1.2, 1, 4])
                 with btn_col1:
@@ -1964,11 +1966,11 @@ def main() -> None:
                                     "contact_person": contact_person,
                                     "call_phone": call_phone,
                                     "whatsapp_phone": whatsapp_phone,
+                                    "email": email,
                                     "products_services": products_services,
                                     "address": address,
                                     "city": city,
                                     "notes": notes,
-                                    "email": email,
                                 },
                                 "matches": matches,
                             }
@@ -1980,11 +1982,11 @@ def main() -> None:
                                 contact_person=contact_person,
                                 call_phone=call_phone,
                                 whatsapp_phone=whatsapp_phone,
+                                email=email,
                                 products_services=products_services,
                                 address=address,
                                 city=city,
                                 notes=notes,
-                                email=email,
                             )
                             st.session_state["extracted_card"] = None
                             st.session_state["flash_success"] = (
@@ -2033,7 +2035,7 @@ def main() -> None:
     with search_col:
         search_query = st.text_input(
             "Search records",
-            placeholder="Search by company, person, phone, product, city, email, or address...",
+            placeholder="Search by company, person, phone, email, product, city, or address...",
             label_visibility="collapsed",
         )
 
@@ -2056,7 +2058,6 @@ def main() -> None:
         filtered_df = search_records_df(filtered_df, search_query)
 
     is_filtered = bool(search_query.strip()) or selected_city != "All Cities"
-
     display_df = filtered_df[DEFAULT_TABLE_COLUMNS]
 
     with export_col:
@@ -2100,7 +2101,7 @@ def main() -> None:
     with st.expander("Update a record (by search)"):
         edit_query = st.text_input(
             "Search card to update",
-            placeholder="Type company name, contact person, phone, city, or email...",
+            placeholder="Type company name, contact person, phone, email, or city...",
             key="search_record_to_edit",
         )
 
@@ -2170,37 +2171,41 @@ def main() -> None:
                                 key=f"upd_whatsapp_{edit_id}_{edit_rev}",
                             )
 
+                        # Email directly after WhatsApp No. and before Product / Services
                         er3_c1, er3_c2 = st.columns(2)
                         with er3_c1:
+                            upd_email = st.text_input(
+                                "Email",
+                                value=str(selected_edit_row["Email"]),
+                                key=f"upd_email_{edit_id}_{edit_rev}",
+                            )
+                        with er3_c2:
                             upd_products = st.text_input(
                                 "Product / Services",
                                 value=str(selected_edit_row["Product / Services"]),
                                 key=f"upd_products_{edit_id}_{edit_rev}",
                             )
-                        with er3_c2:
-                            upd_city = st.text_input(
-                                "City",
-                                value=str(selected_edit_row["City"]),
-                                key=f"upd_city_{edit_id}_{edit_rev}",
-                            )
 
-                        upd_notes = st.text_input(
-                            "Notes (Optional)",
-                            value=str(selected_edit_row["Notes"]),
-                            key=f"upd_notes_{edit_id}_{edit_rev}",
-                        )
-
-                        upd_email = st.text_input(
-                            "Email",
-                            value=str(selected_edit_row["Email"]),
-                            key=f"upd_email_{edit_id}_{edit_rev}",
-                        )
                         upd_address = st.text_area(
                             "Address",
                             value=str(selected_edit_row["Address"]),
                             height=85,
                             key=f"upd_address_{edit_id}_{edit_rev}",
                         )
+
+                        er4_c1, er4_c2 = st.columns(2)
+                        with er4_c1:
+                            upd_city = st.text_input(
+                                "City",
+                                value=str(selected_edit_row["City"]),
+                                key=f"upd_city_{edit_id}_{edit_rev}",
+                            )
+                        with er4_c2:
+                            upd_notes = st.text_input(
+                                "Notes (Optional)",
+                                value=str(selected_edit_row["Notes"]),
+                                key=f"upd_notes_{edit_id}_{edit_rev}",
+                            )
 
                         update_submitted = st.form_submit_button(
                             "Update Record", type="primary"
@@ -2215,11 +2220,11 @@ def main() -> None:
                                     contact_person=upd_contact,
                                     call_phone=upd_call,
                                     whatsapp_phone=upd_whatsapp,
+                                    email=upd_email,
                                     products_services=upd_products,
                                     address=upd_address,
                                     city=upd_city,
                                     notes=upd_notes,
-                                    email=upd_email,
                                 )
                                 if updated:
                                     st.session_state["edit_counter"] += 1
@@ -2240,7 +2245,7 @@ def main() -> None:
     with st.expander("Delete a record (by search)"):
         del_query = st.text_input(
             "Search card to delete",
-            placeholder="Type company name, contact person, phone, city, or email...",
+            placeholder="Type company name, contact person, phone, email, or city...",
             key="search_record_to_delete",
         )
 
