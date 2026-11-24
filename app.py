@@ -1,11 +1,12 @@
 import io
 import os
 import re
-import sqlite3
 import time
+import uuid
 from datetime import datetime
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
+import gspread
 import pandas as pd
 import streamlit as st
 from google import genai
@@ -16,15 +17,63 @@ from pydantic import BaseModel, Field
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-DB_PATH = "company_records.db"
 MODEL_NAME = "gemini-3.5-flash-lite"
 FALLBACK_MODELS = ["gemini-3.6-flash", "gemini-3.8-flash"]
+
+CARDS_WORKSHEET = "visiting_cards"
+USERS_WORKSHEET = "users"
+
+CARD_HEADERS = [
+    "record_id",
+    "user_id",
+    "company_name",
+    "contact_person",
+    "phone",
+    "email",
+    "address",
+    "products_services",
+    "notes",
+    "created_at",
+]
+
+# Pre-created worksheet schema for future Login & Register support
+USER_HEADERS = [
+    "user_id",
+    "username",
+    "email",
+    "password_hash",
+    "role",
+    "created_at",
+]
 
 st.set_page_config(
     page_title="Company Visiting Card Scanner",
     page_icon="📇",
     layout="wide",
 )
+
+
+# ---------------------------------------------------------------------------
+# Secret & Session Helpers (Multi-User Ready)
+# ---------------------------------------------------------------------------
+def get_secret(key: str, default: Any = None) -> Any:
+    """Safely read a key from st.secrets or environment variables."""
+    try:
+        if key in st.secrets:
+            return st.secrets[key]
+    except Exception:
+        pass
+    return os.getenv(key, default)
+
+
+def get_current_user_id() -> str:
+    """
+    Return the active user's ID.
+    Currently defaults to 'default_user'. When Login/Register is added later,
+    authentication simply sets st.session_state['user_id'] and every query
+    automatically isolates that user's visiting cards.
+    """
+    return st.session_state.get("user_id", "default_user")
 
 
 # ---------------------------------------------------------------------------
@@ -56,30 +105,108 @@ class VisitingCard(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# SQLite Database Helpers
+# Google Sheets Storage Layer (Drop-In Multi-User Backend)
 # ---------------------------------------------------------------------------
-def init_db() -> None:
-    """Create the SQLite database and records table if they do not exist."""
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS visiting_cards (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                company_name TEXT NOT NULL,
-                contact_person TEXT NOT NULL,
-                phone TEXT NOT NULL,
-                email TEXT NOT NULL,
-                address TEXT NOT NULL,
-                products_services TEXT NOT NULL,
-                notes TEXT DEFAULT '',
-                created_at TEXT NOT NULL
-            )
-            """
+@st.cache_resource(show_spinner=False)
+def get_spreadsheet() -> gspread.Spreadsheet:
+    """Authenticate via service account from Streamlit secrets and open the Sheet."""
+    creds_section = get_secret("gcp_service_account")
+    sheet_url = get_secret("GSHEET_URL")
+
+    if not creds_section or not sheet_url:
+        raise ValueError(
+            "Google Sheets is not configured. Add `GSHEET_URL` and "
+            "`[gcp_service_account]` to Streamlit Secrets."
         )
-        conn.commit()
+
+    creds_dict = dict(creds_section)
+    client = gspread.service_account_from_dict(creds_dict)
+    spreadsheet = client.open_by_url(str(sheet_url).strip())
+    ensure_worksheets(spreadsheet)
+    return spreadsheet
+
+
+def ensure_worksheets(spreadsheet: gspread.Spreadsheet) -> None:
+    """Create 'visiting_cards' and 'users' worksheets with headers if missing."""
+    existing_titles = {ws.title for ws in spreadsheet.worksheets()}
+
+    if CARDS_WORKSHEET not in existing_titles:
+        cards_ws = spreadsheet.add_worksheet(
+            title=CARDS_WORKSHEET, rows=1000, cols=len(CARD_HEADERS)
+        )
+        cards_ws.append_row(CARD_HEADERS, value_input_option="RAW")
+    else:
+        cards_ws = spreadsheet.worksheet(CARDS_WORKSHEET)
+        if not cards_ws.row_values(1):
+            cards_ws.append_row(CARD_HEADERS, value_input_option="RAW")
+
+    if USERS_WORKSHEET not in existing_titles:
+        users_ws = spreadsheet.add_worksheet(
+            title=USERS_WORKSHEET, rows=500, cols=len(USER_HEADERS)
+        )
+        users_ws.append_row(USER_HEADERS, value_input_option="RAW")
+
+
+def get_cards_worksheet() -> gspread.Worksheet:
+    """Return the visiting_cards worksheet handle."""
+    return get_spreadsheet().worksheet(CARDS_WORKSHEET)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _fetch_all_card_rows() -> list[list[str]]:
+    """Fetch all raw rows from Google Sheets (cached for 60s to avoid quota limits)."""
+    ws = get_cards_worksheet()
+    return ws.get_all_values()
+
+
+def fetch_user_records(user_id: str) -> pd.DataFrame:
+    """Return all saved visiting cards belonging to `user_id`, newest first."""
+    all_rows = _fetch_all_card_rows()
+    display_cols = [
+        "Record ID",
+        "Company Name",
+        "Contact Person",
+        "Phone",
+        "Email",
+        "Products / Services",
+        "Address",
+        "Notes",
+        "Saved On",
+    ]
+
+    if len(all_rows) <= 1:
+        return pd.DataFrame(columns=display_cols)
+
+    headers = all_rows[0]
+    data_rows = []
+    for row in all_rows[1:]:
+        # Pad short rows safely in case trailing cells are blank
+        padded = row + [""] * (len(headers) - len(row))
+        record = dict(zip(headers, padded))
+        if record.get("user_id") == user_id:
+            data_rows.append(
+                {
+                    "Record ID": record.get("record_id", ""),
+                    "Company Name": record.get("company_name", "N/A"),
+                    "Contact Person": record.get("contact_person", "N/A"),
+                    "Phone": record.get("phone", "N/A"),
+                    "Email": record.get("email", "N/A"),
+                    "Products / Services": record.get("products_services", "N/A"),
+                    "Address": record.get("address", "N/A"),
+                    "Notes": record.get("notes", ""),
+                    "Saved On": record.get("created_at", ""),
+                }
+            )
+
+    if not data_rows:
+        return pd.DataFrame(columns=display_cols)
+
+    # Reverse so the most recently added cards appear at the top
+    return pd.DataFrame(data_rows[::-1], columns=display_cols)
 
 
 def save_record(
+    user_id: str,
     company_name: str,
     contact_person: str,
     phone: str,
@@ -87,60 +214,45 @@ def save_record(
     address: str,
     products_services: str,
     notes: str,
-) -> None:
-    """Insert a verified visiting card record with the current timestamp."""
+) -> str:
+    """Append a verified visiting card row to Google Sheets and clear cache."""
+    ws = get_cards_worksheet()
+    record_id = uuid.uuid4().hex[:8]
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            """
-            INSERT INTO visiting_cards (
-                company_name, contact_person, phone, email,
-                address, products_services, notes, created_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                company_name.strip() or "N/A",
-                contact_person.strip() or "N/A",
-                phone.strip() or "N/A",
-                email.strip() or "N/A",
-                address.strip() or "N/A",
-                products_services.strip() or "N/A",
-                notes.strip(),
-                timestamp,
-            ),
-        )
-        conn.commit()
+
+    row = [
+        record_id,
+        user_id,
+        company_name.strip() or "N/A",
+        contact_person.strip() or "N/A",
+        phone.strip() or "N/A",
+        email.strip() or "N/A",
+        address.strip() or "N/A",
+        products_services.strip() or "N/A",
+        notes.strip(),
+        timestamp,
+    ]
+
+    # RAW prevents Google Sheets from treating '+91...' phone numbers as formulas
+    ws.append_row(row, value_input_option="RAW", table_range="A1")
+    _fetch_all_card_rows.clear()
+    return record_id
 
 
-def fetch_all_records() -> pd.DataFrame:
-    """Return all saved records as a pandas DataFrame, newest first."""
-    with sqlite3.connect(DB_PATH) as conn:
-        df = pd.read_sql_query(
-            """
-            SELECT
-                id AS "ID",
-                company_name AS "Company Name",
-                contact_person AS "Contact Person",
-                phone AS "Phone",
-                email AS "Email",
-                products_services AS "Products / Services",
-                address AS "Address",
-                notes AS "Notes",
-                created_at AS "Saved On"
-            FROM visiting_cards
-            ORDER BY id DESC
-            """,
-            conn,
-        )
-    return df
+def delete_record(record_id: str, user_id: str) -> bool:
+    """Delete a record only if both record_id and user_id match."""
+    ws = get_cards_worksheet()
+    all_rows = ws.get_all_values()
 
+    for sheet_row_idx, row in enumerate(all_rows[1:], start=2):
+        row_record_id = row[0] if len(row) > 0 else ""
+        row_user_id = row[1] if len(row) > 1 else ""
+        if row_record_id == record_id and row_user_id == user_id:
+            ws.delete_rows(sheet_row_idx)
+            _fetch_all_card_rows.clear()
+            return True
 
-def delete_record(record_id: int) -> None:
-    """Delete a record by its ID."""
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("DELETE FROM visiting_cards WHERE id = ?", (record_id,))
-        conn.commit()
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -224,11 +336,9 @@ def extract_card_details(
 
             except genai_errors.APIError as api_err:
                 last_error = api_err
-                # Retry briefly on temporary overload (503) or rate limit (429)
                 if api_err.code in (429, 503):
                     time.sleep(2 * (attempt + 1))
                     continue
-                # If a model is unavailable (404), skip straight to the next fallback
                 if api_err.code == 404:
                     break
                 raise
@@ -269,9 +379,8 @@ def run_scan(image_file, api_key: str) -> None:
 # Main Application
 # ---------------------------------------------------------------------------
 def main() -> None:
-    init_db()
+    current_user_id = get_current_user_id()
 
-    # Initialize session state variables
     if "extracted_card" not in st.session_state:
         st.session_state["extracted_card"] = None
     if "scan_counter" not in st.session_state:
@@ -281,35 +390,57 @@ def main() -> None:
     if "scan_notice" not in st.session_state:
         st.session_state["scan_notice"] = None
 
-    # ---- Sidebar: Settings & API Key ----
+    # Verify Google Sheets connection upfront
+    storage_ready = False
+    storage_error = None
+    try:
+        get_spreadsheet()
+        storage_ready = True
+    except Exception as exc:
+        storage_error = str(exc)
+
+    # ---- Sidebar: Settings & Connection Status ----
     with st.sidebar:
         st.header("Settings")
 
-        env_api_key = os.getenv("GEMINI_API_KEY", "")
+        default_api_key = str(get_secret("GEMINI_API_KEY", "") or "")
         user_api_key = st.text_input(
             "Gemini API Key",
-            value=env_api_key,
+            value=default_api_key,
             type="password",
             placeholder="AIza... or AQ...",
-            help="Reads GEMINI_API_KEY from your environment if already set.",
+            help="Automatically loads GEMINI_API_KEY from Streamlit Secrets if set.",
         )
-        active_api_key: Optional[str] = (user_api_key or env_api_key).strip()
+        active_api_key = (user_api_key or default_api_key).strip()
 
         if active_api_key:
-            st.success("API key configured")
+            st.success("Gemini API key configured")
         else:
             st.warning("Enter your Gemini API key to start scanning.")
 
+        if storage_ready:
+            st.success("Google Sheets connected")
+        else:
+            st.error("Google Sheets not connected")
+
         st.divider()
+        st.caption(f"Active account: `{current_user_id}`")
         st.caption(f"Primary model: `{MODEL_NAME}`")
         st.caption(f"Fallbacks: `{', '.join(FALLBACK_MODELS)}`")
-        st.caption(f"Database: `{DB_PATH}`")
 
     # ---- Page Header ----
     st.title("Company Visiting Card Scanner")
     st.caption(
-        "Scan visiting cards with AI, verify the details, save locally, and export to Excel."
+        "Scan visiting cards with AI, verify the details, save permanently to Google Sheets, and export to Excel."
     )
+
+    if not storage_ready:
+        st.error(f"Storage setup required: {storage_error}")
+        st.info(
+            "Add `GSHEET_URL` and `[gcp_service_account]` in Streamlit Cloud → Settings → Secrets, "
+            "and share your Google Sheet with the service account's `client_email` as Editor."
+        )
+        return
 
     if st.session_state["flash_success"]:
         st.success(st.session_state["flash_success"])
@@ -410,13 +541,14 @@ def main() -> None:
 
             btn_col1, btn_col2, _ = st.columns([1.2, 1, 4])
             with btn_col1:
-                submitted = st.form_submit_button("Save Record", type="primary")
+                submitted = st.form_submit_button("Save to Google Sheets", type="primary")
             with btn_col2:
                 discarded = st.form_submit_button("Discard")
 
             if submitted:
                 try:
                     save_record(
+                        user_id=current_user_id,
                         company_name=company_name,
                         contact_person=contact_person,
                         phone=phone,
@@ -427,11 +559,11 @@ def main() -> None:
                     )
                     st.session_state["extracted_card"] = None
                     st.session_state["flash_success"] = (
-                        f"Saved '{company_name}' to {DB_PATH}."
+                        f"Saved '{company_name}' permanently to Google Sheets."
                     )
                     st.rerun()
-                except sqlite3.Error as db_err:
-                    st.error(f"Database error while saving: {db_err}")
+                except Exception as sheet_err:
+                    st.error(f"Could not save to Google Sheets: {sheet_err}")
 
             if discarded:
                 st.session_state["extracted_card"] = None
@@ -439,12 +571,18 @@ def main() -> None:
 
     # ---- Step 3: Saved Records, Search & Excel Export ----
     st.divider()
-    st.subheader("3. Saved Visiting Cards")
+    header_col, refresh_col = st.columns([5, 1])
+    with header_col:
+        st.subheader("3. Saved Visiting Cards")
+    with refresh_col:
+        if st.button("Refresh", use_container_width=True):
+            _fetch_all_card_rows.clear()
+            st.rerun()
 
     try:
-        all_records_df = fetch_all_records()
-    except sqlite3.Error as db_err:
-        st.error(f"Failed to load records from database: {db_err}")
+        all_records_df = fetch_user_records(current_user_id)
+    except Exception as sheet_err:
+        st.error(f"Failed to load records from Google Sheets: {sheet_err}")
         return
 
     search_col, export_col = st.columns([3, 1])
@@ -494,12 +632,12 @@ def main() -> None:
 
     st.dataframe(filtered_df, use_container_width=True, hide_index=True)
 
-    # Compact utility to remove accidental entries
+    # Compact utility to remove accidental entries (scoped to active user)
     with st.expander("Delete a record"):
         record_options = {
-            f"ID {row['ID']} — {row['Company Name']} ({row['Contact Person']})": int(
-                row["ID"]
-            )
+            f"{row['Record ID']} — {row['Company Name']} ({row['Contact Person']})": row[
+                "Record ID"
+            ]
             for _, row in all_records_df.iterrows()
         }
         selected_label = st.selectbox(
@@ -507,12 +645,15 @@ def main() -> None:
         )
         if st.button("Delete Selected Record", type="secondary"):
             try:
-                delete_record(record_options[selected_label])
-                st.session_state["flash_success"] = "Record deleted."
-                st.rerun()
-            except sqlite3.Error as db_err:
-                st.error(f"Could not delete record: {db_err}")
+                deleted = delete_record(record_options[selected_label], current_user_id)
+                if deleted:
+                    st.session_state["flash_success"] = "Record deleted from Google Sheets."
+                    st.rerun()
+                else:
+                    st.warning("Record not found or already deleted.")
+            except Exception as sheet_err:
+                st.error(f"Could not delete record: {sheet_err}")
 
 
 if __name__ == "__main__":
-    main() #aa
+    main()
