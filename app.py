@@ -1,3 +1,4 @@
+import csv
 import hashlib
 import hmac
 import html
@@ -33,7 +34,7 @@ from pydantic import BaseModel, Field
 # ---------------------------------------------------------------------------
 # Configuration & Security Constants
 # ---------------------------------------------------------------------------
-SCHEMA_VERSION = "v9_security_and_integrity"
+SCHEMA_VERSION = "v10_cross_worker_and_schema_hardened"
 
 MODEL_CHAIN = [
     "gemini-3.5-flash-lite",
@@ -42,18 +43,22 @@ MODEL_CHAIN = [
     "gemini-3.8-flash",
 ]
 
-# Anti-504 Timeout & Image Optimization Settings
+# Anti-504 Timeout & Fixed Process-Wide Image Pixel Limit
 PER_REQUEST_TIMEOUT_MS = 22_000
 TOTAL_SCAN_BUDGET_SEC = 45.0
 MAX_IMAGE_SIDE_PX = 1400
 JPEG_QUALITY = 82
 MAX_DECODED_IMAGE_PIXELS = 25_000_000  # 25 megapixels max decoded image size
 
+# Set Pillow decompression-bomb limit once at startup (never mutated per request)
+Image.MAX_IMAGE_PIXELS = MAX_DECODED_IMAGE_PIXELS
+
 # Upload & Import Safeguards
 MAX_CARD_IMAGES = 2
 MAX_IMAGE_FILE_BYTES = 5 * 1024 * 1024     # 5 MB max per card image
 MAX_EXCEL_FILE_BYTES = 2 * 1024 * 1024     # 2 MB max per Excel/CSV upload
-MAX_EXCEL_IMPORT_ROWS = 500                # Max 500 rows per import batch
+MAX_EXCEL_IMPORT_ROWS = 500                # Max 500 non-empty rows per import batch
+MAX_PHYSICAL_ROWS_SCANNED = 2000           # Max 2000 physical rows scanned (including blanks)
 MAX_EXCEL_IMPORT_COLS = 40                 # Max 40 columns per import file
 MAX_FIELD_LEN = 250
 MAX_LONG_FIELD_LEN = 800
@@ -83,7 +88,7 @@ SESSIONS_WORKSHEET = "sessions"
 RATE_LIMITS_WORKSHEET = "auth_rate_limits"
 AUDIT_LOGS_WORKSHEET = "audit_logs"
 
-# Process-level lock to serialize quota, session, and duplicate write operations
+# In-process lock paired with cross-worker optimistic compare-and-verify on Sheets
 _WRITE_LOCK = threading.Lock()
 
 # Worksheet Schemas
@@ -172,14 +177,6 @@ OTP_HEADERS = [
     "expires_at",
     "used",
     "attempts",
-    "created_at",
-]
-
-LEGACY_OTP_HEADERS = [
-    "email",
-    "code_hash",
-    "expires_at",
-    "used",
     "created_at",
 ]
 
@@ -782,10 +779,7 @@ def validate_and_serialize_extra_data(
 ) -> Tuple[str, list[str]]:
     """
     Serialize extra key-value pairs into valid JSON within MAX_LONG_FIELD_LEN (800 chars).
-    - Never truncates raw JSON strings mid-token.
-    - When `strict=True` (forms), raises ValueError if total JSON exceeds MAX_LONG_FIELD_LEN.
-    - When `strict=False` (batch Excel import), drops overflowing keys cleanly at key
-      boundaries and returns `(valid_json, dropped_key_names)` so the caller can notify the user.
+    Never truncates raw JSON mid-token.
     """
     cleaned: dict[str, str] = {}
     for k, v in extra.items():
@@ -909,21 +903,29 @@ def build_expanded_dataframe(
 
 def optimize_card_image(raw_bytes: bytes, fallback_mime: str) -> Tuple[bytes, str]:
     """
-    Validate, decode with a strict 25-megapixel limit, auto-orient, and compress
-    visiting card photos to JPEG. Never falls back to sending raw unvalidated bytes.
+    Validate dimensions against MAX_DECODED_IMAGE_PIXELS, auto-orient, and compress
+    visiting card photos to JPEG without mutating global Pillow settings per request.
     """
     if not raw_bytes or len(raw_bytes) > MAX_IMAGE_FILE_BYTES:
         raise ValueError("Image is empty or exceeds the 5 MB upload limit.")
 
-    prev_max_pixels = Image.MAX_IMAGE_PIXELS
-    Image.MAX_IMAGE_PIXELS = MAX_DECODED_IMAGE_PIXELS
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("error", Image.DecompressionBombWarning)
             with Image.open(io.BytesIO(raw_bytes)) as img:
+                width, height = img.size
+                if width <= 0 or height <= 0 or (width * height) > MAX_DECODED_IMAGE_PIXELS:
+                    raise ValueError(
+                        "Image resolution is too large (exceeds 25 megapixels). Please upload a standard photo."
+                    )
                 img.verify()
 
             with Image.open(io.BytesIO(raw_bytes)) as img:
+                width, height = img.size
+                if width <= 0 or height <= 0 or (width * height) > MAX_DECODED_IMAGE_PIXELS:
+                    raise ValueError(
+                        "Image resolution is too large (exceeds 25 megapixels). Please upload a standard photo."
+                    )
                 img = ImageOps.exif_transpose(img)
                 if img.mode in ("RGBA", "LA", "P"):
                     background = Image.new("RGB", img.size, (255, 255, 255))
@@ -942,6 +944,8 @@ def optimize_card_image(raw_bytes: bytes, fallback_mime: str) -> Tuple[bytes, st
                 out = io.BytesIO()
                 img.save(out, format="JPEG", quality=JPEG_QUALITY, optimize=True)
                 return out.getvalue(), "image/jpeg"
+    except ValueError:
+        raise
     except (Image.DecompressionBombError, Image.DecompressionBombWarning) as bomb_err:
         raise ValueError(
             "Image resolution is too large (exceeds 25 megapixels). Please upload a standard photo."
@@ -951,14 +955,34 @@ def optimize_card_image(raw_bytes: bytes, fallback_mime: str) -> Tuple[bytes, st
             "Could not process this image file (it may be corrupted or unsupported). "
             "Please upload a valid JPG or PNG photo."
         ) from img_err
-    finally:
-        Image.MAX_IMAGE_PIXELS = prev_max_pixels
 
 
 def clear_uploaded_inputs() -> None:
     st.session_state["uploader_reset_counter"] = (
         st.session_state.get("uploader_reset_counter", 0) + 1
     )
+
+
+def clear_account_specific_state(preserve_flash: bool = False) -> None:
+    """
+    Reset all account-specific session state (forms, generated AI playbooks/pitches,
+    legacy consent flags, active view, and file uploaders) on logout, expiry, or user switch.
+    """
+    st.session_state["bound_user_id"] = None
+    st.session_state["active_view"] = "home"
+    st.session_state["extracted_card"] = None
+    st.session_state["is_manual_entry"] = False
+    st.session_state["pending_duplicate_save"] = None
+    st.session_state["scan_notice"] = None
+    st.session_state["audit_warning"] = None
+    st.session_state["ai_growth_output"] = None
+    st.session_state["ai_pitch_output"] = None
+    st.session_state["ai_consent_enabled"] = False
+    st.session_state["edit_counter"] = st.session_state.get("edit_counter", 0) + 1
+    clear_uploaded_inputs()
+    if not preserve_flash:
+        st.session_state["flash_success"] = None
+        st.session_state["flash_info"] = None
 
 
 # ---------------------------------------------------------------------------
@@ -1076,7 +1100,7 @@ def _clean_card_output(card: VisitingCard) -> Tuple[VisitingCard, dict[str, str]
 
 
 # ---------------------------------------------------------------------------
-# Google Sheets Storage Layer (Auto-Creates, Migrates & Repairs All Schemas)
+# Google Sheets Storage Layer (Strict Header Validation & Migration)
 # ---------------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def get_spreadsheet(_schema_version: str = SCHEMA_VERSION) -> gspread.Spreadsheet:
@@ -1122,6 +1146,14 @@ def _migrate_cards_worksheet_if_needed(cards_ws: gspread.Worksheet) -> None:
             )
         return
 
+    allowed_card_cols = set(CARD_HEADERS) | {"phone"}
+    non_empty_headers = [h for h in normalized_headers if h.strip()]
+    unknown = [h for h in non_empty_headers if h not in allowed_card_cols]
+    if unknown:
+        raise ValueError(
+            f"Schema mismatch in worksheet '{CARDS_WORKSHEET}': unexpected column(s) {unknown}."
+        )
+
     migrated_rows = [CARD_HEADERS]
     for row in all_rows[1:]:
         if not any(cell.strip() for cell in row):
@@ -1159,38 +1191,63 @@ def _migrate_cards_worksheet_if_needed(cards_ws: gspread.Worksheet) -> None:
     )
 
 
-def _migrate_otp_worksheet_if_needed(ws: gspread.Worksheet) -> None:
-    """Migrate legacy 5-column OTP worksheets to the 6-column schema with `attempts`."""
+def _migrate_or_validate_worksheet(
+    ws: gspread.Worksheet,
+    expected_headers: list[str],
+    sheet_label: str,
+    defaults: Optional[dict[str, str]] = None,
+) -> None:
+    """
+    Ensure `ws` has the exact `expected_headers` order.
+    - If empty, initializes row 1.
+    - If headers are reordered or missing newly added columns (e.g., `attempts` in OTP tabs),
+      migrates rows by header name into `expected_headers`.
+    - If unrecognized/incompatible columns exist, raises a clear startup ValueError so
+      no downstream code ever misreads column positions.
+    """
     all_rows = ws.get_all_values()
     if not all_rows:
-        ws.append_row(OTP_HEADERS, value_input_option="RAW")
+        if ws.col_count < len(expected_headers):
+            ws.resize(cols=len(expected_headers))
+        ws.append_row(expected_headers, value_input_option="RAW")
         return
 
-    if ws.col_count < len(OTP_HEADERS):
-        ws.resize(cols=len(OTP_HEADERS))
-
-    current_headers = all_rows[0]
-    if current_headers == OTP_HEADERS:
+    raw_headers = all_rows[0]
+    if raw_headers == expected_headers:
         return
 
-    if current_headers == LEGACY_OTP_HEADERS or "attempts" not in current_headers:
-        migrated = [OTP_HEADERS]
-        for row in all_rows[1:]:
-            if not any(cell.strip() for cell in row):
-                continue
-            padded = row + [""] * (len(current_headers) - len(row))
-            old = dict(zip(current_headers, padded))
-            migrated.append(
-                [
-                    old.get("email", ""),
-                    old.get("code_hash", ""),
-                    old.get("expires_at", ""),
-                    old.get("used", "yes"),
-                    old.get("attempts", "0") if "attempts" in old else "0",
-                    old.get("created_at", ""),
-                ]
-            )
-        ws.update(values=migrated, range_name="A1", value_input_option="RAW")
+    trimmed_headers = list(raw_headers)
+    while trimmed_headers and not trimmed_headers[-1].strip():
+        trimmed_headers.pop()
+
+    if not trimmed_headers:
+        if ws.col_count < len(expected_headers):
+            ws.resize(cols=len(expected_headers))
+        ws.update(values=[expected_headers], range_name="A1", value_input_option="RAW")
+        return
+
+    unknown_cols = [h for h in trimmed_headers if h not in expected_headers]
+    if unknown_cols or len(set(trimmed_headers)) != len(trimmed_headers):
+        raise ValueError(
+            f"Schema mismatch in worksheet '{sheet_label}': expected headers {expected_headers}, "
+            f"but found {trimmed_headers}."
+        )
+
+    if ws.col_count < len(expected_headers):
+        ws.resize(cols=len(expected_headers))
+
+    default_map = defaults or {}
+    migrated_rows = [expected_headers]
+    for row in all_rows[1:]:
+        if not any(cell.strip() for cell in row):
+            continue
+        padded = row + [""] * (len(trimmed_headers) - len(row))
+        rec = dict(zip(trimmed_headers, padded))
+        migrated_rows.append(
+            [rec.get(col, default_map.get(col, "")) for col in expected_headers]
+        )
+
+    ws.update(values=migrated_rows, range_name="A1", value_input_option="RAW")
 
 
 def ensure_worksheets(spreadsheet: gspread.Spreadsheet) -> None:
@@ -1202,35 +1259,30 @@ def ensure_worksheets(spreadsheet: gspread.Spreadsheet) -> None:
         )
         cards_ws.append_row(CARD_HEADERS, value_input_option="RAW")
     else:
-        cards_ws = spreadsheet.worksheet(CARDS_WORKSHEET)
-        _migrate_cards_worksheet_if_needed(cards_ws)
+        _migrate_cards_worksheet_if_needed(spreadsheet.worksheet(CARDS_WORKSHEET))
 
-    for otp_ws_name in (RESETS_WORKSHEET, REGISTER_OTPS_WORKSHEET):
-        if otp_ws_name not in existing_titles:
-            ws = spreadsheet.add_worksheet(
-                title=otp_ws_name, rows=500, cols=len(OTP_HEADERS)
-            )
-            ws.append_row(OTP_HEADERS, value_input_option="RAW")
-        else:
-            _migrate_otp_worksheet_if_needed(spreadsheet.worksheet(otp_ws_name))
+    worksheet_specs: list[Tuple[str, list[str], dict[str, str]]] = [
+        (USERS_WORKSHEET, USER_HEADERS, {"role": "user"}),
+        (USAGE_WORKSHEET, USAGE_HEADERS, {"scan_count": "0"}),
+        (RESETS_WORKSHEET, OTP_HEADERS, {"used": "yes", "attempts": "0"}),
+        (REGISTER_OTPS_WORKSHEET, OTP_HEADERS, {"used": "yes", "attempts": "0"}),
+        (SESSIONS_WORKSHEET, SESSION_HEADERS, {"revoked": "no"}),
+        (
+            RATE_LIMITS_WORKSHEET,
+            RATE_LIMIT_HEADERS,
+            {"attempt_count": "0", "window_start": "0", "locked_until": "0"},
+        ),
+        (AUDIT_LOGS_WORKSHEET, AUDIT_HEADERS, {}),
+    ]
 
-    for ws_name, headers in (
-        (USERS_WORKSHEET, USER_HEADERS),
-        (USAGE_WORKSHEET, USAGE_HEADERS),
-        (SESSIONS_WORKSHEET, SESSION_HEADERS),
-        (RATE_LIMITS_WORKSHEET, RATE_LIMIT_HEADERS),
-        (AUDIT_LOGS_WORKSHEET, AUDIT_HEADERS),
-    ):
+    for ws_name, headers, defaults in worksheet_specs:
         if ws_name not in existing_titles:
             ws = spreadsheet.add_worksheet(title=ws_name, rows=500, cols=len(headers))
             ws.append_row(headers, value_input_option="RAW")
         else:
-            ws = spreadsheet.worksheet(ws_name)
-            first_row = ws.row_values(1)
-            if not first_row:
-                ws.append_row(headers, value_input_option="RAW")
-            elif first_row != headers and ws.col_count < len(headers):
-                ws.resize(cols=len(headers))
+            _migrate_or_validate_worksheet(
+                spreadsheet.worksheet(ws_name), headers, ws_name, defaults
+            )
 
 
 def _get_or_create_worksheet(title: str, headers: list[str]) -> gspread.Worksheet:
@@ -1285,7 +1337,6 @@ def get_audit_logs_worksheet() -> gspread.Worksheet:
 def append_audit_log(
     user_id: str, action: str, record_id: str, details: str
 ) -> bool:
-    """Append an immutable audit entry and surface a visible warning if writing fails."""
     try:
         ws = get_audit_logs_worksheet()
         log_id = f"log_{uuid.uuid4().hex}"
@@ -1313,7 +1364,6 @@ def append_audit_log(
 def fetch_user_audit_logs(
     user_id: str, limit: Optional[int] = None
 ) -> pd.DataFrame:
-    """Fetch audit entries for `user_id` (all rows when `limit=None`, newest first)."""
     ws = get_audit_logs_worksheet()
     rows = ws.get_all_values()
     if len(rows) <= 1:
@@ -1540,11 +1590,12 @@ def revoke_all_user_sessions(user_id: str) -> int:
 
 
 def login_user_session(user: dict[str, str]) -> None:
+    clear_account_specific_state(preserve_flash=False)
     composite_token = create_server_session(user["user_id"])
     st.session_state["auth_user"] = user
+    st.session_state["bound_user_id"] = user["user_id"]
     st.session_state["session_token"] = composite_token
     st.session_state["session_action"] = "set"
-    st.session_state["active_view"] = "home"
 
 
 def logout_user_session() -> None:
@@ -1552,13 +1603,13 @@ def logout_user_session() -> None:
     st.session_state["auth_user"] = None
     st.session_state["session_token"] = None
     st.session_state["session_action"] = "clear"
-    st.session_state["active_view"] = "home"
+    clear_account_specific_state(preserve_flash=False)
 
 
 def sync_and_restore_session() -> Tuple[Optional[dict[str, str]], bool]:
     """
     Continuously validate active sessions against server-side revocation state
-    so password resets and global sign-outs invalidate already-open app sessions.
+    and wipe all account-specific session state on expiry, revocation, or user change.
     """
     try:
         if "session" in st.query_params:
@@ -1569,13 +1620,13 @@ def sync_and_restore_session() -> Tuple[Optional[dict[str, str]], bool]:
     current_auth = st.session_state.get("auth_user")
     current_token = st.session_state.get("session_token") or ""
 
-    # Revalidate an already-open session before trusting st.session_state["auth_user"]
     if current_auth is not None:
         verified_uid = verify_server_session(current_token) if current_token else None
         if verified_uid != current_auth.get("user_id"):
             st.session_state["auth_user"] = None
             st.session_state["session_token"] = None
             st.session_state["session_action"] = "clear"
+            clear_account_specific_state(preserve_flash=False)
             st.session_state["flash_info"] = (
                 "Your session expired or was signed out. Please log in again."
             )
@@ -1626,6 +1677,7 @@ def sync_and_restore_session() -> Tuple[Optional[dict[str, str]], bool]:
         if user_id:
             for user in fetch_all_users():
                 if user.get("user_id") == user_id:
+                    clear_account_specific_state(preserve_flash=False)
                     restored = {
                         "user_id": user.get("user_id", ""),
                         "username": user.get("username", ""),
@@ -1633,6 +1685,7 @@ def sync_and_restore_session() -> Tuple[Optional[dict[str, str]], bool]:
                         "role": user.get("role", "user"),
                     }
                     st.session_state["auth_user"] = restored
+                    st.session_state["bound_user_id"] = user_id
                     st.session_state["session_token"] = stored_token
                     st.session_state["session_action"] = "set"
                     return restored, False
@@ -1642,7 +1695,7 @@ def sync_and_restore_session() -> Tuple[Optional[dict[str, str]], bool]:
 
 
 # ---------------------------------------------------------------------------
-# Atomic Fail-Closed Daily Scan Quota Reservation & Release
+# Cross-Worker Optimistic Quota Reservation & Release
 # ---------------------------------------------------------------------------
 class QuotaExceededError(Exception):
     pass
@@ -1654,77 +1707,127 @@ def get_user_scans_today(user_id: str) -> int:
     rows = ws.get_all_values()
     if len(rows) <= 1:
         return 0
+    total = 0
     for row in rows[1:]:
         if len(row) >= 3 and row[0] == user_id and row[1] == today:
-            return int(row[2])
-    return 0
+            total = max(total, int(row[2]))
+    return total
 
 
 def reserve_user_scan_slot(user_id: str, daily_limit: int) -> int:
     """
-    Atomically check and reserve 1 scan slot under `_WRITE_LOCK` before calling Gemini.
-    Prevents concurrent scans from racing past `daily_limit` and fails closed on errors.
+    Reserve 1 daily scan slot using `_WRITE_LOCK` plus post-write optimistic
+    compare-and-verify on Google Sheets so concurrent worker processes cannot
+    silently overwrite each other's increments.
     """
+    if daily_limit < 1:
+        raise QuotaExceededError("Daily AI scan limit reached.")
+
+    today = get_quota_date_str()
     with _WRITE_LOCK:
         ws = get_usage_worksheet()
-        today = get_quota_date_str()
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for _attempt in range(4):
+            rows = ws.get_all_values()
+            if not rows:
+                ws.append_row(USAGE_HEADERS, value_input_option="RAW")
+                rows = [USAGE_HEADERS]
 
-        rows = ws.get_all_values()
-        if not rows:
-            ws.append_row(USAGE_HEADERS, value_input_option="RAW")
-            rows = [USAGE_HEADERS]
+            matching_indices = [
+                (idx, row)
+                for idx, row in enumerate(rows[1:], start=2)
+                if len(row) >= 3 and row[0] == user_id and row[1] == today
+            ]
 
-        for row_idx, row in enumerate(rows[1:], start=2):
-            if len(row) >= 3 and row[0] == user_id and row[1] == today:
+            if matching_indices:
+                row_idx, row = matching_indices[0]
                 current = int(row[2])
                 if current >= daily_limit:
                     raise QuotaExceededError(
                         f"Daily AI scan limit ({daily_limit}) reached."
                     )
                 new_count = current + 1
+                claim_stamp = (
+                    f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}#{uuid.uuid4().hex[:8]}"
+                )
                 ws.update(
-                    values=[[str(new_count), now_str]],
+                    values=[[str(new_count), claim_stamp]],
                     range_name=f"C{row_idx}:D{row_idx}",
                     value_input_option="RAW",
                 )
-                return new_count
+                verify_vals = ws.get(f"C{row_idx}:D{row_idx}")
+                if (
+                    verify_vals
+                    and len(verify_vals[0]) >= 2
+                    and verify_vals[0][1] == claim_stamp
+                ):
+                    return new_count
+                # Another worker updated concurrently — retry with fresh count
+                time.sleep(0.15)
+                continue
 
-        if daily_limit < 1:
-            raise QuotaExceededError("Daily AI scan limit reached.")
+            claim_stamp = (
+                f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}#{uuid.uuid4().hex[:8]}"
+            )
+            ws.append_row(
+                [user_id, today, "1", claim_stamp],
+                value_input_option="RAW",
+                table_range="A1",
+            )
+            # Re-read to verify no parallel worker also inserted a row for (user_id, today)
+            post_rows = ws.get_all_values()
+            dups = [
+                (idx, r)
+                for idx, r in enumerate(post_rows[1:], start=2)
+                if len(r) >= 4 and r[0] == user_id and r[1] == today
+            ]
+            if len(dups) == 1:
+                return 1
+            # Clean up our duplicate row if another worker inserted first, then loop to increment
+            for idx, r in reversed(dups):
+                if r[3] == claim_stamp:
+                    ws.delete_rows(idx)
+                    break
+            time.sleep(0.15)
 
-        ws.append_row(
-            [user_id, today, "1", now_str],
-            value_input_option="RAW",
-            table_range="A1",
-        )
-        return 1
+    raise RuntimeError("Could not atomically reserve a scan slot due to concurrent traffic.")
 
 
 def release_user_scan_slot(user_id: str) -> None:
-    """Return 1 reserved scan slot under `_WRITE_LOCK` if an AI call fails."""
+    """Return 1 reserved scan slot with compare-and-verify if an AI call fails."""
     try:
         with _WRITE_LOCK:
             ws = get_usage_worksheet()
             today = get_quota_date_str()
-            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            rows = ws.get_all_values()
-            for row_idx, row in enumerate(rows[1:], start=2):
-                if len(row) >= 3 and row[0] == user_id and row[1] == today:
-                    current = int(row[2])
-                    if current > 0:
+            for _attempt in range(3):
+                rows = ws.get_all_values()
+                for row_idx, row in enumerate(rows[1:], start=2):
+                    if len(row) >= 3 and row[0] == user_id and row[1] == today:
+                        current = int(row[2])
+                        if current <= 0:
+                            return
+                        claim_stamp = (
+                            f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}#{uuid.uuid4().hex[:8]}"
+                        )
                         ws.update(
-                            values=[[str(current - 1), now_str]],
+                            values=[[str(current - 1), claim_stamp]],
                             range_name=f"C{row_idx}:D{row_idx}",
                             value_input_option="RAW",
                         )
-                    return
+                        verify_vals = ws.get(f"C{row_idx}:D{row_idx}")
+                        if (
+                            verify_vals
+                            and len(verify_vals[0]) >= 2
+                            and verify_vals[0][1] == claim_stamp
+                        ):
+                            return
+                        break
+                time.sleep(0.1)
     except Exception:
         pass
 
 
 # ---------------------------------------------------------------------------
-# Email OTP Delivery & Verification (Global + Session + Per-Email Throttles)
+# Email OTP Delivery & Cross-Worker Compare-and-Verify Consumption
 # ---------------------------------------------------------------------------
 def _send_otp_email(
     recipient_email: str, username: str, code: str, subject: str, purpose_line: str
@@ -1757,7 +1860,6 @@ def _send_otp_email(
 
 
 def _check_otp_send_throttles(purpose_key: str, clean_email: str) -> Tuple[bool, str]:
-    """Check browser-session, global hourly, and per-email OTP send limits."""
     session_sends = int(st.session_state.get("otp_sends_this_session", 0))
     if session_sends >= MAX_OTP_SENDS_PER_SESSION:
         return (
@@ -1845,6 +1947,10 @@ def _issue_otp(
 def _verify_and_consume_otp(
     ws: gspread.Worksheet, email: str, code: str
 ) -> Tuple[bool, str]:
+    """
+    Verify and consume an OTP using compare-and-verify claim tokens (`yes:<claim_id>`)
+    so concurrent workers cannot consume the same OTP twice.
+    """
     clean_email = email.strip().lower()
     clean_code = re.sub(r"\s+", "", code.strip())
 
@@ -1911,11 +2017,16 @@ def _verify_and_consume_otp(
                 return False, "Too many wrong attempts. This code is locked — please request a new code."
             return False, f"Incorrect verification code ({remaining} attempt(s) remaining)."
 
+        claim_token = f"yes:{uuid.uuid4().hex[:10]}"
         ws.update(
-            values=[["yes", str(attempts + 1)]],
+            values=[[claim_token, str(attempts + 1)]],
             range_name=f"D{matched_row_idx}:E{matched_row_idx}",
             value_input_option="RAW",
         )
+        verify_vals = ws.get(f"D{matched_row_idx}")
+        if not verify_vals or not verify_vals[0] or verify_vals[0][0] != claim_token:
+            return False, "This verification code was already used or locked. Please request a new code."
+
         return True, "Verified."
 
 
@@ -2089,10 +2200,6 @@ def authenticate_user(
 
 
 def request_password_reset(email: str) -> Tuple[bool, str]:
-    """
-    Send a password reset OTP if the email exists, while always returning the
-    exact same generic response so attackers cannot enumerate registered emails.
-    """
     clean_email = email.strip().lower()
     if not is_valid_email(clean_email):
         return False, "Please enter a valid email address."
@@ -2114,7 +2221,6 @@ def request_password_reset(email: str) -> Tuple[bool, str]:
             break
 
     if not matched_user:
-        # Still count against throttles so attackers cannot probe unlimited addresses
         _record_otp_send_throttles("reset", clean_email)
         return True, generic_msg
 
@@ -2349,11 +2455,6 @@ def save_record_atomic(
     extra_data: Optional[dict[str, str]] = None,
     allow_duplicate: bool = False,
 ) -> Tuple[Optional[str], list[dict[str, Any]]]:
-    """
-    Atomically check duplicates and append the new card inside `_WRITE_LOCK`
-    using a fresh read of `visiting_cards` and a full UUID4 record ID.
-    Returns `(record_id, [])` on save, or `(None, matches)` if duplicates exist.
-    """
     extra_json, _ = validate_and_serialize_extra_data(extra_data or {}, strict=True)
 
     with _WRITE_LOCK:
@@ -2405,10 +2506,6 @@ def merge_excel_records_atomic(
     skip_duplicates: bool,
     source_name: str,
 ) -> Tuple[int, int, int, list[str]]:
-    """
-    Atomically check duplicates against fresh sheet rows and batch-append merged records
-    under `_WRITE_LOCK`. Returns `(added_count, dup_count, empty_count, dropped_extra_keys)`.
-    """
     with _WRITE_LOCK:
         ws = get_cards_worksheet()
         _ensure_cards_header(ws)
@@ -2659,7 +2756,7 @@ def restore_deleted_record(record_id: str, user_id: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Formula-Safe Excel Export (Headers + Cells) & Bounded Spreadsheet Parsing
+# Formula-Safe Excel Export (Headers + Cells) & Bounded Spreadsheet Streaming
 # ---------------------------------------------------------------------------
 _FORMULA_TRIGGER_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 
@@ -2733,10 +2830,31 @@ def build_multi_sheet_excel_bytes(sheets: dict[str, pd.DataFrame]) -> bytes:
     return output.getvalue()
 
 
+def _dedupe_import_headers(raw_header_row: list[Any]) -> list[str]:
+    headers: list[str] = []
+    seen_hdrs: set[str] = set()
+    for idx, raw_h in enumerate(raw_header_row):
+        base_h = sanitize_text_field(raw_h, 80) if raw_h is not None else ""
+        if not base_h:
+            base_h = f"Column_{idx + 1}"
+        candidate = base_h
+        suffix_num = 2
+        while candidate.lower() in seen_hdrs:
+            candidate = f"{base_h}_{suffix_num}"
+            suffix_num += 1
+        seen_hdrs.add(candidate.lower())
+        headers.append(candidate)
+    return headers
+
+
 def read_bounded_spreadsheet(uploaded_file: Any) -> pd.DataFrame:
     """
-    Enforce file size, column count, and row count limits *while reading* so a
-    compressed or oversized workbook cannot exhaust memory before rejection.
+    Stream CSV or XLSX files while enforcing:
+    - File size limit (2 MB)
+    - Column count limit (40 columns)
+    - Non-empty row limit (500 rows)
+    - Physical row scan limit (2,000 rows including blank rows) so sparse workbooks
+      cannot tie up CPU/memory.
     """
     if getattr(uploaded_file, "size", 0) > MAX_EXCEL_FILE_BYTES:
         raise ValueError("Uploaded spreadsheet exceeds the 2 MB limit.")
@@ -2745,29 +2863,62 @@ def read_bounded_spreadsheet(uploaded_file: Any) -> pd.DataFrame:
     raw_bytes = uploaded_file.getvalue()
 
     if fname.endswith(".csv"):
-        df = pd.read_csv(
-            io.BytesIO(raw_bytes),
-            dtype=str,
-            nrows=MAX_EXCEL_IMPORT_ROWS + 1,
-            usecols=lambda idx: idx <= MAX_EXCEL_IMPORT_COLS,
-        )
-        if len(df.columns) > MAX_EXCEL_IMPORT_COLS:
+        try:
+            text_data = raw_bytes.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            text_data = raw_bytes.decode("latin-1", errors="replace")
+
+        reader = csv.reader(io.StringIO(text_data))
+        header_row = next(reader, None)
+        if header_row is None:
+            return pd.DataFrame()
+
+        if len(header_row) > MAX_EXCEL_IMPORT_COLS:
             raise ValueError(
                 f"File exceeds the maximum limit of {MAX_EXCEL_IMPORT_COLS} columns."
             )
-        df = df.dropna(how="all")
-        if len(df) > MAX_EXCEL_IMPORT_ROWS:
-            raise ValueError(
-                f"File exceeds the maximum limit of {MAX_EXCEL_IMPORT_ROWS} rows per import."
-            )
-        df.columns = [sanitize_text_field(c, 80) or f"Column_{i+1}" for i, c in enumerate(df.columns)]
-        return df
+
+        headers = _dedupe_import_headers(header_row)
+        collected_rows: list[list[str]] = []
+        physical_rows_scanned = 0
+
+        for raw_row in reader:
+            physical_rows_scanned += 1
+            if physical_rows_scanned > MAX_PHYSICAL_ROWS_SCANNED:
+                raise ValueError(
+                    f"CSV exceeds the maximum scan limit of {MAX_PHYSICAL_ROWS_SCANNED} rows (including blank rows)."
+                )
+            if len(raw_row) > MAX_EXCEL_IMPORT_COLS:
+                raise ValueError(
+                    f"File exceeds the maximum limit of {MAX_EXCEL_IMPORT_COLS} columns."
+                )
+            padded = list(raw_row) + [""] * (len(headers) - len(raw_row))
+            str_row = [str(cell) for cell in padded[: len(headers)]]
+            if not any(cell.strip() for cell in str_row):
+                continue
+            collected_rows.append(str_row)
+            if len(collected_rows) > MAX_EXCEL_IMPORT_ROWS:
+                raise ValueError(
+                    f"File exceeds the maximum limit of {MAX_EXCEL_IMPORT_ROWS} rows per import."
+                )
+
+        return pd.DataFrame(collected_rows, columns=headers)
 
     wb = openpyxl.load_workbook(
         io.BytesIO(raw_bytes), read_only=True, data_only=True
     )
     try:
         ws = wb.active
+        if ws.max_column is not None and ws.max_column > MAX_EXCEL_IMPORT_COLS:
+            raise ValueError(
+                f"File exceeds the maximum limit of {MAX_EXCEL_IMPORT_COLS} columns."
+            )
+        if ws.max_row is not None and ws.max_row > (MAX_PHYSICAL_ROWS_SCANNED + 1):
+            raise ValueError(
+                f"Worksheet exceeds the maximum physical limit of {MAX_PHYSICAL_ROWS_SCANNED} rows "
+                "(including blank rows). Remove empty trailing rows and try again."
+            )
+
         row_iter = ws.iter_rows(values_only=True)
         header_row = next(row_iter, None)
         if header_row is None:
@@ -2778,22 +2929,17 @@ def read_bounded_spreadsheet(uploaded_file: Any) -> pd.DataFrame:
                 f"File exceeds the maximum limit of {MAX_EXCEL_IMPORT_COLS} columns."
             )
 
-        headers: list[str] = []
-        seen_hdrs: set[str] = set()
-        for idx, raw_h in enumerate(header_row):
-            base_h = sanitize_text_field(raw_h, 80) if raw_h is not None else ""
-            if not base_h:
-                base_h = f"Column_{idx + 1}"
-            candidate = base_h
-            suffix_num = 2
-            while candidate.lower() in seen_hdrs:
-                candidate = f"{base_h}_{suffix_num}"
-                suffix_num += 1
-            seen_hdrs.add(candidate.lower())
-            headers.append(candidate)
+        headers = _dedupe_import_headers(list(header_row))
+        collected_rows = []
+        physical_rows_scanned = 0
 
-        collected_rows: list[list[str]] = []
         for raw_row in row_iter:
+            physical_rows_scanned += 1
+            if physical_rows_scanned > MAX_PHYSICAL_ROWS_SCANNED:
+                raise ValueError(
+                    f"Worksheet exceeds the maximum physical scan limit of {MAX_PHYSICAL_ROWS_SCANNED} rows "
+                    "(including blank rows). Remove empty trailing rows and try again."
+                )
             if len(raw_row) > MAX_EXCEL_IMPORT_COLS:
                 raise ValueError(
                     f"File exceeds the maximum limit of {MAX_EXCEL_IMPORT_COLS} columns."
@@ -2861,7 +3007,6 @@ def preview_excel_merge_rows(
     col_mapping: dict[str, str],
     unmapped_extra_cols: list[str],
 ) -> list[dict[str, Any]]:
-    """Build formatted preview records for the top 5 rows without hitting Google Sheets."""
     preview: list[dict[str, Any]] = []
     for _, row in raw_df.head(5).iterrows():
         raw_vals: dict[str, str] = {}
@@ -2921,7 +3066,6 @@ def extract_card_details(
     if not images:
         raise ValueError("Please provide at least one visiting card image.")
 
-    # Strict validation & compression — raises ValueError on invalid/oversized images
     optimized_images = [
         optimize_card_image(raw_bytes, mime) for raw_bytes, mime in images
     ]
@@ -3073,7 +3217,6 @@ def generate_marketing_ai_text(prompt: str, api_key: str) -> str:
 
 
 def run_scan(image_files: list, api_key: str, user_id: str) -> None:
-    
     if not api_key:
         st.warning("Scanner API key is not configured yet. Add it in Sidebar → Settings.")
         return
@@ -3166,7 +3309,6 @@ def open_blank_manual_form() -> None:
     )
 
 
-
 # ---------------------------------------------------------------------------
 # Authentication UI (Login, OTP-Verified Register & Generic Password Recovery)
 # ---------------------------------------------------------------------------
@@ -3205,11 +3347,7 @@ def render_auth_screen() -> None:
                             ok, msg, user = authenticate_user(identifier, password)
                             if ok and user:
                                 login_user_session(user)
-                                st.session_state["extracted_card"] = None
-                                st.session_state["is_manual_entry"] = False
-                                st.session_state["pending_duplicate_save"] = None
                                 st.session_state["pending_registration"] = None
-                                st.session_state["scan_notice"] = None
                                 st.session_state["flash_success"] = (
                                     f"Welcome back, {user['username']}!"
                                 )
@@ -3300,10 +3438,6 @@ def render_auth_screen() -> None:
                                 if ok and user:
                                     login_user_session(user)
                                     st.session_state["pending_registration"] = None
-                                    st.session_state["extracted_card"] = None
-                                    st.session_state["is_manual_entry"] = False
-                                    st.session_state["pending_duplicate_save"] = None
-                                    st.session_state["scan_notice"] = None
                                     st.session_state["flash_success"] = (
                                         f"Email verified! Welcome, {user['username']}."
                                     )
@@ -3404,7 +3538,7 @@ def render_auth_screen() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Analyze & Growth Hub (Escaped HTML, AI Consent Check & Atomic Quota)
+# Analyze & Growth Hub (Escaped HTML, User-Bound AI Output & Atomic Quota)
 # ---------------------------------------------------------------------------
 def _compute_analytics_tables(
     df: pd.DataFrame,
@@ -3548,6 +3682,14 @@ def _render_campaign_message(template: str, row: pd.Series) -> str:
     return msg
 
 
+def _get_user_bound_ai_text(state_key: str, user_id: str) -> Optional[str]:
+    """Return stored AI output only if it belongs to `user_id`."""
+    entry = st.session_state.get(state_key)
+    if isinstance(entry, dict) and entry.get("user_id") == user_id:
+        return entry.get("text")
+    return None
+
+
 def render_analyze_section(
     all_records_df: pd.DataFrame,
     current_username: str,
@@ -3561,7 +3703,7 @@ def render_analyze_section(
         with hdr_col:
             st.subheader("Analyze & Growth Hub")
             st.caption(
-                "Market intelligence, 1-click WhatsApp/Email campaigns, and optional AI growth playbooks built from your saved leads."
+                "Market intelligence, 1-click WhatsApp/Email campaigns, and AI growth playbooks built from your saved leads."
             )
 
         if all_records_df.empty:
@@ -3671,7 +3813,7 @@ def render_analyze_section(
 
         with tab_outreach:
             st.caption(
-                "Segment your contacts and launch instant personalized WhatsApp or Email outreach (works 100% locally without AI)."
+                "Segment your contacts and launch instant personalized WhatsApp or Email outreach."
             )
 
             unique_cities = sorted(
@@ -3877,7 +4019,6 @@ def render_analyze_section(
                     )
 
         with tab_ai_growth:
-
             ai_mode = st.radio(
                 "Choose AI Marketing Tool",
                 options=[
@@ -3949,7 +4090,10 @@ def render_analyze_section(
                             playbook_md = generate_marketing_ai_text(
                                 prompt, active_api_key
                             )
-                            st.session_state["ai_growth_output"] = playbook_md
+                            st.session_state["ai_growth_output"] = {
+                                "user_id": current_user_id,
+                                "text": playbook_md,
+                            }
                         except ValueError as v_err:
                             release_user_scan_slot(current_user_id)
                             st.warning(str(v_err))
@@ -3962,8 +4106,11 @@ def render_analyze_section(
                                 "Could not generate the playbook right now. Please try again."
                             )
 
-                if st.session_state.get("ai_growth_output"):
-                    st.markdown(st.session_state["ai_growth_output"])
+                saved_playbook = _get_user_bound_ai_text(
+                    "ai_growth_output", current_user_id
+                )
+                if saved_playbook:
+                    st.markdown(saved_playbook)
 
             else:
                 pitch_query = st.text_input(
@@ -4035,7 +4182,10 @@ def render_analyze_section(
                                 pitch_md = generate_marketing_ai_text(
                                     prompt, active_api_key
                                 )
-                                st.session_state["ai_pitch_output"] = pitch_md
+                                st.session_state["ai_pitch_output"] = {
+                                    "user_id": current_user_id,
+                                    "text": pitch_md,
+                                }
                             except ValueError as v_err:
                                 release_user_scan_slot(current_user_id)
                                 st.warning(str(v_err))
@@ -4048,8 +4198,11 @@ def render_analyze_section(
                                     "Could not generate the pitch right now. Please try again."
                                 )
 
-                if st.session_state.get("ai_pitch_output"):
-                    st.markdown(st.session_state["ai_pitch_output"])
+                saved_pitch = _get_user_bound_ai_text(
+                    "ai_pitch_output", current_user_id
+                )
+                if saved_pitch:
+                    st.markdown(saved_pitch)
 
 
 # ---------------------------------------------------------------------------
@@ -4469,7 +4622,6 @@ def render_delete_record_section(
 def render_trash_and_audit_section(
     current_user_id: str, current_username: str, key_prefix: str
 ) -> None:
-    """Render Trash (with 1-click Restore), Full Backup (.xlsx), and Complete Audit History."""
     with st.container(border=True):
         st.subheader("Trash, Backups & Audit History")
 
@@ -4484,7 +4636,6 @@ def render_trash_and_audit_section(
             if not all_with_deleted.empty
             else pd.DataFrame(columns=ALL_RECORD_COLUMNS)
         )
-        # Fetch complete audit history (limit=None) for Full Backup
         full_audit_df = fetch_user_audit_logs(current_user_id, limit=None)
 
         b_col1, b_col2 = st.columns([2.8, 1.5])
@@ -4579,6 +4730,7 @@ def main() -> None:
 
     for key, default in (
         ("auth_user", None),
+        ("bound_user_id", None),
         ("session_token", None),
         ("session_action", "read"),
         ("active_view", "home"),
@@ -4599,6 +4751,7 @@ def main() -> None:
         ("reset_email_target", ""),
         ("ai_growth_output", None),
         ("ai_pitch_output", None),
+        ("ai_consent_enabled", False),
         ("otp_sends_this_session", 0),
     ):
         if key not in st.session_state:
@@ -4634,6 +4787,11 @@ def main() -> None:
     current_user_id = auth_user["user_id"]
     current_username = auth_user["username"]
     current_email = auth_user["email"]
+
+    # Guard against any account switch in the same browser tab
+    if st.session_state.get("bound_user_id") != current_user_id:
+        clear_account_specific_state(preserve_flash=True)
+        st.session_state["bound_user_id"] = current_user_id
 
     daily_limit = get_daily_scan_limit()
     try:
@@ -4676,12 +4834,6 @@ def main() -> None:
 
         if st.button("Logout", use_container_width=True, key="nav_btn_logout"):
             logout_user_session()
-            st.session_state["extracted_card"] = None
-            st.session_state["is_manual_entry"] = False
-            st.session_state["pending_duplicate_save"] = None
-            st.session_state["scan_notice"] = None
-            st.session_state["flash_success"] = None
-            st.session_state["flash_info"] = None
             st.session_state["close_sidebar_seq"] += 1
             st.rerun()
 
