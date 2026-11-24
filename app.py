@@ -2,6 +2,7 @@ import base64
 import hashlib
 import hmac
 import io
+import json
 import os
 import re
 import secrets
@@ -27,7 +28,7 @@ from pydantic import BaseModel, Field
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-SCHEMA_VERSION = "v5_register_otp_and_excel_merge"
+SCHEMA_VERSION = "v6_extra_data_and_clean_ui"
 
 MODEL_CHAIN = [
     "gemini-3.5-flash-lite",
@@ -56,7 +57,7 @@ REGISTER_OTPS_WORKSHEET = "register_otps"
 PBKDF2_ITERATIONS = 260_000
 MAX_CARD_IMAGES = 2
 
-# Google Sheet column order (Email directly after WhatsApp No. and before Product / Services)
+# Google Sheet column order (adds single `extra_data` JSON column at the end)
 CARD_HEADERS = [
     "record_id",
     "user_id",
@@ -70,9 +71,10 @@ CARD_HEADERS = [
     "city",
     "notes",
     "created_at",
+    "extra_data",
 ]
 
-# Exact default table & Excel export column order
+# Exact default table column order
 DEFAULT_TABLE_COLUMNS = [
     "Company Name",
     "Contact Person",
@@ -89,7 +91,33 @@ DEFAULT_TABLE_COLUMNS = [
 ALL_RECORD_COLUMNS = [
     "Record ID",
     *DEFAULT_TABLE_COLUMNS,
+    "Extra Details",
+    "Extra Data JSON",
 ]
+
+STANDARD_FIELD_LABELS_LOWER = {
+    "company name",
+    "company",
+    "contact person",
+    "contact no",
+    "contact no.",
+    "call phone",
+    "phone",
+    "whatsapp no",
+    "whatsapp no.",
+    "whatsapp",
+    "email",
+    "product / services",
+    "products / services",
+    "products",
+    "services",
+    "address",
+    "city",
+    "notes",
+    "saved on",
+    "record id",
+    "user id",
+}
 
 USER_HEADERS = [
     "user_id",
@@ -115,7 +143,7 @@ OTP_HEADERS = [
     "created_at",
 ]
 
-# Aliases for auto-mapping uploaded Excel/CSV columns to our format
+# Aliases for auto-mapping uploaded Excel/CSV columns to our standard fields
 EXCEL_COLUMN_ALIASES: dict[str, list[str]] = {
     "company_name": [
         "company name",
@@ -221,20 +249,36 @@ EXCEL_COLUMN_ALIASES: dict[str, list[str]] = {
     ],
 }
 
+# Realistic dummy placeholders used across Scan, Manual Entry, and Update forms
+FIELD_PLACEHOLDERS = {
+    "company_name": "e.g., Apex Industrial Solutions",
+    "contact_person": "e.g., Rajesh Patel (Sales Manager)",
+    "call_phone": "e.g., 9876543210 / 07926300000",
+    "whatsapp_phone": "e.g., 9876543210 / 9123456789",
+    "email": "e.g., contact@example.com",
+    "products_services": "e.g., Industrial Valves, Pumps, Automation",
+    "address": "e.g., Plot 12, GIDC Estate, Main Road",
+    "city": "e.g., Ahmedabad",
+    "notes": "e.g., Met at trade fair, wholesale supplier",
+    "extra_details": "Website: www.example.com\nGSTIN: 24ABCDE1234F1Z5",
+}
+
 st.set_page_config(
     page_title="Company Visiting Card Scanner",
     page_icon="📇",
     layout="wide",
+    initial_sidebar_state="auto",
 )
 
 
 # ---------------------------------------------------------------------------
-# Hide GitHub, Fork & Extra Toolbar Controls (Keep Sidebar Toggle Working)
+# Clean Responsive UI Styling (Phone + Laptop) & Toolbar Cleanup
 # ---------------------------------------------------------------------------
 def inject_clean_ui_css() -> None:
     st.markdown(
         """
         <style>
+            /* Hide GitHub, Fork, Deploy & extra chrome while keeping sidebar toggle intact */
             [data-testid="stToolbarActions"],
             [data-testid="stActionButtonIcon"],
             [data-testid="stAppDeployButton"],
@@ -249,6 +293,77 @@ def inject_clean_ui_css() -> None:
                 display: none !important;
                 visibility: hidden !important;
             }
+
+            /* Balanced layout spacing for desktop and mobile */
+            .block-container {
+                padding-top: 1.4rem;
+                padding-bottom: 2.5rem;
+                max-width: 1200px;
+            }
+
+            /* Touch-friendly rounded buttons */
+            .stButton > button,
+            .stDownloadButton > button,
+            .stFormSubmitButton > button {
+                min-height: 2.65rem;
+                border-radius: 8px;
+                font-weight: 500;
+            }
+
+            /* Compact summary pill strip */
+            .vcard-stat-strip {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 0.65rem;
+                margin: 0.35rem 0 1rem 0;
+            }
+            .vcard-stat-pill {
+                flex: 1 1 160px;
+                padding: 0.65rem 0.95rem;
+                border-radius: 10px;
+                border: 1px solid rgba(128, 128, 128, 0.22);
+                background: rgba(128, 128, 128, 0.06);
+            }
+            .vcard-stat-label {
+                font-size: 0.78rem;
+                opacity: 0.72;
+                margin-bottom: 0.15rem;
+            }
+            .vcard-stat-value {
+                font-size: 1.15rem;
+                font-weight: 600;
+            }
+
+            /* Smooth slide-down reveal for the card form */
+            @keyframes vcardSlideDown {
+                from {
+                    opacity: 0;
+                    transform: translateY(-10px);
+                }
+                to {
+                    opacity: 1;
+                    transform: translateY(0);
+                }
+            }
+            .vcard-form-anchor {
+                scroll-margin-top: 1rem;
+                animation: vcardSlideDown 0.3s ease-out;
+            }
+
+            /* Mobile tweaks */
+            @media (max-width: 768px) {
+                .block-container {
+                    padding-top: 0.9rem;
+                    padding-left: 0.85rem;
+                    padding-right: 0.85rem;
+                }
+                h1 {
+                    font-size: 1.65rem !important;
+                }
+                h2, h3 {
+                    font-size: 1.2rem !important;
+                }
+            }
         </style>
         """,
         unsafe_allow_html=True,
@@ -256,7 +371,7 @@ def inject_clean_ui_css() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Browser localStorage Session Bridge (Clean URL, No ?session= Param)
+# Browser Bridges: localStorage Session + Mobile Sidebar Close & Smooth Scroll
 # ---------------------------------------------------------------------------
 _SESSION_BRIDGE_JS = """
 export default function(component) {
@@ -298,6 +413,50 @@ export default function(component) {
 }
 """
 
+_UI_BRIDGE_JS = """
+export default function(component) {
+    const { data } = component;
+    const closeSeq = Number((data && data.closeSidebarSeq) || 0);
+    const scrollSeq = Number((data && data.scrollToFormSeq) || 0);
+
+    if (closeSeq > 0 && window.__vcardLastCloseSeq !== closeSeq) {
+        window.__vcardLastCloseSeq = closeSeq;
+        const tryCloseMobileSidebar = () => {
+            if (window.innerWidth > 900) return;
+            const sidebar = document.querySelector('[data-testid="stSidebar"]');
+            if (!sidebar) return;
+            if (sidebar.getAttribute("aria-expanded") === "false") return;
+            const btn =
+                document.querySelector('[data-testid="stSidebarCollapseButton"] button') ||
+                sidebar.querySelector('[data-testid="stSidebarHeader"] button') ||
+                sidebar.querySelector(
+                    'button[aria-label*="Close"], button[aria-label*="Collapse"], button[kind="headerNoPadding"]'
+                );
+            if (btn) btn.click();
+        };
+        setTimeout(tryCloseMobileSidebar, 60);
+        setTimeout(tryCloseMobileSidebar, 240);
+    }
+
+    if (scrollSeq > 0 && window.__vcardLastScrollSeq !== scrollSeq) {
+        window.__vcardLastScrollSeq = scrollSeq;
+        const tryScrollToForm = () => {
+            const el = document.getElementById("card-entry-form-anchor");
+            if (el) {
+                el.scrollIntoView({ behavior: "smooth", block: "start" });
+                return true;
+            }
+            return false;
+        };
+        setTimeout(() => {
+            if (!tryScrollToForm()) {
+                setTimeout(tryScrollToForm, 250);
+            }
+        }, 120);
+    }
+}
+"""
+
 _HAS_COMPONENTS_V2 = hasattr(st, "components") and hasattr(st.components, "v2")
 _SESSION_BRIDGE = (
     st.components.v2.component(
@@ -309,10 +468,33 @@ _SESSION_BRIDGE = (
     if _HAS_COMPONENTS_V2
     else None
 )
+_UI_BRIDGE = (
+    st.components.v2.component(
+        "vcard_ui_bridge",
+        html="<div style='display:none'></div>",
+        css=":host { display: none !important; height: 0 !important; }",
+        js=_UI_BRIDGE_JS,
+    )
+    if _HAS_COMPONENTS_V2
+    else None
+)
+
+
+def trigger_ui_bridge() -> None:
+    """Run lightweight browser actions (mobile sidebar auto-close & scroll-to-form)."""
+    if _UI_BRIDGE is None:
+        return
+    _UI_BRIDGE(
+        data={
+            "closeSidebarSeq": int(st.session_state.get("close_sidebar_seq", 0)),
+            "scrollToFormSeq": int(st.session_state.get("scroll_to_form_seq", 0)),
+        },
+        key="vcard_ui_bridge_instance",
+    )
 
 
 # ---------------------------------------------------------------------------
-# Secret, Session Token, Hashing & Normalization Helpers
+# Secret, Session Token, Hashing, Phone & Extra-Data Helpers
 # ---------------------------------------------------------------------------
 def get_secret(key: str, default: Any = None) -> Any:
     """Safely read a key from st.secrets or environment variables."""
@@ -383,7 +565,6 @@ def verify_session_token(token: str) -> Optional[str]:
 
 
 def login_user_session(user: dict[str, str]) -> None:
-    """Store user in session_state and persist token in browser localStorage."""
     token = create_session_token(user["user_id"])
     st.session_state["auth_user"] = user
     st.session_state["session_token"] = token
@@ -392,7 +573,6 @@ def login_user_session(user: dict[str, str]) -> None:
 
 
 def logout_user_session() -> None:
-    """Clear user from session_state and remove token from browser localStorage."""
     st.session_state["auth_user"] = None
     st.session_state["session_token"] = None
     st.session_state["session_action"] = "clear"
@@ -400,10 +580,7 @@ def logout_user_session() -> None:
 
 
 def sync_and_restore_session() -> Tuple[Optional[dict[str, str]], bool]:
-    """
-    Synchronize hidden browser localStorage session without showing any token in the URL.
-    Returns (auth_user_or_none, is_checking_browser_storage).
-    """
+    """Synchronize hidden browser localStorage session without touching URL params."""
     try:
         if "session" in st.query_params:
             st.query_params.pop("session", None)
@@ -552,7 +729,6 @@ def format_phone_numbers(raw: str) -> str:
 
 
 def extract_normalized_phones(phone_str: str) -> set[str]:
-    """Extract comparable phone tokens (last 10 digits) for duplicate matching."""
     formatted = format_phone_numbers(phone_str)
     if formatted == "N/A":
         return set()
@@ -569,6 +745,138 @@ def extract_normalized_emails(email_str: str) -> set[str]:
         return set()
     parts = re.split(r"[,;/|\s]+", email_str.strip().lower())
     return {p for p in parts if is_valid_email(p)}
+
+
+# ---------------------------------------------------------------------------
+# Extra Data (Option 1: JSON Column -> Auto-Expanded Excel Columns)
+# ---------------------------------------------------------------------------
+def parse_extra_data(raw_json: str) -> dict[str, str]:
+    """Safely parse the JSON stored in Google Sheets' `extra_data` column."""
+    if not raw_json or not str(raw_json).strip():
+        return {}
+    try:
+        parsed = json.loads(str(raw_json))
+        if not isinstance(parsed, dict):
+            return {}
+        cleaned: dict[str, str] = {}
+        for k, v in parsed.items():
+            ck = str(k).strip()
+            cv = normalize_digits(str(v)).strip()
+            if ck and cv and cv.upper() != "N/A":
+                cleaned[ck] = cv
+        return cleaned
+    except Exception:
+        return {}
+
+
+def serialize_extra_data(extra: dict[str, str]) -> str:
+    """Serialize extra key-value pairs to compact JSON for Google Sheets storage."""
+    cleaned = {
+        str(k).strip(): normalize_digits(str(v)).strip()
+        for k, v in extra.items()
+        if str(k).strip()
+        and normalize_digits(str(v)).strip()
+        and normalize_digits(str(v)).strip().upper() != "N/A"
+    }
+    if not cleaned:
+        return ""
+    return json.dumps(cleaned, ensure_ascii=False)
+
+
+def format_extra_data_for_input(extra: dict[str, str]) -> str:
+    """Format extra fields as editable `Key: Value` lines for form text areas."""
+    if not extra:
+        return ""
+    return "\n".join(f"{k}: {v}" for k, v in extra.items())
+
+
+def parse_extra_data_from_input(text: str) -> dict[str, str]:
+    """Parse user-entered `Key: Value` lines into a clean extra-fields dictionary."""
+    if not text or not text.strip():
+        return {}
+    result: dict[str, str] = {}
+    other_lines: list[str] = []
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.upper() == "N/A":
+            continue
+        if ":" in line:
+            k, v = line.split(":", 1)
+            ck = k.strip()
+            cv = normalize_digits(v).strip()
+            if ck and cv and cv.upper() != "N/A":
+                result[ck] = cv
+        elif "=" in line:
+            k, v = line.split("=", 1)
+            ck = k.strip()
+            cv = normalize_digits(v).strip()
+            if ck and cv and cv.upper() != "N/A":
+                result[ck] = cv
+        else:
+            other_lines.append(normalize_digits(line))
+
+    if other_lines:
+        existing_other = result.get("Other Info", "")
+        combined = " | ".join([x for x in [existing_other, *other_lines] if x])
+        result["Other Info"] = combined
+
+    return result
+
+
+def format_extra_data_summary(extra: dict[str, str]) -> str:
+    """Compact one-line summary for search indexing."""
+    if not extra:
+        return ""
+    return " | ".join(f"{k}: {v}" for k, v in extra.items())
+
+
+def collect_extra_column_names(df: pd.DataFrame) -> list[str]:
+    """Collect unique extra column names present in a user's records (case-normalized)."""
+    if df.empty or "Extra Data JSON" not in df.columns:
+        return []
+    standard_lower = {c.lower() for c in DEFAULT_TABLE_COLUMNS}
+    seen_lower: dict[str, str] = {}
+    for raw in df["Extra Data JSON"].tolist():
+        for key in parse_extra_data(str(raw)).keys():
+            kl = key.lower()
+            if kl in standard_lower:
+                continue
+            if kl not in seen_lower:
+                seen_lower[kl] = key
+    return list(seen_lower.values())
+
+
+def build_expanded_dataframe(
+    df: pd.DataFrame, include_extra_columns: bool
+) -> pd.DataFrame:
+    """
+    Build the display or Excel export DataFrame.
+    When `include_extra_columns=True`, expands all `extra_data` keys into real columns
+    at the right end (filling 'N/A' where absent).
+    """
+    base_df = df[DEFAULT_TABLE_COLUMNS].copy()
+    if not include_extra_columns or df.empty or "Extra Data JSON" not in df.columns:
+        return base_df
+
+    extra_cols = collect_extra_column_names(df)
+    if not extra_cols:
+        return base_df
+
+    parsed_rows = [parse_extra_data(str(raw)) for raw in df["Extra Data JSON"].tolist()]
+    for col_name in extra_cols:
+        col_lower = col_name.lower()
+        values = []
+        for row_dict in parsed_rows:
+            matched_val = "N/A"
+            for k, v in row_dict.items():
+                if k.lower() == col_lower:
+                    matched_val = v
+                    break
+            values.append(matched_val)
+        base_df[col_name] = values
+
+    return base_df
 
 
 def optimize_card_image(raw_bytes: bytes, fallback_mime: str) -> Tuple[bytes, str]:
@@ -605,8 +913,20 @@ def clear_uploaded_inputs() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Pydantic Schema for Gemini Structured Outputs
+# Pydantic Schema for Gemini Structured Outputs (Includes Extra Printed Details)
 # ---------------------------------------------------------------------------
+class ExtraDetail(BaseModel):
+    label: str = Field(
+        description=(
+            "Short clean English Title Case label for an extra detail on the card "
+            "(e.g., 'Website', 'GSTIN', 'PAN', 'Instagram', 'LinkedIn', 'Branch', 'Timings')."
+        )
+    )
+    value: str = Field(
+        description="Value of this extra detail in English with standard 0-9 digits."
+    )
+
+
 class VisitingCard(BaseModel):
     company_name: str = Field(
         description=(
@@ -664,12 +984,34 @@ class VisitingCard(BaseModel):
             "Infer from the address or PIN code if clear; return 'N/A' if completely absent."
         )
     )
+    extra_details: list[ExtraDetail] = Field(
+        default_factory=list,
+        description=(
+            "Any additional useful details printed on the card that do NOT belong in the standard fields "
+            "(such as Website, GSTIN, PAN, Instagram, LinkedIn, Facebook, Branch, Office Timings, ISO Certification). "
+            "Do NOT repeat company name, contact person, phone, email, products, address, or city here. "
+            "Return an empty list [] if none are printed."
+        ),
+    )
 
 
-def _clean_card_output(card: VisitingCard) -> VisitingCard:
+def _clean_card_output(card: VisitingCard) -> Tuple[VisitingCard, dict[str, str]]:
     raw_city = normalize_digits(card.city).strip()
     clean_city = raw_city if raw_city and raw_city.upper() != "N/A" else "N/A"
-    return card.model_copy(
+
+    extra_dict: dict[str, str] = {}
+    for item in card.extra_details or []:
+        lbl = normalize_digits(item.label).strip()
+        val = normalize_digits(item.value).strip()
+        if (
+            lbl
+            and val
+            and val.upper() != "N/A"
+            and lbl.lower() not in STANDARD_FIELD_LABELS_LOWER
+        ):
+            extra_dict[lbl] = val
+
+    cleaned = card.model_copy(
         update={
             "company_name": normalize_digits(card.company_name).strip() or "N/A",
             "contact_person": normalize_digits(card.contact_person).strip() or "N/A",
@@ -681,6 +1023,7 @@ def _clean_card_output(card: VisitingCard) -> VisitingCard:
             "city": clean_city,
         }
     )
+    return cleaned, extra_dict
 
 
 # ---------------------------------------------------------------------------
@@ -705,7 +1048,7 @@ def get_spreadsheet(_schema_version: str = SCHEMA_VERSION) -> gspread.Spreadshee
 
 
 def _migrate_cards_worksheet_if_needed(cards_ws: gspread.Worksheet) -> None:
-    """Align `visiting_cards` rows to CARD_HEADERS and normalize existing phone numbers."""
+    """Align `visiting_cards` rows to CARD_HEADERS (adds `extra_data` column safely)."""
     all_rows = cards_ws.get_all_values()
     if not all_rows:
         cards_ws.append_row(CARD_HEADERS, value_input_option="RAW")
@@ -747,6 +1090,7 @@ def _migrate_cards_worksheet_if_needed(cards_ws: gspread.Worksheet) -> None:
             "city": old_rec.get("city", "N/A") or "N/A",
             "notes": old_rec.get("notes", ""),
             "created_at": old_rec.get("created_at", ""),
+            "extra_data": old_rec.get("extra_data", ""),
         }
         migrated_rows.append([new_rec[col] for col in CARD_HEADERS])
 
@@ -758,7 +1102,6 @@ def _migrate_cards_worksheet_if_needed(cards_ws: gspread.Worksheet) -> None:
 
 
 def ensure_worksheets(spreadsheet: gspread.Spreadsheet) -> None:
-    """Create or repair all required worksheets."""
     existing_titles = {ws.title for ws in spreadsheet.worksheets()}
 
     if CARDS_WORKSHEET not in existing_titles:
@@ -884,7 +1227,6 @@ def increment_user_scan_count(user_id: str) -> int:
 def _send_otp_email(
     recipient_email: str, username: str, code: str, subject: str, purpose_line: str
 ) -> None:
-    """Send a 6-digit OTP via SMTP (Gmail App Password by default)."""
     smtp_email = str(get_secret("SMTP_EMAIL", "") or "").strip()
     smtp_password = str(get_secret("SMTP_APP_PASSWORD", "") or "").strip()
     smtp_host = str(get_secret("SMTP_HOST", "smtp.gmail.com") or "smtp.gmail.com").strip()
@@ -1013,7 +1355,6 @@ def fetch_all_users() -> list[dict[str, str]]:
 def start_registration_otp(
     username: str, email: str, password: str
 ) -> Tuple[bool, str, Optional[dict[str, str]]]:
-    """Validate new account fields and send a 6-digit email verification OTP."""
     clean_username = username.strip()
     clean_email = email.strip().lower()
 
@@ -1054,7 +1395,6 @@ def start_registration_otp(
 
 
 def resend_registration_otp(pending_data: dict[str, str]) -> Tuple[bool, str]:
-    """Resend a fresh 6-digit registration OTP to the pending email."""
     return _issue_otp(
         ws=get_register_otps_worksheet(),
         email=pending_data["email"],
@@ -1067,7 +1407,6 @@ def resend_registration_otp(pending_data: dict[str, str]) -> Tuple[bool, str]:
 def complete_registration_with_otp(
     pending_data: dict[str, str], otp_code: str
 ) -> Tuple[bool, str, Optional[dict[str, str]]]:
-    """Verify the registration OTP and create the user account."""
     clean_username = pending_data["username"]
     clean_email = pending_data["email"]
     pw_hash = pending_data["password_hash"]
@@ -1231,6 +1570,7 @@ def fetch_user_records(user_id: str) -> pd.DataFrame:
         padded = row + [""] * (len(headers) - len(row))
         record = dict(zip(headers, padded))
         if record.get("user_id") == user_id:
+            extra_dict = parse_extra_data(record.get("extra_data", ""))
             data_rows.append(
                 {
                     "Record ID": record.get("record_id", ""),
@@ -1244,8 +1584,10 @@ def fetch_user_records(user_id: str) -> pd.DataFrame:
                     "Product / Services": record.get("products_services", "N/A") or "N/A",
                     "Address": record.get("address", "N/A") or "N/A",
                     "City": record.get("city", "N/A") or "N/A",
-                    "Notes": record.get("notes", ""),
+                    "Notes": record.get("notes", "") or "N/A",
                     "Saved On": record.get("created_at", ""),
+                    "Extra Details": format_extra_data_summary(extra_dict),
+                    "Extra Data JSON": serialize_extra_data(extra_dict),
                 }
             )
 
@@ -1256,7 +1598,7 @@ def fetch_user_records(user_id: str) -> pd.DataFrame:
 
 
 def search_records_df(df: pd.DataFrame, query: str) -> pd.DataFrame:
-    """Search across all user-facing card fields (case-insensitive)."""
+    """Search across all standard and extra card fields (case-insensitive)."""
     q = query.strip()
     if not q or df.empty:
         return df.iloc[0:0]
@@ -1271,6 +1613,7 @@ def search_records_df(df: pd.DataFrame, query: str) -> pd.DataFrame:
         | df["Address"].str.contains(q, case=False, na=False)
         | df["City"].str.contains(q, case=False, na=False)
         | df["Notes"].str.contains(q, case=False, na=False)
+        | df["Extra Details"].str.contains(q, case=False, na=False)
     )
     return df[mask]
 
@@ -1345,12 +1688,14 @@ def save_record(
     address: str,
     city: str,
     notes: str,
+    extra_data: Optional[dict[str, str]] = None,
 ) -> str:
     ws = get_cards_worksheet()
     _ensure_cards_header(ws)
 
     record_id = uuid.uuid4().hex[:8]
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    extra_json = serialize_extra_data(extra_data or {})
 
     row = [
         record_id,
@@ -1365,6 +1710,7 @@ def save_record(
         normalize_digits(city).strip() or "N/A",
         notes.strip() or "N/A",
         timestamp,
+        extra_json,
     ]
 
     ws.append_row(row, value_input_option="RAW", table_range="A1")
@@ -1372,7 +1718,7 @@ def save_record(
     return record_id
 
 
-def save_records_batch(user_id: str, records: list[dict[str, str]]) -> int:
+def save_records_batch(user_id: str, records: list[dict[str, Any]]) -> int:
     """Append multiple merged Excel/CSV records in one Google Sheets API call."""
     if not records:
         return 0
@@ -1383,6 +1729,7 @@ def save_records_batch(user_id: str, records: list[dict[str, str]]) -> int:
     rows_to_append: list[list[str]] = []
 
     for rec in records:
+        extra_json = serialize_extra_data(rec.get("extra_data") or {})
         rows_to_append.append(
             [
                 uuid.uuid4().hex[:8],
@@ -1397,6 +1744,7 @@ def save_records_batch(user_id: str, records: list[dict[str, str]]) -> int:
                 normalize_digits(rec.get("city", "")).strip() or "N/A",
                 normalize_digits(rec.get("notes", "")).strip() or "N/A",
                 timestamp,
+                extra_json,
             ]
         )
 
@@ -1417,6 +1765,7 @@ def update_record(
     address: str,
     city: str,
     notes: str,
+    extra_data: Optional[dict[str, str]] = None,
 ) -> bool:
     ws = get_cards_worksheet()
     all_rows = ws.get_all_values()
@@ -1432,6 +1781,7 @@ def update_record(
             original_created_at = existing.get(
                 "created_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             )
+            extra_json = serialize_extra_data(extra_data or {})
             updated_row = [
                 record_id,
                 user_id,
@@ -1445,6 +1795,7 @@ def update_record(
                 normalize_digits(city).strip() or "N/A",
                 notes.strip() or "N/A",
                 original_created_at,
+                extra_json,
             ]
             end_cell = rowcol_to_a1(sheet_row_idx, len(CARD_HEADERS))
             ws.update(
@@ -1474,7 +1825,7 @@ def delete_record(record_id: str, user_id: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Excel Export & Existing Excel Merge Helpers
+# Excel Export & Existing Excel Merge Helpers (With Extra-Column Preservation)
 # ---------------------------------------------------------------------------
 def build_excel_bytes(df: pd.DataFrame) -> bytes:
     output = io.BytesIO()
@@ -1498,20 +1849,17 @@ def _normalize_col_key(col_name: str) -> str:
 
 
 def _auto_detect_excel_mapping(columns: list[str]) -> dict[str, str]:
-    """Guess column mappings from an uploaded Excel/CSV file into our schema."""
     norm_to_orig = {_normalize_col_key(c): c for c in columns}
     mapping: dict[str, str] = {}
     used_cols: set[str] = set()
 
     for field_key, aliases in EXCEL_COLUMN_ALIASES.items():
         matched_col = ""
-        # Exact normalized alias match first
         for alias in aliases:
             norm_alias = _normalize_col_key(alias)
             if norm_alias in norm_to_orig and norm_to_orig[norm_alias] not in used_cols:
                 matched_col = norm_to_orig[norm_alias]
                 break
-        # Partial substring match as fallback
         if not matched_col:
             for norm_col, orig_col in norm_to_orig.items():
                 if orig_col in used_cols:
@@ -1540,12 +1888,13 @@ def _clean_excel_cell(val: Any) -> str:
 def prepare_excel_merge_rows(
     raw_df: pd.DataFrame,
     col_mapping: dict[str, str],
+    unmapped_extra_cols: list[str],
     user_id: str,
     skip_duplicates: bool,
-) -> Tuple[list[dict[str, str]], int, int]:
+) -> Tuple[list[dict[str, Any]], int, int]:
     """
-    Convert an uploaded Excel DataFrame into our exact format (empty cells -> 'N/A').
-    Returns (records_to_save, skipped_duplicate_count, skipped_empty_count).
+    Convert an uploaded Excel/CSV DataFrame into our standard format while saving any
+    unmapped extra columns (e.g., Website, GSTIN) inside `extra_data`.
     """
     existing_phones: set[str] = set()
     existing_emails: set[str] = set()
@@ -1558,7 +1907,7 @@ def prepare_excel_merge_rows(
             existing_phones |= extract_normalized_phones(str(ex_row.get("WhatsApp No.", "")))
             existing_emails |= extract_normalized_emails(str(ex_row.get("Email", "")))
 
-    prepared: list[dict[str, str]] = []
+    prepared: list[dict[str, Any]] = []
     skipped_dups = 0
     skipped_empty = 0
 
@@ -1570,7 +1919,14 @@ def prepare_excel_merge_rows(
                 _clean_excel_cell(row[src_col]) if src_col and src_col in raw_df.columns else ""
             )
 
-        if not has_at_least_one_field(*raw_vals.values()):
+        extra_dict: dict[str, str] = {}
+        for extra_col in unmapped_extra_cols:
+            if extra_col in raw_df.columns:
+                val = _clean_excel_cell(row[extra_col])
+                if val and val.upper() != "N/A":
+                    extra_dict[extra_col.strip()] = normalize_digits(val)
+
+        if not has_at_least_one_field(*raw_vals.values(), *extra_dict.values()):
             skipped_empty += 1
             continue
 
@@ -1605,6 +1961,7 @@ def prepare_excel_merge_rows(
                 "address": normalize_digits(raw_vals["address"]).strip() or "N/A",
                 "city": normalize_digits(raw_vals["city"]).strip() or "N/A",
                 "notes": normalize_digits(raw_vals["notes"]).strip() or "N/A",
+                "extra_data": extra_dict,
             }
         )
 
@@ -1620,10 +1977,10 @@ class ScanUnavailableError(Exception):
 
 def extract_card_details(
     images: list[Tuple[bytes, str]], api_key: str
-) -> Tuple[VisitingCard, str]:
+) -> Tuple[VisitingCard, dict[str, str], str]:
     if not api_key or not api_key.strip():
         raise ValueError(
-            "Scanner API key is missing. Add it in Streamlit Secrets or the sidebar Settings."
+            "Scanner API key is missing. Add it in Streamlit Secrets or Settings."
         )
     if not images:
         raise ValueError("Please provide at least one visiting card image.")
@@ -1663,10 +2020,13 @@ def extract_card_details(
         "CITY RULE:\n"
         "- Put ONLY the clean English city/town name in `city` (e.g., 'Ahmedabad', 'Mumbai', 'Kapadvanj', 'Dakor'). "
         "Do not put street, state, or PIN code in `city`. Infer from the address or PIN code if unambiguous; else 'N/A'.\n\n"
+        "EXTRA DETAILS RULE:\n"
+        "- Put any extra printed details (like Website, GSTIN, PAN, Instagram, LinkedIn, Branch, Office Timings, "
+        "ISO certification) into `extra_details` as {label, value} items so nothing printed on the card is lost.\n\n"
         "OTHER RULES:\n"
         "- For `products_services`: if not explicitly listed, infer what the company offers from the company name, "
         "tagline, logo, or contact person's title.\n"
-        "- If any field is completely absent and cannot be inferred, return 'N/A'."
+        "- If any standard field is completely absent and cannot be inferred, return 'N/A'."
     )
 
     image_parts = [
@@ -1700,7 +2060,8 @@ def extract_card_details(
             )
 
             if isinstance(response.parsed, VisitingCard):
-                return _clean_card_output(response.parsed), model
+                cleaned_card, extra_dict = _clean_card_output(response.parsed)
+                return cleaned_card, extra_dict, model
 
             if not response.text:
                 continue
@@ -1711,10 +2072,9 @@ def extract_card_details(
                 response.text.strip(),
                 flags=re.IGNORECASE,
             )
-            return (
-                _clean_card_output(VisitingCard.model_validate_json(cleaned_json)),
-                model,
-            )
+            parsed_obj = VisitingCard.model_validate_json(cleaned_json)
+            cleaned_card, extra_dict = _clean_card_output(parsed_obj)
+            return cleaned_card, extra_dict, model
 
         except genai_errors.APIError as api_err:
             if api_err.code in (401, 403):
@@ -1731,15 +2091,13 @@ def extract_card_details(
 
     raise ScanUnavailableError(
         "The AI scanner is momentarily busy or timed out. "
-        "Please tap Scan again in a few seconds — or use 'Fill Details Manually' below."
+        "Please tap Scan again in a few seconds — or use 'Fill Details Manually'."
     )
 
 
 def run_scan(image_files: list, api_key: str, user_id: str) -> None:
     if not api_key:
-        st.warning(
-            "Scanner API key is not configured yet. Please add it in the sidebar Settings."
-        )
+        st.warning("Scanner API key is not configured yet. Add it in Sidebar → Settings.")
         return
     if not image_files:
         st.warning("Please upload or capture at least 1 card image.")
@@ -1757,8 +2115,8 @@ def run_scan(image_files: list, api_key: str, user_id: str) -> None:
     if used_today >= daily_limit:
         st.warning(
             f"You have reached your daily limit of **{daily_limit} AI scans**. "
-            "Your quota resets automatically at 1:30 PM IST (12:30 PM IST in summer). "
-            "You can still add cards right now using **Fill Details Manually** below."
+            "Quota resets daily at 1:30 PM IST (12:30 PM IST in summer). "
+            "You can still add cards right now using **Fill Details Manually** or **Merge Existing Excel**."
         )
         return
 
@@ -1767,19 +2125,26 @@ def run_scan(image_files: list, api_key: str, user_id: str) -> None:
 
     with st.spinner(f"Scanning {side_label}..."):
         try:
-            extracted, _used_model = extract_card_details(images_payload, api_key)
+            extracted, extra_dict, _used_model = extract_card_details(
+                images_payload, api_key
+            )
             try:
                 increment_user_scan_count(user_id)
             except Exception:
                 pass
 
-            st.session_state["extracted_card"] = extracted.model_dump()
+            card_dict = extracted.model_dump(exclude={"extra_details"})
+            card_dict["notes"] = ""
+            card_dict["extra_details_text"] = format_extra_data_for_input(extra_dict)
+
+            st.session_state["extracted_card"] = card_dict
             st.session_state["is_manual_entry"] = False
             st.session_state["pending_duplicate_save"] = None
             st.session_state["scan_counter"] += 1
+            st.session_state["scroll_to_form_seq"] += 1
             st.session_state["scan_notice"] = (
                 f"Scanned {len(images_payload)} image(s) successfully! "
-                "Please verify or edit the details below and click Save Card."
+                "Verify or edit the details below and click Save Card."
             )
             st.rerun()
         except ValueError as val_err:
@@ -1788,13 +2153,13 @@ def run_scan(image_files: list, api_key: str, user_id: str) -> None:
             st.warning(str(busy_err))
         except Exception:
             st.warning(
-                "Could not read the card right now. Please try a clearer photo, "
-                "tap Scan again in a moment, or use 'Fill Details Manually' below."
+                "Could not read the card right now. Try a clearer photo, "
+                "tap Scan again in a moment, or use 'Fill Details Manually'."
             )
 
 
 def open_blank_manual_form() -> None:
-    """Open a clean manual entry form with empty fields (no N/A, no placeholders)."""
+    """Open an empty manual entry form (no N/A defaults) and smoothly scroll down to it."""
     st.session_state["extracted_card"] = {
         "company_name": "",
         "contact_person": "",
@@ -1805,12 +2170,14 @@ def open_blank_manual_form() -> None:
         "address": "",
         "city": "",
         "notes": "",
+        "extra_details_text": "",
     }
     st.session_state["is_manual_entry"] = True
     st.session_state["pending_duplicate_save"] = None
     st.session_state["scan_counter"] += 1
+    st.session_state["scroll_to_form_seq"] += 1
     st.session_state["scan_notice"] = (
-        "Manual entry mode — fill in at least one field below and click Save Card."
+        "Manual entry — fill in at least one field below and click Save Card."
     )
 
 
@@ -1823,206 +2190,231 @@ def render_auth_screen() -> None:
     with center_col:
         st.title("Company Visiting Card Scanner")
         st.caption(
-            "Sign in or create an account to scan, save, and manage your own visiting cards."
+            "Sign in or create an account to scan, organize, and export your visiting cards."
         )
 
-        tab_login, tab_register, tab_forgot = st.tabs(
-            ["Login", "Register", "Forgot Password"]
-        )
+        with st.container(border=True):
+            tab_login, tab_register, tab_forgot = st.tabs(
+                ["Login", "Register", "Forgot Password"]
+            )
 
-        with tab_login:
-            with st.form("login_form"):
-                identifier = st.text_input(
-                    "Username or Email",
-                    placeholder="e.g., business_user or name@example.com",
-                )
-                password = st.text_input("Password", type="password")
-                login_submitted = st.form_submit_button(
-                    "Login", type="primary", use_container_width=True
-                )
-
-            if login_submitted:
-                with st.spinner("Signing in..."):
-                    try:
-                        ok, msg, user = authenticate_user(identifier, password)
-                        if ok and user:
-                            login_user_session(user)
-                            st.session_state["extracted_card"] = None
-                            st.session_state["is_manual_entry"] = False
-                            st.session_state["pending_duplicate_save"] = None
-                            st.session_state["pending_registration"] = None
-                            st.session_state["scan_notice"] = None
-                            st.session_state["flash_success"] = (
-                                f"Welcome back, {user['username']}!"
-                            )
-                            st.rerun()
-                        else:
-                            st.error(msg)
-                    except Exception:
-                        st.error("Unable to sign in right now. Please try again.")
-
-        with tab_register:
-            pending_reg = st.session_state.get("pending_registration")
-
-            if pending_reg is None:
-                st.caption("Step 1: Enter your details to receive an email verification OTP.")
-                with st.form("register_step1_form"):
-                    reg_username = st.text_input(
-                        "Username",
-                        placeholder="3–30 characters (letters, numbers, _ . -)",
+            with tab_login:
+                with st.form("login_form"):
+                    identifier = st.text_input(
+                        "Username or Email",
+                        placeholder="e.g., business_user or name@example.com",
                     )
-                    reg_email = st.text_input("Email", placeholder="name@example.com")
-                    reg_password = st.text_input(
+                    password = st.text_input(
                         "Password",
                         type="password",
-                        placeholder="Minimum 6 characters",
+                        placeholder="Enter your password",
                     )
-                    reg_confirm = st.text_input("Confirm Password", type="password")
-                    send_reg_otp = st.form_submit_button(
-                        "Send Verification OTP",
-                        type="primary",
-                        use_container_width=True,
+                    login_submitted = st.form_submit_button(
+                        "Login", type="primary", use_container_width=True
                     )
 
-                if send_reg_otp:
-                    if reg_password != reg_confirm:
-                        st.error("Passwords do not match.")
-                    else:
-                        with st.spinner("Sending verification OTP..."):
-                            try:
-                                ok, msg, pending_data = start_registration_otp(
-                                    reg_username, reg_email, reg_password
-                                )
-                                if ok and pending_data:
-                                    st.session_state["pending_registration"] = pending_data
-                                    st.session_state["reg_otp_notice"] = msg
-                                    st.rerun()
-                                else:
-                                    st.error(msg)
-                            except Exception:
-                                st.error(
-                                    "Unable to start registration right now. Please try again."
-                                )
-            else:
-                if st.session_state.get("reg_otp_notice"):
-                    st.success(st.session_state["reg_otp_notice"])
-                    st.session_state["reg_otp_notice"] = None
-
-                st.info(
-                    f"Step 2: Enter the 6-digit OTP sent to **{pending_reg['email']}** "
-                    f"for username **{pending_reg['username']}**."
-                )
-
-                with st.form("register_step2_otp_form"):
-                    reg_otp_input = st.text_input(
-                        "6-Digit Verification OTP",
-                        placeholder="e.g., 482910",
-                        max_chars=6,
-                    )
-                    verify_reg_btn = st.form_submit_button(
-                        "Verify Email & Create Account",
-                        type="primary",
-                        use_container_width=True,
-                    )
-
-                if verify_reg_btn:
-                    with st.spinner("Verifying OTP and creating account..."):
+                if login_submitted:
+                    with st.spinner("Signing in..."):
                         try:
-                            ok, msg, user = complete_registration_with_otp(
-                                pending_reg, reg_otp_input
-                            )
+                            ok, msg, user = authenticate_user(identifier, password)
                             if ok and user:
                                 login_user_session(user)
-                                st.session_state["pending_registration"] = None
                                 st.session_state["extracted_card"] = None
                                 st.session_state["is_manual_entry"] = False
                                 st.session_state["pending_duplicate_save"] = None
+                                st.session_state["pending_registration"] = None
                                 st.session_state["scan_notice"] = None
                                 st.session_state["flash_success"] = (
-                                    f"Email verified! Welcome, {user['username']}."
+                                    f"Welcome back, {user['username']}!"
                                 )
                                 st.rerun()
                             else:
                                 st.error(msg)
                         except Exception:
-                            st.error("Could not verify OTP right now. Please try again.")
+                            st.error("Unable to sign in right now. Please try again.")
 
-                resend_col, cancel_col = st.columns(2)
-                with resend_col:
-                    if st.button("Resend OTP", use_container_width=True, key="btn_resend_reg_otp"):
-                        with st.spinner("Resending OTP..."):
-                            ok, msg = resend_registration_otp(pending_reg)
-                            if ok:
-                                st.success(msg)
-                            else:
-                                st.error(msg)
-                with cancel_col:
-                    if st.button(
-                        "Change Email / Details",
-                        use_container_width=True,
-                        key="btn_cancel_reg_otp",
-                    ):
-                        st.session_state["pending_registration"] = None
-                        st.session_state["reg_otp_notice"] = None
-                        st.rerun()
+            with tab_register:
+                pending_reg = st.session_state.get("pending_registration")
 
-        with tab_forgot:
-            st.caption("Step 1: Enter your registered email to receive a 6-digit code.")
-            with st.form("forgot_request_form"):
-                reset_email_input = st.text_input(
-                    "Registered Email",
-                    value=st.session_state.get("reset_email_target", ""),
-                    placeholder="name@example.com",
-                )
-                send_code_btn = st.form_submit_button(
-                    "Send 6-Digit Reset Code", type="primary", use_container_width=True
-                )
-
-            if send_code_btn:
-                with st.spinner("Sending verification code..."):
-                    ok, msg = request_password_reset(reset_email_input)
-                    if ok:
-                        st.session_state["reset_email_target"] = (
-                            reset_email_input.strip().lower()
+                if pending_reg is None:
+                    st.caption(
+                        "Step 1: Enter your details to receive an email verification OTP."
+                    )
+                    with st.form("register_step1_form"):
+                        reg_username = st.text_input(
+                            "Username",
+                            placeholder="3–30 characters (letters, numbers, _ . -)",
                         )
-                        st.success(msg)
-                    else:
-                        st.error(msg)
+                        reg_email = st.text_input("Email", placeholder="name@example.com")
+                        reg_password = st.text_input(
+                            "Password",
+                            type="password",
+                            placeholder="Minimum 6 characters",
+                        )
+                        reg_confirm = st.text_input(
+                            "Confirm Password",
+                            type="password",
+                            placeholder="Re-enter your password",
+                        )
+                        send_reg_otp = st.form_submit_button(
+                            "Send Verification OTP",
+                            type="primary",
+                            use_container_width=True,
+                        )
 
-            st.divider()
-            st.caption("Step 2: Enter the code from your email and choose a new password.")
-            with st.form("forgot_confirm_form"):
-                verify_email = st.text_input(
-                    "Email",
-                    value=st.session_state.get("reset_email_target", ""),
-                    placeholder="name@example.com",
-                )
-                otp_code = st.text_input(
-                    "6-Digit Verification Code",
-                    placeholder="e.g., 482910",
-                    max_chars=6,
-                )
-                new_pw = st.text_input(
-                    "New Password",
-                    type="password",
-                    placeholder="Minimum 6 characters",
-                )
-                confirm_new_pw = st.text_input("Confirm New Password", type="password")
-                reset_pw_btn = st.form_submit_button(
-                    "Reset Password", type="primary", use_container_width=True
-                )
-
-            if reset_pw_btn:
-                if new_pw != confirm_new_pw:
-                    st.error("Passwords do not match.")
+                    if send_reg_otp:
+                        if reg_password != reg_confirm:
+                            st.error("Passwords do not match.")
+                        else:
+                            with st.spinner("Sending verification OTP..."):
+                                try:
+                                    ok, msg, pending_data = start_registration_otp(
+                                        reg_username, reg_email, reg_password
+                                    )
+                                    if ok and pending_data:
+                                        st.session_state["pending_registration"] = (
+                                            pending_data
+                                        )
+                                        st.session_state["reg_otp_notice"] = msg
+                                        st.rerun()
+                                    else:
+                                        st.error(msg)
+                                except Exception:
+                                    st.error(
+                                        "Unable to start registration right now. Please try again."
+                                    )
                 else:
-                    with st.spinner("Updating password..."):
-                        ok, msg = confirm_password_reset(verify_email, otp_code, new_pw)
+                    if st.session_state.get("reg_otp_notice"):
+                        st.success(st.session_state["reg_otp_notice"])
+                        st.session_state["reg_otp_notice"] = None
+
+                    st.info(
+                        f"Step 2: Enter the 6-digit OTP sent to **{pending_reg['email']}** "
+                        f"for username **{pending_reg['username']}**."
+                    )
+
+                    with st.form("register_step2_otp_form"):
+                        reg_otp_input = st.text_input(
+                            "6-Digit Verification OTP",
+                            placeholder="e.g., 482910",
+                            max_chars=6,
+                        )
+                        verify_reg_btn = st.form_submit_button(
+                            "Verify Email & Create Account",
+                            type="primary",
+                            use_container_width=True,
+                        )
+
+                    if verify_reg_btn:
+                        with st.spinner("Verifying OTP and creating account..."):
+                            try:
+                                ok, msg, user = complete_registration_with_otp(
+                                    pending_reg, reg_otp_input
+                                )
+                                if ok and user:
+                                    login_user_session(user)
+                                    st.session_state["pending_registration"] = None
+                                    st.session_state["extracted_card"] = None
+                                    st.session_state["is_manual_entry"] = False
+                                    st.session_state["pending_duplicate_save"] = None
+                                    st.session_state["scan_notice"] = None
+                                    st.session_state["flash_success"] = (
+                                        f"Email verified! Welcome, {user['username']}."
+                                    )
+                                    st.rerun()
+                                else:
+                                    st.error(msg)
+                            except Exception:
+                                st.error("Could not verify OTP right now. Please try again.")
+
+                    resend_col, cancel_col = st.columns(2)
+                    with resend_col:
+                        if st.button(
+                            "Resend OTP",
+                            use_container_width=True,
+                            key="btn_resend_reg_otp",
+                        ):
+                            with st.spinner("Resending OTP..."):
+                                ok, msg = resend_registration_otp(pending_reg)
+                                if ok:
+                                    st.success(msg)
+                                else:
+                                    st.error(msg)
+                    with cancel_col:
+                        if st.button(
+                            "Change Email / Details",
+                            use_container_width=True,
+                            key="btn_cancel_reg_otp",
+                        ):
+                            st.session_state["pending_registration"] = None
+                            st.session_state["reg_otp_notice"] = None
+                            st.rerun()
+
+            with tab_forgot:
+                st.caption("Step 1: Enter your registered email to receive a 6-digit code.")
+                with st.form("forgot_request_form"):
+                    reset_email_input = st.text_input(
+                        "Registered Email",
+                        value=st.session_state.get("reset_email_target", ""),
+                        placeholder="name@example.com",
+                    )
+                    send_code_btn = st.form_submit_button(
+                        "Send 6-Digit Reset Code",
+                        type="primary",
+                        use_container_width=True,
+                    )
+
+                if send_code_btn:
+                    with st.spinner("Sending verification code..."):
+                        ok, msg = request_password_reset(reset_email_input)
                         if ok:
-                            st.session_state["reset_email_target"] = ""
+                            st.session_state["reset_email_target"] = (
+                                reset_email_input.strip().lower()
+                            )
                             st.success(msg)
                         else:
                             st.error(msg)
+
+                st.divider()
+                st.caption("Step 2: Enter the code from your email and choose a new password.")
+                with st.form("forgot_confirm_form"):
+                    verify_email = st.text_input(
+                        "Email",
+                        value=st.session_state.get("reset_email_target", ""),
+                        placeholder="name@example.com",
+                    )
+                    otp_code = st.text_input(
+                        "6-Digit Verification Code",
+                        placeholder="e.g., 482910",
+                        max_chars=6,
+                    )
+                    new_pw = st.text_input(
+                        "New Password",
+                        type="password",
+                        placeholder="Minimum 6 characters",
+                    )
+                    confirm_new_pw = st.text_input(
+                        "Confirm New Password",
+                        type="password",
+                        placeholder="Re-enter new password",
+                    )
+                    reset_pw_btn = st.form_submit_button(
+                        "Reset Password", type="primary", use_container_width=True
+                    )
+
+                if reset_pw_btn:
+                    if new_pw != confirm_new_pw:
+                        st.error("Passwords do not match.")
+                    else:
+                        with st.spinner("Updating password..."):
+                            ok, msg = confirm_password_reset(
+                                verify_email, otp_code, new_pw
+                            )
+                            if ok:
+                                st.session_state["reset_email_target"] = ""
+                                st.success(msg)
+                            else:
+                                st.error(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -2048,97 +2440,128 @@ def render_show_records_section(
     title: str,
     key_prefix: str,
 ) -> None:
-    header_col, refresh_col = st.columns([5, 1])
-    with header_col:
-        st.subheader(title)
-    with refresh_col:
-        if st.button("Refresh", use_container_width=True, key=f"{key_prefix}_refresh"):
-            _fetch_all_card_rows.clear()
-            _fetch_all_usage_rows.clear()
-            st.rerun()
+    with st.container(border=True):
+        header_col, refresh_col = st.columns([4.5, 1])
+        with header_col:
+            st.subheader(title)
+        with refresh_col:
+            if st.button("Refresh", use_container_width=True, key=f"{key_prefix}_refresh"):
+                _fetch_all_card_rows.clear()
+                _fetch_all_usage_rows.clear()
+                st.rerun()
 
-    if all_records_df.empty:
-        st.info("You haven't saved any visiting cards yet. Scan, enter manually, or merge an Excel file!")
-        return
+        if all_records_df.empty:
+            st.info(
+                "No visiting cards saved yet. Upload a card, take a photo, fill manually, or merge an Excel file."
+            )
+            return
 
-    unique_cities = sorted(
-        {
-            str(c).strip()
-            for c in all_records_df["City"].dropna().tolist()
-            if str(c).strip() and str(c).strip().upper() != "N/A"
-        }
-    )
-
-    search_col, city_col, export_col = st.columns([2.6, 1.3, 1.2])
-
-    with search_col:
-        search_query = st.text_input(
-            "Search records",
-            placeholder="Search by company, person, phone, email, product, city, or address...",
-            label_visibility="collapsed",
-            key=f"{key_prefix}_search_box",
+        unique_cities = sorted(
+            {
+                str(c).strip()
+                for c in all_records_df["City"].dropna().tolist()
+                if str(c).strip() and str(c).strip().upper() != "N/A"
+            }
         )
 
-    with city_col:
-        selected_city = st.selectbox(
-            "Filter by City",
-            options=["All Cities", *unique_cities],
-            label_visibility="collapsed",
-            key=f"{key_prefix}_city_filter",
-        )
+        search_col, city_col, export_col = st.columns([2.5, 1.3, 1.4])
 
-    filtered_df = all_records_df.copy()
-
-    if selected_city != "All Cities":
-        filtered_df = filtered_df[
-            filtered_df["City"].astype(str).str.strip().str.lower()
-            == selected_city.lower()
-        ]
-
-    if search_query.strip():
-        filtered_df = search_records_df(filtered_df, search_query)
-
-    is_filtered = bool(search_query.strip()) or selected_city != "All Cities"
-    display_df = filtered_df[DEFAULT_TABLE_COLUMNS]
-
-    with export_col:
-        if not display_df.empty:
-            excel_bytes = build_excel_bytes(display_df)
-            city_suffix = (
-                f"_{re.sub(r'[^A-Za-z0-9]+', '_', selected_city).strip('_')}"
-                if selected_city != "All Cities"
-                else ""
+        with search_col:
+            search_query = st.text_input(
+                "Search records",
+                placeholder="Search company, person, phone, email, city, website...",
+                label_visibility="collapsed",
+                key=f"{key_prefix}_search_box",
             )
-            filename = (
-                f"visiting_cards_{current_username}{city_suffix}_{datetime.now().strftime('%Y%m%d')}.xlsx"
+
+        with city_col:
+            selected_city = st.selectbox(
+                "Filter by City",
+                options=["All Cities", *unique_cities],
+                label_visibility="collapsed",
+                key=f"{key_prefix}_city_filter",
             )
-            btn_label = (
-                "Download Filtered (.xlsx)"
-                if is_filtered
-                else "Download Excel (.xlsx)"
-            )
-            st.download_button(
-                label=btn_label,
-                data=excel_bytes,
-                file_name=filename,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-                key=f"{key_prefix}_download_excel",
-            )
+
+        filtered_df = all_records_df.copy()
+
+        if selected_city != "All Cities":
+            filtered_df = filtered_df[
+                filtered_df["City"].astype(str).str.strip().str.lower()
+                == selected_city.lower()
+            ]
+
+        if search_query.strip():
+            filtered_df = search_records_df(filtered_df, search_query)
+
+        is_filtered = bool(search_query.strip()) or selected_city != "All Cities"
+        extra_col_names = collect_extra_column_names(filtered_df)
+
+        # Excel export ALWAYS expands extra_data keys (e.g., Website, GSTIN) into real columns
+        export_df = build_expanded_dataframe(filtered_df, include_extra_columns=True)
+
+        with export_col:
+            if not export_df.empty:
+                excel_bytes = build_excel_bytes(export_df)
+                city_suffix = (
+                    f"_{re.sub(r'[^A-Za-z0-9]+', '_', selected_city).strip('_')}"
+                    if selected_city != "All Cities"
+                    else ""
+                )
+                filename = (
+                    f"visiting_cards_{current_username}{city_suffix}_{datetime.now().strftime('%Y%m%d')}.xlsx"
+                )
+                btn_label = (
+                    "Export Filtered (.xlsx)"
+                    if is_filtered
+                    else "Export Excel (.xlsx)"
+                )
+                st.download_button(
+                    label=btn_label,
+                    data=excel_bytes,
+                    file_name=filename,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                    key=f"{key_prefix}_download_excel",
+                )
+            else:
+                st.button(
+                    "Export Excel (.xlsx)",
+                    disabled=True,
+                    use_container_width=True,
+                    key=f"{key_prefix}_download_disabled",
+                )
+
+        # Keep default 10-column table clean; offer quick toggle when extra columns exist
+        show_extra_in_table = False
+        if extra_col_names:
+            meta_col1, meta_col2 = st.columns([2.2, 2.8])
+            with meta_col1:
+                if is_filtered:
+                    st.caption(
+                        f"Showing **{len(filtered_df)}** of {len(all_records_df)} saved cards"
+                    )
+                else:
+                    st.caption(f"Total saved cards: **{len(all_records_df)}**")
+            with meta_col2:
+                preview_names = ", ".join(extra_col_names[:3])
+                more = f" +{len(extra_col_names) - 3} more" if len(extra_col_names) > 3 else ""
+                show_extra_in_table = st.checkbox(
+                    f"Show extra columns ({preview_names}{more}) — always included in Excel export",
+                    value=False,
+                    key=f"{key_prefix}_toggle_extra_cols",
+                )
         else:
-            st.button(
-                "Download Excel (.xlsx)",
-                disabled=True,
-                use_container_width=True,
-                key=f"{key_prefix}_download_disabled",
-            )
+            if is_filtered:
+                st.caption(
+                    f"Showing **{len(filtered_df)}** of {len(all_records_df)} saved cards"
+                )
+            else:
+                st.caption(f"Total saved cards: **{len(all_records_df)}**")
 
-    if is_filtered:
-        st.caption(f"Showing {len(display_df)} of {len(all_records_df)} saved cards")
-    else:
-        st.caption(f"Total saved cards: {len(all_records_df)}")
-
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
+        display_df = build_expanded_dataframe(
+            filtered_df, include_extra_columns=show_extra_in_table
+        )
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
 
 
 def _render_update_record_body(
@@ -2150,12 +2573,12 @@ def _render_update_record_body(
 
     edit_query = st.text_input(
         "Search card to update",
-        placeholder="Type company name, contact person, phone, email, or city...",
+        placeholder="Type company name, person, phone, email, city, or website...",
         key=f"{key_prefix}_search_record_to_edit",
     )
 
     if not edit_query.strip():
-        st.caption("Enter a keyword above to find the record you want to update.")
+        st.caption("Enter any keyword above to find the record you want to update.")
         return
 
     edit_matches = search_records_df(all_records_df, edit_query)
@@ -2191,6 +2614,9 @@ def _render_update_record_body(
 
     edit_id = str(selected_edit_row["Record ID"])
     edit_rev = st.session_state["edit_counter"]
+    existing_extra_text = format_extra_data_for_input(
+        parse_extra_data(str(selected_edit_row.get("Extra Data JSON", "")))
+    )
 
     with st.form(key=f"{key_prefix}_edit_card_form_{edit_id}_{edit_rev}"):
         er1_c1, er1_c2 = st.columns(2)
@@ -2198,12 +2624,14 @@ def _render_update_record_body(
             upd_company = st.text_input(
                 "Company Name",
                 value=str(selected_edit_row["Company Name"]),
+                placeholder=FIELD_PLACEHOLDERS["company_name"],
                 key=f"{key_prefix}_upd_company_{edit_id}_{edit_rev}",
             )
         with er1_c2:
             upd_contact = st.text_input(
                 "Contact Person",
                 value=str(selected_edit_row["Contact Person"]),
+                placeholder=FIELD_PLACEHOLDERS["contact_person"],
                 key=f"{key_prefix}_upd_contact_{edit_id}_{edit_rev}",
             )
 
@@ -2212,12 +2640,14 @@ def _render_update_record_body(
             upd_call = st.text_input(
                 "Contact No.",
                 value=str(selected_edit_row["Contact No."]),
+                placeholder=FIELD_PLACEHOLDERS["call_phone"],
                 key=f"{key_prefix}_upd_call_{edit_id}_{edit_rev}",
             )
         with er2_c2:
             upd_whatsapp = st.text_input(
                 "WhatsApp No.",
                 value=str(selected_edit_row["WhatsApp No."]),
+                placeholder=FIELD_PLACEHOLDERS["whatsapp_phone"],
                 key=f"{key_prefix}_upd_whatsapp_{edit_id}_{edit_rev}",
             )
 
@@ -2226,19 +2656,22 @@ def _render_update_record_body(
             upd_email = st.text_input(
                 "Email",
                 value=str(selected_edit_row["Email"]),
+                placeholder=FIELD_PLACEHOLDERS["email"],
                 key=f"{key_prefix}_upd_email_{edit_id}_{edit_rev}",
             )
         with er3_c2:
             upd_products = st.text_input(
                 "Product / Services",
                 value=str(selected_edit_row["Product / Services"]),
+                placeholder=FIELD_PLACEHOLDERS["products_services"],
                 key=f"{key_prefix}_upd_products_{edit_id}_{edit_rev}",
             )
 
         upd_address = st.text_area(
             "Address",
             value=str(selected_edit_row["Address"]),
-            height=85,
+            placeholder=FIELD_PLACEHOLDERS["address"],
+            height=80,
             key=f"{key_prefix}_upd_address_{edit_id}_{edit_rev}",
         )
 
@@ -2247,18 +2680,29 @@ def _render_update_record_body(
             upd_city = st.text_input(
                 "City",
                 value=str(selected_edit_row["City"]),
+                placeholder=FIELD_PLACEHOLDERS["city"],
                 key=f"{key_prefix}_upd_city_{edit_id}_{edit_rev}",
             )
         with er4_c2:
             upd_notes = st.text_input(
                 "Notes (Optional)",
                 value=str(selected_edit_row["Notes"]),
+                placeholder=FIELD_PLACEHOLDERS["notes"],
                 key=f"{key_prefix}_upd_notes_{edit_id}_{edit_rev}",
             )
+
+        upd_extra_text = st.text_area(
+            "Extra Details (Optional — Website, GSTIN, etc., one per line as Label: Value)",
+            value=existing_extra_text,
+            placeholder=FIELD_PLACEHOLDERS["extra_details"],
+            height=75,
+            key=f"{key_prefix}_upd_extra_{edit_id}_{edit_rev}",
+        )
 
         update_submitted = st.form_submit_button("Update Record", type="primary")
 
         if update_submitted:
+            parsed_extra = parse_extra_data_from_input(upd_extra_text)
             if not has_at_least_one_field(
                 upd_company,
                 upd_contact,
@@ -2269,6 +2713,7 @@ def _render_update_record_body(
                 upd_address,
                 upd_city,
                 upd_notes,
+                *parsed_extra.values(),
             ):
                 st.error("Please fill at least one field before updating the record.")
             else:
@@ -2285,6 +2730,7 @@ def _render_update_record_body(
                         address=upd_address,
                         city=upd_city,
                         notes=upd_notes,
+                        extra_data=parsed_extra,
                     )
                     if updated:
                         st.session_state["edit_counter"] += 1
@@ -2311,8 +2757,9 @@ def render_update_record_section(
         with st.expander("Update a record (by search)"):
             _render_update_record_body(all_records_df, current_user_id, key_prefix)
     else:
-        st.subheader("Update a Record (by Search)")
-        _render_update_record_body(all_records_df, current_user_id, key_prefix)
+        with st.container(border=True):
+            st.subheader("Update a Record")
+            _render_update_record_body(all_records_df, current_user_id, key_prefix)
 
 
 def _render_delete_record_body(
@@ -2324,12 +2771,12 @@ def _render_delete_record_body(
 
     del_query = st.text_input(
         "Search card to delete",
-        placeholder="Type company name, contact person, phone, email, or city...",
+        placeholder="Type company name, person, phone, email, city, or website...",
         key=f"{key_prefix}_search_record_to_delete",
     )
 
     if not del_query.strip():
-        st.caption("Enter a keyword above to find the record you want to delete.")
+        st.caption("Enter any keyword above to find the record you want to delete.")
         return
 
     del_matches = search_records_df(all_records_df, del_query)
@@ -2395,8 +2842,9 @@ def render_delete_record_section(
         with st.expander("Delete a record (by search)"):
             _render_delete_record_body(all_records_df, current_user_id, key_prefix)
     else:
-        st.subheader("Delete a Record (by Search)")
-        _render_delete_record_body(all_records_df, current_user_id, key_prefix)
+        with st.container(border=True):
+            st.subheader("Delete a Record")
+            _render_delete_record_body(all_records_df, current_user_id, key_prefix)
 
 
 # ---------------------------------------------------------------------------
@@ -2418,6 +2866,8 @@ def main() -> None:
         ("scan_counter", 0),
         ("edit_counter", 0),
         ("uploader_reset_counter", 0),
+        ("close_sidebar_seq", 0),
+        ("scroll_to_form_seq", 0),
         ("flash_success", None),
         ("flash_info", None),
         ("scan_notice", None),
@@ -2466,9 +2916,16 @@ def main() -> None:
         scans_used_today = 0
     scans_remaining = max(0, daily_limit - scans_used_today)
 
-    # ---- Sidebar: Navigation, Account, Daily Limit & Settings ----
+    # Fetch user records once so both summary strip and sections stay in sync
+    try:
+        all_records_df = fetch_user_records(current_user_id)
+    except Exception:
+        st.error("Unable to load your saved cards right now. Please refresh.")
+        return
+
+    # ---- Sidebar: Menu (with Logout), Account Info, Collapsible Settings ----
     with st.sidebar:
-        st.header("Navigation")
+        st.markdown("### Menu")
         active_view = st.session_state["active_view"]
 
         nav_items = [
@@ -2485,21 +2942,11 @@ def main() -> None:
                 key=f"nav_btn_{view_key}",
             ):
                 st.session_state["active_view"] = view_key
+                st.session_state["close_sidebar_seq"] += 1
                 st.rerun()
 
-        st.divider()
-        st.header("Account")
-        st.markdown(f"**{current_username}**")
-        st.caption(current_email)
-
-        st.metric(
-            label="AI Scans Left Today",
-            value=f"{scans_remaining} / {daily_limit}",
-        )
-        st.progress(min(1.0, scans_used_today / daily_limit))
-        st.caption("Resets daily at 1:30 PM IST (12:30 PM in summer)")
-
-        if st.button("Logout", use_container_width=True):
+        # Logout grouped cleanly with Menu navigation buttons (not inside Account)
+        if st.button("Logout", use_container_width=True, key="nav_btn_logout"):
             logout_user_session()
             st.session_state["extracted_card"] = None
             st.session_state["is_manual_entry"] = False
@@ -2507,40 +2954,69 @@ def main() -> None:
             st.session_state["scan_notice"] = None
             st.session_state["flash_success"] = None
             st.session_state["flash_info"] = None
+            st.session_state["close_sidebar_seq"] += 1
             st.rerun()
 
         st.divider()
-        st.header("Settings")
+        st.markdown("### Account")
+        st.markdown(f"**{current_username}**")
+        st.caption(current_email)
+        st.progress(min(1.0, scans_used_today / daily_limit))
+        st.caption(
+            f"**{scans_remaining} / {daily_limit}** AI scans left today · "
+            "Resets 1:30 PM IST (12:30 PM summer)"
+        )
 
+        st.divider()
         server_api_key = str(get_secret("GEMINI_API_KEY", "") or "").strip()
-        if server_api_key:
-            st.success("AI Scanner ready")
-            override_key = st.text_input(
-                "Use your own Gemini API Key (optional)",
-                value="",
-                type="password",
-                placeholder="Leave blank to use default key",
-            )
-            active_api_key = override_key.strip() or server_api_key
-        else:
-            user_api_key = st.text_input(
-                "Gemini API Key",
-                value="",
-                type="password",
-                placeholder="AIza... or AQ...",
-            )
-            active_api_key = user_api_key.strip()
-            if active_api_key:
+        with st.expander("Settings", expanded=not bool(server_api_key)):
+            if server_api_key:
                 st.success("AI Scanner ready")
+                override_key = st.text_input(
+                    "Use your own Gemini API Key (optional)",
+                    value="",
+                    type="password",
+                    placeholder="Leave blank to use default key",
+                )
+                active_api_key = override_key.strip() or server_api_key
             else:
-                st.warning("Enter a Gemini API key to scan cards.")
+                user_api_key = st.text_input(
+                    "Gemini API Key",
+                    value="",
+                    type="password",
+                    placeholder="Enter your Gemini API key",
+                )
+                active_api_key = user_api_key.strip()
+                if active_api_key:
+                    st.success("AI Scanner ready")
+                else:
+                    st.warning("Enter a Gemini API key to scan cards.")
 
-        st.success("Cloud storage connected")
+            st.success("Cloud storage connected")
 
-    # ---- Page Header & Flash Banners ----
+    # Mount hidden UI bridge for mobile sidebar auto-close & smooth form scroll
+    trigger_ui_bridge()
+
+    # ---- Clean Page Header & Quick-Stats Strip ----
     st.title("Company Visiting Card Scanner")
-    st.caption(
-        f"Signed in as **{current_username}** — you only see and manage cards saved to your account."
+    st.markdown(
+        f"""
+        <div class="vcard-stat-strip">
+            <div class="vcard-stat-pill">
+                <div class="vcard-stat-label">Account</div>
+                <div class="vcard-stat-value">{current_username}</div>
+            </div>
+            <div class="vcard-stat-pill">
+                <div class="vcard-stat-label">Saved Cards</div>
+                <div class="vcard-stat-value">{len(all_records_df)}</div>
+            </div>
+            <div class="vcard-stat-pill">
+                <div class="vcard-stat-label">AI Scans Left Today</div>
+                <div class="vcard-stat-value">{scans_remaining} / {daily_limit}</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
     if st.session_state["flash_success"]:
@@ -2550,13 +3026,6 @@ def main() -> None:
     if st.session_state["flash_info"]:
         st.info(st.session_state["flash_info"])
         st.session_state["flash_info"] = None
-
-    # Fetch user records once for all views
-    try:
-        all_records_df = fetch_user_records(current_user_id)
-    except Exception:
-        st.error("Unable to load your saved cards right now. Please refresh.")
-        return
 
     # ---- Dedicated Sidebar Views (Show / Update / Delete) ----
     if active_view == "show":
@@ -2586,164 +3055,202 @@ def main() -> None:
         )
         return
 
-    # ---- HOME VIEW: Step 1 (Upload / Camera / Merge Excel) + Step 2 + Step 3 ----
+    # ---- HOME VIEW: Step 1 (Upload / Camera / Merge Excel + Manual Entry) ----
     upload_rev = st.session_state["uploader_reset_counter"]
 
-    step1_col, manual_col = st.columns([4, 1.4])
-    with step1_col:
-        st.subheader("1. Capture, Upload Card, or Merge Excel")
-    with manual_col:
-        if st.button("Fill Details Manually", use_container_width=True):
-            open_blank_manual_form()
-            st.rerun()
+    with st.container(border=True):
+        step1_col, manual_col = st.columns([3.5, 1.5])
+        with step1_col:
+            st.subheader("1. Add Visiting Card")
+            st.caption(
+                "Scan 1 or 2 card sides with AI, merge an existing Excel sheet, or fill details manually."
+            )
+        with manual_col:
+            st.markdown("<div style='height: 0.35rem'></div>", unsafe_allow_html=True)
+            if st.button(
+                "Fill Details Manually",
+                type="secondary",
+                use_container_width=True,
+                key="btn_open_manual_form",
+            ):
+                open_blank_manual_form()
+                st.rerun()
 
-    tab_upload, tab_camera, tab_excel = st.tabs(
-        ["Upload Image(s)", "Take Photo with Camera", "Merge Existing Excel"]
-    )
-
-    with tab_upload:
-        uploaded_files = st.file_uploader(
-            "Choose 1 or 2 visiting card images (Front & Back — JPG or PNG)",
-            type=["jpg", "jpeg", "png"],
-            accept_multiple_files=True,
-            key=f"card_file_uploader_{upload_rev}",
+        tab_upload, tab_camera, tab_excel = st.tabs(
+            ["Upload Image(s)", "Take Photo", "Merge Existing Excel"]
         )
-        if uploaded_files:
-            if len(uploaded_files) > MAX_CARD_IMAGES:
-                st.error(
-                    f"Maximum {MAX_CARD_IMAGES} images allowed (Front & Back side). "
-                    f"You selected {len(uploaded_files)} — please remove the extra file(s)."
+
+        with tab_upload:
+            uploaded_files = st.file_uploader(
+                "Upload 1 or 2 card photos (Front & Back — JPG or PNG)",
+                type=["jpg", "jpeg", "png"],
+                accept_multiple_files=True,
+                key=f"card_file_uploader_{upload_rev}",
+            )
+            if uploaded_files:
+                if len(uploaded_files) > MAX_CARD_IMAGES:
+                    st.error(
+                        f"Maximum {MAX_CARD_IMAGES} images allowed (Front & Back). "
+                        f"You selected {len(uploaded_files)} — please remove the extra file(s)."
+                    )
+                else:
+                    preview_cols = st.columns(len(uploaded_files))
+                    side_labels = ["Side 1 (Front)", "Side 2 (Back)"]
+                    for idx, file_obj in enumerate(uploaded_files):
+                        with preview_cols[idx]:
+                            st.image(
+                                file_obj.getvalue(),
+                                caption=side_labels[idx],
+                                use_container_width=True,
+                            )
+                    if st.button(
+                        f"Scan Card ({len(uploaded_files)} image{'s' if len(uploaded_files) > 1 else ''})",
+                        type="primary",
+                        use_container_width=True,
+                        key=f"btn_scan_upload_{upload_rev}",
+                        disabled=(scans_remaining == 0),
+                    ):
+                        run_scan(uploaded_files, active_api_key, current_user_id)
+
+        with tab_camera:
+            cam_front = st.camera_input(
+                "Side 1 (Front) — Capture front of the visiting card",
+                key=f"card_camera_front_{upload_rev}",
+            )
+            add_back_side = st.checkbox(
+                "Card has details on the back side (capture 2nd photo)",
+                key=f"toggle_camera_back_{upload_rev}",
+            )
+            cam_back = None
+            if add_back_side:
+                cam_back = st.camera_input(
+                    "Side 2 (Back) — Capture back of the visiting card",
+                    key=f"card_camera_back_{upload_rev}",
                 )
-            else:
-                preview_cols = st.columns(len(uploaded_files))
-                side_labels = ["Side 1 (Front)", "Side 2 (Back)"]
-                for idx, file_obj in enumerate(uploaded_files):
-                    with preview_cols[idx]:
-                        st.image(
-                            file_obj.getvalue(),
-                            caption=side_labels[idx],
-                            width=360,
-                        )
+
+            captured_photos = [p for p in (cam_front, cam_back) if p is not None]
+            if captured_photos:
                 if st.button(
-                    f"Scan Uploaded Card ({len(uploaded_files)} image{'s' if len(uploaded_files) > 1 else ''})",
+                    f"Scan Captured Photo{'s' if len(captured_photos) > 1 else ''} ({len(captured_photos)})",
                     type="primary",
-                    key=f"btn_scan_upload_{upload_rev}",
+                    use_container_width=True,
+                    key=f"btn_scan_camera_{upload_rev}",
                     disabled=(scans_remaining == 0),
                 ):
-                    run_scan(uploaded_files, active_api_key, current_user_id)
+                    run_scan(captured_photos, active_api_key, current_user_id)
 
-    with tab_camera:
-        cam_front = st.camera_input(
-            "Side 1 (Front) — Point your camera at the front of the visiting card",
-            key=f"card_camera_front_{upload_rev}",
-        )
-        add_back_side = st.checkbox(
-            "Card has details on the back side (capture 2nd photo)",
-            key=f"toggle_camera_back_{upload_rev}",
-        )
-        cam_back = None
-        if add_back_side:
-            cam_back = st.camera_input(
-                "Side 2 (Back) — Point your camera at the back of the visiting card",
-                key=f"card_camera_back_{upload_rev}",
+        with tab_excel:
+            st.caption(
+                "Upload any `.xlsx` or `.csv` file. Standard columns auto-map into our format, "
+                "empty cells save as `N/A`, and any extra columns (like `Website` or `GSTIN`) are preserved automatically."
+            )
+            uploaded_excel = st.file_uploader(
+                "Choose an Excel (.xlsx) or CSV file to merge",
+                type=["xlsx", "csv"],
+                key=f"excel_merge_uploader_{upload_rev}",
             )
 
-        captured_photos = [p for p in (cam_front, cam_back) if p is not None]
-        if captured_photos:
-            if st.button(
-                f"Scan Captured Photo{'s' if len(captured_photos) > 1 else ''} ({len(captured_photos)})",
-                type="primary",
-                key=f"btn_scan_camera_{upload_rev}",
-                disabled=(scans_remaining == 0),
-            ):
-                run_scan(captured_photos, active_api_key, current_user_id)
-
-    with tab_excel:
-        st.caption(
-            "Upload an existing `.xlsx` or `.csv` file to merge into your cards. "
-            "Columns are auto-mapped to our format, and any empty cell is saved as `N/A`."
-        )
-        uploaded_excel = st.file_uploader(
-            "Choose an Excel (.xlsx) or CSV file to merge",
-            type=["xlsx", "csv"],
-            key=f"excel_merge_uploader_{upload_rev}",
-        )
-
-        if uploaded_excel is not None:
-            try:
-                if uploaded_excel.name.lower().endswith(".csv"):
-                    raw_excel_df = pd.read_csv(uploaded_excel, dtype=str)
-                else:
-                    raw_excel_df = pd.read_excel(
-                        uploaded_excel, engine="openpyxl", dtype=str
-                    )
-                raw_excel_df = raw_excel_df.dropna(how="all")
-            except Exception as excel_err:
-                st.error(f"Could not read the file: {excel_err}")
-                raw_excel_df = None
-
-            if raw_excel_df is not None:
-                if raw_excel_df.empty:
-                    st.warning("The uploaded file has no data rows.")
-                else:
-                    excel_cols = [str(c) for c in raw_excel_df.columns.tolist()]
-                    raw_excel_df.columns = excel_cols
-                    auto_map = _auto_detect_excel_mapping(excel_cols)
-                    dropdown_options = ["— Leave as N/A —", *excel_cols]
-
-                    st.caption(
-                        f"Found **{len(raw_excel_df)}** row(s). Verify column mapping below:"
-                    )
-
-                    field_labels = [
-                        ("company_name", "Company Name"),
-                        ("contact_person", "Contact Person"),
-                        ("call_phone", "Contact No."),
-                        ("whatsapp_phone", "WhatsApp No."),
-                        ("email", "Email"),
-                        ("products_services", "Product / Services"),
-                        ("address", "Address"),
-                        ("city", "City"),
-                        ("notes", "Notes"),
-                    ]
-
-                    chosen_mapping: dict[str, str] = {}
-                    map_cols = st.columns(3)
-                    for idx, (f_key, f_label) in enumerate(field_labels):
-                        default_col = auto_map.get(f_key, "")
-                        default_idx = (
-                            dropdown_options.index(default_col)
-                            if default_col in dropdown_options
-                            else 0
+            if uploaded_excel is not None:
+                try:
+                    if uploaded_excel.name.lower().endswith(".csv"):
+                        raw_excel_df = pd.read_csv(uploaded_excel, dtype=str)
+                    else:
+                        raw_excel_df = pd.read_excel(
+                            uploaded_excel, engine="openpyxl", dtype=str
                         )
-                        with map_cols[idx % 3]:
-                            selected_col = st.selectbox(
-                                f_label,
-                                options=dropdown_options,
-                                index=default_idx,
-                                key=f"map_{f_key}_{upload_rev}_{uploaded_excel.name}",
+                    raw_excel_df = raw_excel_df.dropna(how="all")
+                except Exception as excel_err:
+                    st.error(f"Could not read the file: {excel_err}")
+                    raw_excel_df = None
+
+                if raw_excel_df is not None:
+                    if raw_excel_df.empty:
+                        st.warning("The uploaded file has no data rows.")
+                    else:
+                        excel_cols = [str(c) for c in raw_excel_df.columns.tolist()]
+                        raw_excel_df.columns = excel_cols
+                        auto_map = _auto_detect_excel_mapping(excel_cols)
+                        dropdown_options = ["— Leave as N/A —", *excel_cols]
+
+                        st.caption(
+                            f"Found **{len(raw_excel_df)}** row(s). Verify standard column mapping:"
+                        )
+
+                        field_labels = [
+                            ("company_name", "Company Name"),
+                            ("contact_person", "Contact Person"),
+                            ("call_phone", "Contact No."),
+                            ("whatsapp_phone", "WhatsApp No."),
+                            ("email", "Email"),
+                            ("products_services", "Product / Services"),
+                            ("address", "Address"),
+                            ("city", "City"),
+                            ("notes", "Notes"),
+                        ]
+
+                        chosen_mapping: dict[str, str] = {}
+                        map_cols = st.columns(3)
+                        for idx, (f_key, f_label) in enumerate(field_labels):
+                            default_col = auto_map.get(f_key, "")
+                            default_idx = (
+                                dropdown_options.index(default_col)
+                                if default_col in dropdown_options
+                                else 0
                             )
-                            chosen_mapping[f_key] = (
-                                "" if selected_col == "— Leave as N/A —" else selected_col
+                            with map_cols[idx % 3]:
+                                selected_col = st.selectbox(
+                                    f_label,
+                                    options=dropdown_options,
+                                    index=default_idx,
+                                    key=f"map_{f_key}_{upload_rev}_{uploaded_excel.name}",
+                                )
+                                chosen_mapping[f_key] = (
+                                    ""
+                                    if selected_col == "— Leave as N/A —"
+                                    else selected_col
+                                )
+
+                        mapped_source_set = {
+                            c for c in chosen_mapping.values() if c
+                        }
+                        detected_extra_cols = [
+                            c
+                            for c in excel_cols
+                            if c not in mapped_source_set
+                            and not c.lower().startswith("unnamed:")
+                        ]
+
+                        preserve_extra_cols = False
+                        if detected_extra_cols:
+                            preserve_extra_cols = st.checkbox(
+                                f"Preserve {len(detected_extra_cols)} extra column(s) automatically "
+                                f"({', '.join(detected_extra_cols)}) — exported as separate columns in Excel",
+                                value=True,
+                                key=f"preserve_extra_cols_{upload_rev}_{uploaded_excel.name}",
                             )
 
-                    skip_excel_dups = st.checkbox(
-                        "Skip rows that already exist in my account (match by phone or email)",
-                        value=True,
-                        key=f"skip_excel_dups_{upload_rev}",
-                    )
+                        active_extra_cols = (
+                            detected_extra_cols if preserve_extra_cols else []
+                        )
 
-                    # Preview top 5 rows formatted in our exact column order
-                    preview_records, _, _ = prepare_excel_merge_rows(
-                        raw_excel_df.head(5),
-                        chosen_mapping,
-                        current_user_id,
-                        skip_duplicates=False,
-                    )
-                    if preview_records:
-                        preview_df = pd.DataFrame(
-                            [
-                                {
+                        skip_excel_dups = st.checkbox(
+                            "Skip rows that already exist in my account (match by phone or email)",
+                            value=True,
+                            key=f"skip_excel_dups_{upload_rev}",
+                        )
+
+                        # Preview top 5 formatted rows including any preserved extra columns
+                        preview_records, _, _ = prepare_excel_merge_rows(
+                            raw_excel_df.head(5),
+                            chosen_mapping,
+                            active_extra_cols,
+                            current_user_id,
+                            skip_duplicates=False,
+                        )
+                        if preview_records:
+                            preview_rows_dicts = []
+                            for r in preview_records:
+                                p_row = {
                                     "Company Name": r["company_name"],
                                     "Contact Person": r["contact_person"],
                                     "Contact No.": r["call_phone"],
@@ -2754,304 +3261,340 @@ def main() -> None:
                                     "City": r["city"],
                                     "Notes": r["notes"],
                                 }
-                                for r in preview_records
-                            ]
-                        )
-                        st.caption("Preview (first 5 formatted rows):")
-                        st.dataframe(preview_df, use_container_width=True, hide_index=True)
+                                for ec in active_extra_cols:
+                                    p_row[ec] = r["extra_data"].get(ec.strip(), "N/A")
+                                preview_rows_dicts.append(p_row)
+                            st.caption("Preview (first 5 formatted rows):")
+                            st.dataframe(
+                                pd.DataFrame(preview_rows_dicts),
+                                use_container_width=True,
+                                hide_index=True,
+                            )
 
-                    if st.button(
-                        "Merge into My Cards",
-                        type="primary",
-                        key=f"btn_merge_excel_{upload_rev}",
-                    ):
-                        if not any(chosen_mapping.values()):
-                            st.error("Please map at least one column before merging.")
-                        else:
-                            with st.spinner("Merging records into your account..."):
-                                try:
-                                    ready_rows, dup_count, empty_count = (
-                                        prepare_excel_merge_rows(
-                                            raw_excel_df,
-                                            chosen_mapping,
-                                            current_user_id,
-                                            skip_duplicates=skip_excel_dups,
+                        if st.button(
+                            "Merge into My Cards",
+                            type="primary",
+                            use_container_width=True,
+                            key=f"btn_merge_excel_{upload_rev}",
+                        ):
+                            if not any(chosen_mapping.values()) and not active_extra_cols:
+                                st.error(
+                                    "Please map at least one column before merging."
+                                )
+                            else:
+                                with st.spinner("Merging records into your account..."):
+                                    try:
+                                        ready_rows, dup_count, empty_count = (
+                                            prepare_excel_merge_rows(
+                                                raw_excel_df,
+                                                chosen_mapping,
+                                                active_extra_cols,
+                                                current_user_id,
+                                                skip_duplicates=skip_excel_dups,
+                                            )
                                         )
-                                    )
-                                    if not ready_rows:
-                                        st.warning(
-                                            f"No new records to merge "
-                                            f"(skipped {dup_count} duplicate(s), {empty_count} empty row(s))."
+                                        if not ready_rows:
+                                            st.warning(
+                                                f"No new records to merge "
+                                                f"(skipped {dup_count} duplicate(s), {empty_count} empty row(s))."
+                                            )
+                                        else:
+                                            added = save_records_batch(
+                                                current_user_id, ready_rows
+                                            )
+                                            clear_uploaded_inputs()
+                                            extra_notes = []
+                                            if active_extra_cols:
+                                                extra_notes.append(
+                                                    f"preserved extra column(s): {', '.join(active_extra_cols)}"
+                                                )
+                                            if dup_count:
+                                                extra_notes.append(
+                                                    f"{dup_count} duplicate(s) skipped"
+                                                )
+                                            if empty_count:
+                                                extra_notes.append(
+                                                    f"{empty_count} empty row(s) skipped"
+                                                )
+                                            suffix_txt = (
+                                                f" ({'; '.join(extra_notes)})"
+                                                if extra_notes
+                                                else ""
+                                            )
+                                            st.session_state["flash_success"] = (
+                                                f"Merged {added} record(s) from '{uploaded_excel.name}'{suffix_txt}."
+                                            )
+                                            st.rerun()
+                                    except Exception:
+                                        st.error(
+                                            "Could not merge the Excel file right now. Please try again."
                                         )
-                                    else:
-                                        added = save_records_batch(
-                                            current_user_id, ready_rows
-                                        )
-                                        clear_uploaded_inputs()
-                                        extra = []
-                                        if dup_count:
-                                            extra.append(f"{dup_count} duplicate(s) skipped")
-                                        if empty_count:
-                                            extra.append(f"{empty_count} empty row(s) skipped")
-                                        suffix_txt = (
-                                            f" ({', '.join(extra)})" if extra else ""
-                                        )
-                                        st.session_state["flash_success"] = (
-                                            f"Merged {added} record(s) from '{uploaded_excel.name}'{suffix_txt}."
-                                        )
-                                        st.rerun()
-                                except Exception:
-                                    st.error(
-                                        "Could not merge the Excel file right now. Please try again."
-                                    )
 
-    if scans_remaining == 0:
-        st.info(
-            f"You have used all {daily_limit} AI scans for today. "
-            "Click **Fill Details Manually** or use **Merge Existing Excel** above to keep adding cards."
-        )
+        if scans_remaining == 0:
+            st.info(
+                f"You have used all {daily_limit} AI scans for today. "
+                "Use **Fill Details Manually** or **Merge Existing Excel** above to keep adding cards."
+            )
 
-    # ---- Step 2: Verification Form & Duplicate Confirmation ----
+    # ---- Step 2: Slide-Down Verification / Manual Entry Form ----
     if st.session_state["extracted_card"] is not None:
-        st.divider()
-        st.subheader("2. Verify & Save Details")
-
-        pending_dup = st.session_state["pending_duplicate_save"]
-
-        if pending_dup is not None:
-            st.warning(
-                "**Duplicate Card Detected!** A card with the same phone number or email "
-                "is already saved in your account."
-            )
-            st.caption("Existing matching card(s) in your account:")
-            st.dataframe(
-                pd.DataFrame(pending_dup["matches"]),
-                use_container_width=True,
-                hide_index=True,
+        st.markdown(
+            '<div id="card-entry-form-anchor" class="vcard-form-anchor"></div>',
+            unsafe_allow_html=True,
+        )
+        with st.container(border=True):
+            is_manual = bool(st.session_state.get("is_manual_entry", False))
+            st.subheader(
+                "2. Enter Card Details" if is_manual else "2. Verify & Save Details"
             )
 
-            st.markdown("**Do you want to upload this same card data again?**")
-            dup_col1, dup_col2, _ = st.columns([1.3, 1.3, 3.4])
-            with dup_col1:
-                if st.button(
-                    "Yes, Upload Again",
-                    type="primary",
+            pending_dup = st.session_state["pending_duplicate_save"]
+
+            if pending_dup is not None:
+                st.warning(
+                    "**Duplicate Card Detected!** A card with the same phone number or email "
+                    "is already saved in your account."
+                )
+                st.caption("Existing matching card(s) in your account:")
+                st.dataframe(
+                    pd.DataFrame(pending_dup["matches"]),
                     use_container_width=True,
-                    key="btn_dup_yes",
-                ):
-                    data = pending_dup["payload"]
-                    try:
-                        save_record(
-                            user_id=current_user_id,
-                            company_name=data["company_name"],
-                            contact_person=data["contact_person"],
-                            call_phone=data["call_phone"],
-                            whatsapp_phone=data["whatsapp_phone"],
-                            email=data["email"],
-                            products_services=data["products_services"],
-                            address=data["address"],
-                            city=data["city"],
-                            notes=data["notes"],
-                        )
+                    hide_index=True,
+                )
+
+                st.markdown("**Do you want to upload this same card data again?**")
+                dup_col1, dup_col2, _ = st.columns([1.4, 1.4, 3.2])
+                with dup_col1:
+                    if st.button(
+                        "Yes, Upload Again",
+                        type="primary",
+                        use_container_width=True,
+                        key="btn_dup_yes",
+                    ):
+                        data = pending_dup["payload"]
+                        try:
+                            save_record(
+                                user_id=current_user_id,
+                                company_name=data["company_name"],
+                                contact_person=data["contact_person"],
+                                call_phone=data["call_phone"],
+                                whatsapp_phone=data["whatsapp_phone"],
+                                email=data["email"],
+                                products_services=data["products_services"],
+                                address=data["address"],
+                                city=data["city"],
+                                notes=data["notes"],
+                                extra_data=data.get("extra_data") or {},
+                            )
+                            st.session_state["pending_duplicate_save"] = None
+                            st.session_state["extracted_card"] = None
+                            st.session_state["is_manual_entry"] = False
+                            clear_uploaded_inputs()
+                            saved_label = (
+                                data["company_name"].strip()
+                                or data["contact_person"].strip()
+                                or "Card"
+                            )
+                            st.session_state["flash_success"] = (
+                                f"Saved '{saved_label}' to your account."
+                            )
+                            st.rerun()
+                        except Exception:
+                            st.error("Could not save right now. Please try again.")
+
+                with dup_col2:
+                    if st.button(
+                        "No, Cancel",
+                        type="secondary",
+                        use_container_width=True,
+                        key="btn_dup_no",
+                    ):
                         st.session_state["pending_duplicate_save"] = None
                         st.session_state["extracted_card"] = None
                         st.session_state["is_manual_entry"] = False
                         clear_uploaded_inputs()
-                        saved_label = (
-                            data["company_name"].strip()
-                            or data["contact_person"].strip()
-                            or "Card"
-                        )
-                        st.session_state["flash_success"] = (
-                            f"Saved '{saved_label}' to your account."
+                        st.session_state["flash_info"] = (
+                            "Duplicate upload cancelled — card was not saved again."
                         )
                         st.rerun()
-                    except Exception:
-                        st.error("Could not save right now. Please try again.")
 
-            with dup_col2:
-                if st.button(
-                    "No, Cancel",
-                    type="secondary",
-                    use_container_width=True,
-                    key="btn_dup_no",
-                ):
-                    st.session_state["pending_duplicate_save"] = None
-                    st.session_state["extracted_card"] = None
-                    st.session_state["is_manual_entry"] = False
-                    clear_uploaded_inputs()
-                    st.session_state["flash_info"] = (
-                        "Duplicate upload cancelled — card was not saved again."
-                    )
-                    st.rerun()
+            else:
+                if st.session_state["scan_notice"]:
+                    st.info(st.session_state["scan_notice"])
+                    st.session_state["scan_notice"] = None
 
-        else:
-            if st.session_state["scan_notice"]:
-                st.info(st.session_state["scan_notice"])
-                st.session_state["scan_notice"] = None
+                card = st.session_state["extracted_card"]
+                suffix = st.session_state["scan_counter"]
 
-            card = st.session_state["extracted_card"]
-            suffix = st.session_state["scan_counter"]
-            is_manual = bool(st.session_state.get("is_manual_entry", False))
+                with st.form(key=f"verify_card_form_{suffix}"):
+                    r1_c1, r1_c2 = st.columns(2)
+                    with r1_c1:
+                        company_name = st.text_input(
+                            "Company Name",
+                            value="" if is_manual else card.get("company_name", "N/A"),
+                            placeholder=FIELD_PLACEHOLDERS["company_name"],
+                            key=f"company_{suffix}",
+                        )
+                    with r1_c2:
+                        contact_person = st.text_input(
+                            "Contact Person",
+                            value="" if is_manual else card.get("contact_person", "N/A"),
+                            placeholder=FIELD_PLACEHOLDERS["contact_person"],
+                            key=f"contact_{suffix}",
+                        )
 
-            # In manual entry mode: empty values, no N/A defaults, and no placeholders
-            ph_phone = "" if is_manual else "e.g., 9876543210 / 9123456789"
-            ph_city = "" if is_manual else "e.g., Ahmedabad, Mumbai, Surat..."
-            ph_notes = "" if is_manual else "e.g., Met at trade fair, wholesale supplier..."
+                    r2_c1, r2_c2 = st.columns(2)
+                    with r2_c1:
+                        call_phone = st.text_input(
+                            "Contact No.",
+                            value="" if is_manual else card.get("call_phone", "N/A"),
+                            placeholder=FIELD_PLACEHOLDERS["call_phone"],
+                            key=f"call_{suffix}",
+                        )
+                    with r2_c2:
+                        whatsapp_phone = st.text_input(
+                            "WhatsApp No.",
+                            value="" if is_manual else card.get("whatsapp_phone", "N/A"),
+                            placeholder=FIELD_PLACEHOLDERS["whatsapp_phone"],
+                            key=f"whatsapp_{suffix}",
+                        )
 
-            with st.form(key=f"verify_card_form_{suffix}"):
-                r1_c1, r1_c2 = st.columns(2)
-                with r1_c1:
-                    company_name = st.text_input(
-                        "Company Name",
-                        value="" if is_manual else card.get("company_name", "N/A"),
-                        placeholder="",
-                        key=f"company_{suffix}",
-                    )
-                with r1_c2:
-                    contact_person = st.text_input(
-                        "Contact Person",
-                        value="" if is_manual else card.get("contact_person", "N/A"),
-                        placeholder="",
-                        key=f"contact_{suffix}",
-                    )
+                    r3_c1, r3_c2 = st.columns(2)
+                    with r3_c1:
+                        email = st.text_input(
+                            "Email",
+                            value="" if is_manual else card.get("email", "N/A"),
+                            placeholder=FIELD_PLACEHOLDERS["email"],
+                            key=f"email_{suffix}",
+                        )
+                    with r3_c2:
+                        products_services = st.text_input(
+                            "Product / Services",
+                            value="" if is_manual else card.get("products_services", "N/A"),
+                            placeholder=FIELD_PLACEHOLDERS["products_services"],
+                            key=f"products_{suffix}",
+                        )
 
-                r2_c1, r2_c2 = st.columns(2)
-                with r2_c1:
-                    call_phone = st.text_input(
-                        "Contact No.",
-                        value="" if is_manual else card.get("call_phone", "N/A"),
-                        placeholder=ph_phone,
-                        key=f"call_{suffix}",
-                    )
-                with r2_c2:
-                    whatsapp_phone = st.text_input(
-                        "WhatsApp No.",
-                        value="" if is_manual else card.get("whatsapp_phone", "N/A"),
-                        placeholder=ph_phone,
-                        key=f"whatsapp_{suffix}",
-                    )
-
-                r3_c1, r3_c2 = st.columns(2)
-                with r3_c1:
-                    email = st.text_input(
-                        "Email",
-                        value="" if is_manual else card.get("email", "N/A"),
-                        placeholder="",
-                        key=f"email_{suffix}",
-                    )
-                with r3_c2:
-                    products_services = st.text_input(
-                        "Product / Services",
-                        value="" if is_manual else card.get("products_services", "N/A"),
-                        placeholder="",
-                        key=f"products_{suffix}",
+                    address = st.text_area(
+                        "Address",
+                        value="" if is_manual else card.get("address", "N/A"),
+                        placeholder=FIELD_PLACEHOLDERS["address"],
+                        height=80,
+                        key=f"address_{suffix}",
                     )
 
-                address = st.text_area(
-                    "Address",
-                    value="" if is_manual else card.get("address", "N/A"),
-                    placeholder="",
-                    height=85,
-                    key=f"address_{suffix}",
-                )
+                    r4_c1, r4_c2 = st.columns(2)
+                    with r4_c1:
+                        city = st.text_input(
+                            "City",
+                            value="" if is_manual else card.get("city", "N/A"),
+                            placeholder=FIELD_PLACEHOLDERS["city"],
+                            key=f"city_{suffix}",
+                        )
+                    with r4_c2:
+                        notes = st.text_input(
+                            "Notes (Optional)",
+                            value="" if is_manual else card.get("notes", ""),
+                            placeholder=FIELD_PLACEHOLDERS["notes"],
+                            key=f"notes_{suffix}",
+                        )
 
-                r4_c1, r4_c2 = st.columns(2)
-                with r4_c1:
-                    city = st.text_input(
-                        "City",
-                        value="" if is_manual else card.get("city", "N/A"),
-                        placeholder=ph_city,
-                        key=f"city_{suffix}",
+                    extra_details_text = st.text_area(
+                        "Extra Details (Optional — Website, GSTIN, etc., one per line as Label: Value)",
+                        value="" if is_manual else card.get("extra_details_text", ""),
+                        placeholder=FIELD_PLACEHOLDERS["extra_details"],
+                        height=75,
+                        key=f"extra_details_{suffix}",
                     )
-                with r4_c2:
-                    notes = st.text_input(
-                        "Notes (Optional)",
-                        value="" if is_manual else card.get("notes", ""),
-                        placeholder=ph_notes,
-                        key=f"notes_{suffix}",
-                    )
 
-                btn_col1, btn_col2, _ = st.columns([1.2, 1, 4])
-                with btn_col1:
-                    submitted = st.form_submit_button("Save Card", type="primary")
-                with btn_col2:
-                    discarded = st.form_submit_button("Discard")
+                    btn_col1, btn_col2, _ = st.columns([1.4, 1.2, 3.4])
+                    with btn_col1:
+                        submitted = st.form_submit_button(
+                            "Save Card", type="primary", use_container_width=True
+                        )
+                    with btn_col2:
+                        discarded = st.form_submit_button(
+                            "Discard", use_container_width=True
+                        )
 
-                if submitted:
-                    if not has_at_least_one_field(
-                        company_name,
-                        contact_person,
-                        call_phone,
-                        whatsapp_phone,
-                        email,
-                        products_services,
-                        address,
-                        city,
-                        notes,
-                    ):
-                        st.error("Please fill at least one field before saving.")
-                    else:
-                        try:
-                            matches = find_duplicate_records(
-                                user_id=current_user_id,
-                                call_phone=call_phone,
-                                whatsapp_phone=whatsapp_phone,
-                                email=email,
-                            )
-                            if matches:
-                                st.session_state["pending_duplicate_save"] = {
-                                    "payload": {
-                                        "company_name": company_name,
-                                        "contact_person": contact_person,
-                                        "call_phone": call_phone,
-                                        "whatsapp_phone": whatsapp_phone,
-                                        "email": email,
-                                        "products_services": products_services,
-                                        "address": address,
-                                        "city": city,
-                                        "notes": notes,
-                                    },
-                                    "matches": matches,
-                                }
-                                st.rerun()
-                            else:
-                                save_record(
+                    if submitted:
+                        parsed_extra = parse_extra_data_from_input(extra_details_text)
+                        if not has_at_least_one_field(
+                            company_name,
+                            contact_person,
+                            call_phone,
+                            whatsapp_phone,
+                            email,
+                            products_services,
+                            address,
+                            city,
+                            notes,
+                            *parsed_extra.values(),
+                        ):
+                            st.error("Please fill at least one field before saving.")
+                        else:
+                            try:
+                                matches = find_duplicate_records(
                                     user_id=current_user_id,
-                                    company_name=company_name,
-                                    contact_person=contact_person,
                                     call_phone=call_phone,
                                     whatsapp_phone=whatsapp_phone,
                                     email=email,
-                                    products_services=products_services,
-                                    address=address,
-                                    city=city,
-                                    notes=notes,
                                 )
-                                st.session_state["extracted_card"] = None
-                                st.session_state["is_manual_entry"] = False
-                                clear_uploaded_inputs()
-                                saved_label = (
-                                    company_name.strip()
-                                    or contact_person.strip()
-                                    or "Card"
-                                )
-                                st.session_state["flash_success"] = (
-                                    f"Saved '{saved_label}' to your account."
-                                )
-                                st.rerun()
-                        except Exception:
-                            st.error("Could not save right now. Please try again.")
+                                if matches:
+                                    st.session_state["pending_duplicate_save"] = {
+                                        "payload": {
+                                            "company_name": company_name,
+                                            "contact_person": contact_person,
+                                            "call_phone": call_phone,
+                                            "whatsapp_phone": whatsapp_phone,
+                                            "email": email,
+                                            "products_services": products_services,
+                                            "address": address,
+                                            "city": city,
+                                            "notes": notes,
+                                            "extra_data": parsed_extra,
+                                        },
+                                        "matches": matches,
+                                    }
+                                    st.rerun()
+                                else:
+                                    save_record(
+                                        user_id=current_user_id,
+                                        company_name=company_name,
+                                        contact_person=contact_person,
+                                        call_phone=call_phone,
+                                        whatsapp_phone=whatsapp_phone,
+                                        email=email,
+                                        products_services=products_services,
+                                        address=address,
+                                        city=city,
+                                        notes=notes,
+                                        extra_data=parsed_extra,
+                                    )
+                                    st.session_state["extracted_card"] = None
+                                    st.session_state["is_manual_entry"] = False
+                                    clear_uploaded_inputs()
+                                    saved_label = (
+                                        company_name.strip()
+                                        or contact_person.strip()
+                                        or "Card"
+                                    )
+                                    st.session_state["flash_success"] = (
+                                        f"Saved '{saved_label}' to your account."
+                                    )
+                                    st.rerun()
+                            except Exception:
+                                st.error("Could not save right now. Please try again.")
 
-                if discarded:
-                    st.session_state["extracted_card"] = None
-                    st.session_state["is_manual_entry"] = False
-                    st.session_state["pending_duplicate_save"] = None
-                    clear_uploaded_inputs()
-                    st.rerun()
+                    if discarded:
+                        st.session_state["extracted_card"] = None
+                        st.session_state["is_manual_entry"] = False
+                        st.session_state["pending_duplicate_save"] = None
+                        clear_uploaded_inputs()
+                        st.rerun()
 
     # ---- Step 3 (Still on Home Page): Show Records, Update & Delete ----
-    st.divider()
+    st.markdown("<div style='height: 0.4rem'></div>", unsafe_allow_html=True)
     render_show_records_section(
         all_records_df=all_records_df,
         current_username=current_username,
