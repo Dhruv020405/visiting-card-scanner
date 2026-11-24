@@ -397,7 +397,7 @@ def main() -> None:
         get_spreadsheet()
         storage_ready = True
     except Exception as exc:
-        storage_error = str(exc)
+        storage_error = f"{type(exc).__name__}: {exc}"
 
     # ---- Sidebar: Settings & Connection Status ----
     with st.sidebar:
