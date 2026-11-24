@@ -1,6 +1,9 @@
+import hashlib
+import hmac
 import io
 import os
 import re
+import secrets
 import time
 import uuid
 from datetime import datetime
@@ -22,6 +25,7 @@ FALLBACK_MODELS = ["gemini-3.6-flash", "gemini-3.8-flash"]
 
 CARDS_WORKSHEET = "visiting_cards"
 USERS_WORKSHEET = "users"
+PBKDF2_ITERATIONS = 260_000
 
 CARD_HEADERS = [
     "record_id",
@@ -36,7 +40,6 @@ CARD_HEADERS = [
     "created_at",
 ]
 
-# Pre-created worksheet schema for future Login & Register support
 USER_HEADERS = [
     "user_id",
     "username",
@@ -54,7 +57,7 @@ st.set_page_config(
 
 
 # ---------------------------------------------------------------------------
-# Secret & Session Helpers (Multi-User Ready)
+# Secret & Password Hashing Helpers
 # ---------------------------------------------------------------------------
 def get_secret(key: str, default: Any = None) -> Any:
     """Safely read a key from st.secrets or environment variables."""
@@ -66,14 +69,38 @@ def get_secret(key: str, default: Any = None) -> Any:
     return os.getenv(key, default)
 
 
-def get_current_user_id() -> str:
-    """
-    Return the active user's ID.
-    Currently defaults to 'default_user'. When Login/Register is added later,
-    authentication simply sets st.session_state['user_id'] and every query
-    automatically isolates that user's visiting cards.
-    """
-    return st.session_state.get("user_id", "default_user")
+def hash_password(password: str) -> str:
+    """Hash a password using salted PBKDF2-HMAC-SHA256."""
+    salt = secrets.token_hex(16)
+    dk = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt.encode("utf-8"), PBKDF2_ITERATIONS
+    )
+    return f"pbkdf2_sha256${PBKDF2_ITERATIONS}${salt}${dk.hex()}"
+
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    """Verify a plaintext password against a stored PBKDF2 hash."""
+    try:
+        algo, iter_str, salt, expected_hex = stored_hash.split("$")
+        if algo != "pbkdf2_sha256":
+            return False
+        dk = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            salt.encode("utf-8"),
+            int(iter_str),
+        )
+        return hmac.compare_digest(dk.hex(), expected_hex)
+    except Exception:
+        return False
+
+
+def is_valid_email(email: str) -> bool:
+    return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email))
+
+
+def is_valid_username(username: str) -> bool:
+    return bool(re.match(r"^[A-Za-z0-9_.-]{3,30}$", username))
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +132,7 @@ class VisitingCard(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Google Sheets Storage Layer (Drop-In Multi-User Backend)
+# Google Sheets Storage Layer
 # ---------------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def get_spreadsheet() -> gspread.Spreadsheet:
@@ -145,22 +172,125 @@ def ensure_worksheets(spreadsheet: gspread.Spreadsheet) -> None:
             title=USERS_WORKSHEET, rows=500, cols=len(USER_HEADERS)
         )
         users_ws.append_row(USER_HEADERS, value_input_option="RAW")
+    else:
+        users_ws = spreadsheet.worksheet(USERS_WORKSHEET)
+        if not users_ws.row_values(1):
+            users_ws.append_row(USER_HEADERS, value_input_option="RAW")
 
 
 def get_cards_worksheet() -> gspread.Worksheet:
-    """Return the visiting_cards worksheet handle."""
     return get_spreadsheet().worksheet(CARDS_WORKSHEET)
 
 
+def get_users_worksheet() -> gspread.Worksheet:
+    return get_spreadsheet().worksheet(USERS_WORKSHEET)
+
+
+# ---------------------------------------------------------------------------
+# User Authentication Functions (Backed by `users` Tab)
+# ---------------------------------------------------------------------------
+def fetch_all_users() -> list[dict[str, str]]:
+    """Fetch all user records directly from Google Sheets (fresh, uncached)."""
+    ws = get_users_worksheet()
+    all_rows = ws.get_all_values()
+    if len(all_rows) <= 1:
+        return []
+
+    headers = all_rows[0]
+    users = []
+    for row in all_rows[1:]:
+        if not any(cell.strip() for cell in row):
+            continue
+        padded = row + [""] * (len(headers) - len(row))
+        users.append(dict(zip(headers, padded)))
+    return users
+
+
+def register_user(
+    username: str, email: str, password: str
+) -> Tuple[bool, str, Optional[dict[str, str]]]:
+    """Create a new user in the `users` worksheet if username/email are unique."""
+    clean_username = username.strip()
+    clean_email = email.strip().lower()
+
+    if not is_valid_username(clean_username):
+        return (
+            False,
+            "Username must be 3–30 characters using only letters, numbers, `_`, `.`, or `-`.",
+            None,
+        )
+    if not is_valid_email(clean_email):
+        return False, "Please enter a valid email address.", None
+    if len(password) < 6:
+        return False, "Password must be at least 6 characters long.", None
+
+    existing_users = fetch_all_users()
+    for user in existing_users:
+        if user.get("username", "").strip().lower() == clean_username.lower():
+            return False, "That username is already taken. Try another one.", None
+        if user.get("email", "").strip().lower() == clean_email:
+            return False, "An account with this email already exists. Please log in.", None
+
+    user_id = f"usr_{uuid.uuid4().hex[:10]}"
+    created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    pw_hash = hash_password(password)
+
+    ws = get_users_worksheet()
+    ws.append_row(
+        [user_id, clean_username, clean_email, pw_hash, "user", created_at],
+        value_input_option="RAW",
+        table_range="A1",
+    )
+
+    new_user = {
+        "user_id": user_id,
+        "username": clean_username,
+        "email": clean_email,
+        "role": "user",
+    }
+    return True, "Account created! Welcome.", new_user
+
+
+def authenticate_user(
+    identifier: str, password: str
+) -> Tuple[bool, str, Optional[dict[str, str]]]:
+    """Verify login by username or email against the `users` worksheet."""
+    clean_id = identifier.strip().lower()
+    if not clean_id or not password:
+        return False, "Please enter both username/email and password.", None
+
+    for user in fetch_all_users():
+        uname = user.get("username", "").strip().lower()
+        uemail = user.get("email", "").strip().lower()
+        if clean_id in (uname, uemail):
+            if verify_password(password, user.get("password_hash", "")):
+                return (
+                    True,
+                    "Logged in successfully.",
+                    {
+                        "user_id": user.get("user_id", ""),
+                        "username": user.get("username", ""),
+                        "email": user.get("email", ""),
+                        "role": user.get("role", "user"),
+                    },
+                )
+            return False, "Incorrect password. Please try again.", None
+
+    return False, "No account found with that username or email.", None
+
+
+# ---------------------------------------------------------------------------
+# Visiting Card CRUD (Strictly Scoped to Logged-In User)
+# ---------------------------------------------------------------------------
 @st.cache_data(ttl=60, show_spinner=False)
 def _fetch_all_card_rows() -> list[list[str]]:
-    """Fetch all raw rows from Google Sheets (cached for 60s to avoid quota limits)."""
+    """Fetch all raw rows from `visiting_cards` (cached 60s to respect API quota)."""
     ws = get_cards_worksheet()
     return ws.get_all_values()
 
 
 def fetch_user_records(user_id: str) -> pd.DataFrame:
-    """Return all saved visiting cards belonging to `user_id`, newest first."""
+    """Return ONLY the visiting cards uploaded by `user_id`, newest first."""
     all_rows = _fetch_all_card_rows()
     display_cols = [
         "Record ID",
@@ -180,7 +310,6 @@ def fetch_user_records(user_id: str) -> pd.DataFrame:
     headers = all_rows[0]
     data_rows = []
     for row in all_rows[1:]:
-        # Pad short rows safely in case trailing cells are blank
         padded = row + [""] * (len(headers) - len(row))
         record = dict(zip(headers, padded))
         if record.get("user_id") == user_id:
@@ -201,7 +330,6 @@ def fetch_user_records(user_id: str) -> pd.DataFrame:
     if not data_rows:
         return pd.DataFrame(columns=display_cols)
 
-    # Reverse so the most recently added cards appear at the top
     return pd.DataFrame(data_rows[::-1], columns=display_cols)
 
 
@@ -215,7 +343,7 @@ def save_record(
     products_services: str,
     notes: str,
 ) -> str:
-    """Append a verified visiting card row to Google Sheets and clear cache."""
+    """Append a verified visiting card row tagged with the logged-in user's ID."""
     ws = get_cards_worksheet()
     record_id = uuid.uuid4().hex[:8]
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -233,14 +361,13 @@ def save_record(
         timestamp,
     ]
 
-    # RAW prevents Google Sheets from treating '+91...' phone numbers as formulas
     ws.append_row(row, value_input_option="RAW", table_range="A1")
     _fetch_all_card_rows.clear()
     return record_id
 
 
 def delete_record(record_id: str, user_id: str) -> bool:
-    """Delete a record only if both record_id and user_id match."""
+    """Delete a card ONLY if both record_id and user_id belong to the logged-in user."""
     ws = get_cards_worksheet()
     all_rows = ws.get_all_values()
 
@@ -285,7 +412,7 @@ def extract_card_details(
     """Send the visiting card image to Gemini with automatic retry and model fallback."""
     if not api_key or not api_key.strip():
         raise ValueError(
-            "Gemini API key is missing. Please add it in the sidebar Settings."
+            "Gemini API key is missing. Add it in Streamlit Secrets or the sidebar Settings."
         )
 
     client = genai.Client(api_key=api_key.strip())
@@ -351,7 +478,7 @@ def extract_card_details(
 def run_scan(image_file, api_key: str) -> None:
     """Process an UploadedFile from either file_uploader or camera_input."""
     if not api_key:
-        st.error("Please enter your Gemini API key in the sidebar before scanning.")
+        st.error("Gemini API key is not configured. Please add it in the sidebar Settings.")
         return
 
     image_bytes = image_file.getvalue()
@@ -376,11 +503,96 @@ def run_scan(image_file, api_key: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Authentication UI (Login & Register)
+# ---------------------------------------------------------------------------
+def render_auth_screen() -> None:
+    """Render Login and Register tabs when no user is signed in."""
+    _, center_col, _ = st.columns([1, 1.8, 1])
+
+    with center_col:
+        st.title("Company Visiting Card Scanner")
+        st.caption(
+            "Sign in or create an account to scan, save, and manage your own visiting cards."
+        )
+
+        tab_login, tab_register = st.tabs(["Login", "Register"])
+
+        with tab_login:
+            with st.form("login_form"):
+                identifier = st.text_input(
+                    "Username or Email",
+                    placeholder="e.g., uncle_business or name@example.com",
+                )
+                password = st.text_input("Password", type="password")
+                login_submitted = st.form_submit_button(
+                    "Login", type="primary", use_container_width=True
+                )
+
+            if login_submitted:
+                with st.spinner("Signing in..."):
+                    try:
+                        ok, msg, user = authenticate_user(identifier, password)
+                        if ok and user:
+                            st.session_state["auth_user"] = user
+                            st.session_state["extracted_card"] = None
+                            st.session_state["scan_notice"] = None
+                            st.session_state["flash_success"] = (
+                                f"Welcome back, {user['username']}!"
+                            )
+                            st.rerun()
+                        else:
+                            st.error(msg)
+                    except Exception as exc:
+                        st.error(f"Login failed: {exc}")
+
+        with tab_register:
+            with st.form("register_form"):
+                reg_username = st.text_input(
+                    "Username",
+                    placeholder="3–30 characters (letters, numbers, _ . -)",
+                )
+                reg_email = st.text_input(
+                    "Email", placeholder="name@example.com"
+                )
+                reg_password = st.text_input(
+                    "Password",
+                    type="password",
+                    placeholder="Minimum 6 characters",
+                )
+                reg_confirm = st.text_input("Confirm Password", type="password")
+                reg_submitted = st.form_submit_button(
+                    "Create Account", type="primary", use_container_width=True
+                )
+
+            if reg_submitted:
+                if reg_password != reg_confirm:
+                    st.error("Passwords do not match.")
+                else:
+                    with st.spinner("Creating account..."):
+                        try:
+                            ok, msg, user = register_user(
+                                reg_username, reg_email, reg_password
+                            )
+                            if ok and user:
+                                st.session_state["auth_user"] = user
+                                st.session_state["extracted_card"] = None
+                                st.session_state["scan_notice"] = None
+                                st.session_state["flash_success"] = (
+                                    f"Account created! Welcome, {user['username']}."
+                                )
+                                st.rerun()
+                            else:
+                                st.error(msg)
+                        except Exception as exc:
+                            st.error(f"Registration failed: {exc}")
+
+
+# ---------------------------------------------------------------------------
 # Main Application
 # ---------------------------------------------------------------------------
 def main() -> None:
-    current_user_id = get_current_user_id()
-
+    if "auth_user" not in st.session_state:
+        st.session_state["auth_user"] = None
     if "extracted_card" not in st.session_state:
         st.session_state["extracted_card"] = None
     if "scan_counter" not in st.session_state:
@@ -397,50 +609,78 @@ def main() -> None:
         get_spreadsheet()
         storage_ready = True
     except Exception as exc:
-        storage_error = f"{type(exc).__name__}: {exc}"
+        cause = f" | Cause: {exc.__cause__}" if exc.__cause__ else ""
+        storage_error = f"{type(exc).__name__}: {exc}{cause}"
 
-    # ---- Sidebar: Settings & Connection Status ----
-    with st.sidebar:
-        st.header("Settings")
-
-        default_api_key = str(get_secret("GEMINI_API_KEY", "") or "")
-        user_api_key = st.text_input(
-            "Gemini API Key",
-            value=default_api_key,
-            type="password",
-            placeholder="AIza... or AQ...",
-            help="Automatically loads GEMINI_API_KEY from Streamlit Secrets if set.",
+    if not storage_ready:
+        st.title("Company Visiting Card Scanner")
+        st.error(f"Storage setup required: {storage_error}")
+        st.info(
+            "Check `GSHEET_URL` and `[gcp_service_account]` in Streamlit Secrets, "
+            "and confirm the Google Sheets API is enabled and shared with your service account."
         )
-        active_api_key = (user_api_key or default_api_key).strip()
+        return
 
-        if active_api_key:
-            st.success("Gemini API key configured")
-        else:
-            st.warning("Enter your Gemini API key to start scanning.")
+    # Gate the app behind Login / Register
+    auth_user = st.session_state["auth_user"]
+    if auth_user is None:
+        render_auth_screen()
+        return
 
-        if storage_ready:
-            st.success("Google Sheets connected")
-        else:
-            st.error("Google Sheets not connected")
+    current_user_id = auth_user["user_id"]
+    current_username = auth_user["username"]
+    current_email = auth_user["email"]
+
+    # ---- Sidebar: Account, Logout & Settings ----
+    with st.sidebar:
+        st.header("Account")
+        st.markdown(f"**{current_username}**")
+        st.caption(current_email)
+
+        if st.button("Logout", use_container_width=True):
+            st.session_state["auth_user"] = None
+            st.session_state["extracted_card"] = None
+            st.session_state["scan_notice"] = None
+            st.session_state["flash_success"] = None
+            st.rerun()
 
         st.divider()
-        st.caption(f"Active account: `{current_user_id}`")
+        st.header("Settings")
+
+        server_api_key = str(get_secret("GEMINI_API_KEY", "") or "").strip()
+        if server_api_key:
+            # Keep server secret hidden from users on shared/multi-user deployments
+            st.success("Gemini API key configured")
+            override_key = st.text_input(
+                "Use your own Gemini API Key (optional)",
+                value="",
+                type="password",
+                placeholder="Leave blank to use default key",
+            )
+            active_api_key = override_key.strip() or server_api_key
+        else:
+            user_api_key = st.text_input(
+                "Gemini API Key",
+                value="",
+                type="password",
+                placeholder="AIza... or AQ...",
+            )
+            active_api_key = user_api_key.strip()
+            if active_api_key:
+                st.success("Gemini API key configured")
+            else:
+                st.warning("Enter a Gemini API key to scan cards.")
+
+        st.success("Google Sheets connected")
+        st.divider()
         st.caption(f"Primary model: `{MODEL_NAME}`")
         st.caption(f"Fallbacks: `{', '.join(FALLBACK_MODELS)}`")
 
     # ---- Page Header ----
     st.title("Company Visiting Card Scanner")
     st.caption(
-        "Scan visiting cards with AI, verify the details, save permanently to Google Sheets, and export to Excel."
+        f"Signed in as **{current_username}** — you only see and manage cards saved to your account."
     )
-
-    if not storage_ready:
-        st.error(f"Storage setup required: {storage_error}")
-        st.info(
-            "Add `GSHEET_URL` and `[gcp_service_account]` in Streamlit Cloud → Settings → Secrets, "
-            "and share your Google Sheet with the service account's `client_email` as Editor."
-        )
-        return
 
     if st.session_state["flash_success"]:
         st.success(st.session_state["flash_success"])
@@ -541,7 +781,7 @@ def main() -> None:
 
             btn_col1, btn_col2, _ = st.columns([1.2, 1, 4])
             with btn_col1:
-                submitted = st.form_submit_button("Save to Google Sheets", type="primary")
+                submitted = st.form_submit_button("Save Card", type="primary")
             with btn_col2:
                 discarded = st.form_submit_button("Discard")
 
@@ -559,7 +799,7 @@ def main() -> None:
                     )
                     st.session_state["extracted_card"] = None
                     st.session_state["flash_success"] = (
-                        f"Saved '{company_name}' permanently to Google Sheets."
+                        f"Saved '{company_name}' to your account."
                     )
                     st.rerun()
                 except Exception as sheet_err:
@@ -569,11 +809,11 @@ def main() -> None:
                 st.session_state["extracted_card"] = None
                 st.rerun()
 
-    # ---- Step 3: Saved Records, Search & Excel Export ----
+    # ---- Step 3: User's Saved Records, Search & Excel Export ----
     st.divider()
     header_col, refresh_col = st.columns([5, 1])
     with header_col:
-        st.subheader("3. Saved Visiting Cards")
+        st.subheader("3. Your Saved Visiting Cards")
     with refresh_col:
         if st.button("Refresh", use_container_width=True):
             _fetch_all_card_rows.clear()
@@ -582,7 +822,7 @@ def main() -> None:
     try:
         all_records_df = fetch_user_records(current_user_id)
     except Exception as sheet_err:
-        st.error(f"Failed to load records from Google Sheets: {sheet_err}")
+        st.error(f"Failed to load your records from Google Sheets: {sheet_err}")
         return
 
     search_col, export_col = st.columns([3, 1])
@@ -590,14 +830,16 @@ def main() -> None:
     with search_col:
         search_query = st.text_input(
             "Search records",
-            placeholder="Filter by company name, products/services, or address...",
+            placeholder="Filter your cards by company name, products/services, or address...",
             label_visibility="collapsed",
         )
 
     with export_col:
         if not all_records_df.empty:
             excel_bytes = build_excel_bytes(all_records_df)
-            filename = f"company_visiting_cards_{datetime.now().strftime('%Y%m%d')}.xlsx"
+            filename = (
+                f"visiting_cards_{current_username}_{datetime.now().strftime('%Y%m%d')}.xlsx"
+            )
             st.download_button(
                 label="Download Excel (.xlsx)",
                 data=excel_bytes,
@@ -613,10 +855,9 @@ def main() -> None:
             )
 
     if all_records_df.empty:
-        st.info("No visiting cards saved yet. Scan your first card above!")
+        st.info("You haven't saved any visiting cards yet. Scan your first card above!")
         return
 
-    # Filter records by company name, products/services, or address
     if search_query.strip():
         q = search_query.strip()
         mask = (
@@ -632,8 +873,8 @@ def main() -> None:
 
     st.dataframe(filtered_df, use_container_width=True, hide_index=True)
 
-    # Compact utility to remove accidental entries (scoped to active user)
-    with st.expander("Delete a record"):
+    # Delete strictly scoped to the logged-in user's records
+    with st.expander("Delete one of your records"):
         record_options = {
             f"{row['Record ID']} — {row['Company Name']} ({row['Contact Person']})": row[
                 "Record ID"
@@ -647,10 +888,10 @@ def main() -> None:
             try:
                 deleted = delete_record(record_options[selected_label], current_user_id)
                 if deleted:
-                    st.session_state["flash_success"] = "Record deleted from Google Sheets."
+                    st.session_state["flash_success"] = "Record deleted."
                     st.rerun()
                 else:
-                    st.warning("Record not found or already deleted.")
+                    st.warning("Record not found or does not belong to your account.")
             except Exception as sheet_err:
                 st.error(f"Could not delete record: {sheet_err}")
 
