@@ -5,6 +5,7 @@ import os
 import re
 import secrets
 import time
+import unicodedata
 import uuid
 from datetime import datetime
 from typing import Any, Optional, Tuple
@@ -26,18 +27,34 @@ FALLBACK_MODELS = ["gemini-3.6-flash", "gemini-3.8-flash"]
 CARDS_WORKSHEET = "visiting_cards"
 USERS_WORKSHEET = "users"
 PBKDF2_ITERATIONS = 260_000
+MAX_CARD_IMAGES = 2
 
+# Email is placed second-to-last, immediately before Address
 CARD_HEADERS = [
     "record_id",
     "user_id",
     "company_name",
     "contact_person",
-    "phone",
-    "email",
-    "address",
+    "whatsapp_phone",
+    "call_phone",
     "products_services",
     "notes",
     "created_at",
+    "email",
+    "address",
+]
+
+DISPLAY_COLUMNS = [
+    "Record ID",
+    "Company Name",
+    "Contact Person",
+    "WhatsApp Number",
+    "Call Number",
+    "Products / Services",
+    "Notes",
+    "Saved On",
+    "Email",
+    "Address",
 ]
 
 USER_HEADERS = [
@@ -57,7 +74,7 @@ st.set_page_config(
 
 
 # ---------------------------------------------------------------------------
-# Secret & Password Hashing Helpers
+# Secret, Hashing & Normalization Helpers
 # ---------------------------------------------------------------------------
 def get_secret(key: str, default: Any = None) -> Any:
     """Safely read a key from st.secrets or environment variables."""
@@ -103,36 +120,106 @@ def is_valid_username(username: str) -> bool:
     return bool(re.match(r"^[A-Za-z0-9_.-]{3,30}$", username))
 
 
+def normalize_digits(text: str) -> str:
+    """Convert any regional Unicode digits (e.g., Gujarati ૦-૯, Hindi ०-९) to ASCII 0-9."""
+    return "".join(
+        str(unicodedata.digit(ch)) if ch.isdecimal() and not ch.isascii() else ch
+        for ch in text
+    )
+
+
+def extract_normalized_phones(phone_str: str) -> set[str]:
+    """Extract comparable phone tokens (last 10 digits for mobile/STD numbers)."""
+    if not phone_str or phone_str.strip().upper() == "N/A":
+        return set()
+    cleaned = normalize_digits(phone_str)
+    parts = re.split(r"[,;/|\n]+", cleaned)
+    phones: set[str] = set()
+    for part in parts:
+        digits = re.sub(r"\D", "", part)
+        if len(digits) >= 7:
+            phones.add(digits[-10:] if len(digits) >= 10 else digits)
+    return phones
+
+
+def extract_normalized_emails(email_str: str) -> set[str]:
+    """Extract lowercase valid email addresses for duplicate matching."""
+    if not email_str or email_str.strip().upper() == "N/A":
+        return set()
+    parts = re.split(r"[,;/|\s]+", email_str.strip().lower())
+    return {p for p in parts if is_valid_email(p)}
+
+
 # ---------------------------------------------------------------------------
-# Pydantic Schema for Gemini Structured Outputs
+# Pydantic Schema for Gemini Structured Outputs (English + Dual Phone Fields)
 # ---------------------------------------------------------------------------
 class VisitingCard(BaseModel):
     company_name: str = Field(
-        description="Name of the company or business. Return 'N/A' if missing."
+        description=(
+            "Name of the company or business in English (Latin script). "
+            "Transliterate non-English business names cleanly into readable English. Return 'N/A' if missing."
+        )
     )
     contact_person: str = Field(
-        description="Full name of the contact person (include designation if printed). Return 'N/A' if missing."
+        description=(
+            "Full name of the contact person in English (Latin script), including designation if printed. "
+            "Transliterate non-English names into readable English. Return 'N/A' if missing."
+        )
     )
-    phone: str = Field(
-        description="All phone or mobile numbers found, comma-separated. Return 'N/A' if missing."
+    whatsapp_phone: str = Field(
+        description=(
+            "WhatsApp phone number(s) using ONLY standard ASCII digits (0-9), comma-separated. "
+            "Rules: (1) If WhatsApp icon/logo or text ('WP', 'WA', 'WhatsApp') marks specific number(s), put those here. "
+            "(2) If only 1 number is on the card without a call-only/landline distinction, put it here by default. "
+            "(3) If 2 or more numbers are on the card with NO icon or text distinguishing WhatsApp from Call, "
+            "put ALL of them here. Return 'N/A' only if no number applies."
+        )
     )
-    email: str = Field(
-        description="Email address. Return 'N/A' if missing."
-    )
-    address: str = Field(
-        description="Complete physical shop, office, or factory address. Return 'N/A' if missing."
+    call_phone: str = Field(
+        description=(
+            "Normal call / office / landline phone number(s) using ONLY standard ASCII digits (0-9), comma-separated. "
+            "ONLY populate this when the card explicitly distinguishes a call/phone/landline number using a phone/call "
+            "icon or text label ('Call', 'Ph', 'Tel', 'Office', 'Landline', 'Contact') separately from WhatsApp. "
+            "If there is only 1 unspecified number, or 2+ unspecified numbers, return 'N/A' here."
+        )
     )
     products_services: str = Field(
         description=(
-            "Products or services offered by the company. If not explicitly listed on the card, "
-            "infer what the business deals in based on the company name, job title, or tagline. "
-            "Return 'N/A' only if it is completely impossible to determine."
+            "Products or services offered by the company in English (Latin script). "
+            "Translate regional terms into natural English (keep well-known Indian item names in standard English "
+            "spelling like Bhajiya, Jalebi, Boondi Laddu, Mohanthal). If not explicitly listed, infer from the "
+            "company name, title, or tagline. Return 'N/A' only if completely impossible to determine."
+        )
+    )
+    email: str = Field(
+        description="Email address in English (Latin script). Return 'N/A' if missing."
+    )
+    address: str = Field(
+        description=(
+            "Complete physical shop, office, or factory address translated and transliterated into clear English "
+            "with standard 0-9 digits (translate directional words like 'near' or 'next to'; transliterate street "
+            "and city names). Return 'N/A' if missing."
         )
     )
 
 
+def _clean_card_output(card: VisitingCard) -> VisitingCard:
+    """Guarantee standard ASCII 0-9 digits across all extracted fields."""
+    return card.model_copy(
+        update={
+            "company_name": normalize_digits(card.company_name).strip() or "N/A",
+            "contact_person": normalize_digits(card.contact_person).strip() or "N/A",
+            "whatsapp_phone": normalize_digits(card.whatsapp_phone).strip() or "N/A",
+            "call_phone": normalize_digits(card.call_phone).strip() or "N/A",
+            "products_services": normalize_digits(card.products_services).strip() or "N/A",
+            "email": normalize_digits(card.email).strip() or "N/A",
+            "address": normalize_digits(card.address).strip() or "N/A",
+        }
+    )
+
+
 # ---------------------------------------------------------------------------
-# Google Sheets Storage Layer
+# Google Sheets Storage Layer (Auto-Migrates Columns Safely)
 # ---------------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def get_spreadsheet() -> gspread.Spreadsheet:
@@ -153,8 +240,55 @@ def get_spreadsheet() -> gspread.Spreadsheet:
     return spreadsheet
 
 
+def _migrate_cards_worksheet_if_needed(cards_ws: gspread.Worksheet) -> None:
+    """Align existing `visiting_cards` sheet rows to the latest CARD_HEADERS order."""
+    all_rows = cards_ws.get_all_values()
+    if not all_rows:
+        cards_ws.append_row(CARD_HEADERS, value_input_option="RAW")
+        return
+
+    current_headers = all_rows[0]
+    if current_headers == CARD_HEADERS:
+        return
+
+    if cards_ws.col_count < len(CARD_HEADERS):
+        cards_ws.resize(cols=len(CARD_HEADERS))
+
+    migrated_rows = [CARD_HEADERS]
+    for row in all_rows[1:]:
+        if not any(cell.strip() for cell in row):
+            continue
+        padded = row + [""] * (len(current_headers) - len(row))
+        old_rec = dict(zip(current_headers, padded))
+
+        # Preserve old single `phone` column into `whatsapp_phone` by default
+        wp_val = old_rec.get("whatsapp_phone") or old_rec.get("phone") or "N/A"
+        call_val = old_rec.get("call_phone") or "N/A"
+
+        new_rec = {
+            "record_id": old_rec.get("record_id", uuid.uuid4().hex[:8]),
+            "user_id": old_rec.get("user_id", "default_user"),
+            "company_name": old_rec.get("company_name", "N/A"),
+            "contact_person": old_rec.get("contact_person", "N/A"),
+            "whatsapp_phone": wp_val,
+            "call_phone": call_val,
+            "products_services": old_rec.get("products_services", "N/A"),
+            "notes": old_rec.get("notes", ""),
+            "created_at": old_rec.get("created_at", ""),
+            "email": old_rec.get("email", "N/A"),
+            "address": old_rec.get("address", "N/A"),
+        }
+        migrated_rows.append([new_rec[col] for col in CARD_HEADERS])
+
+    cards_ws.update(
+        values=migrated_rows,
+        range_name="A1",
+        value_input_option="RAW",
+    )
+
+
 def ensure_worksheets(spreadsheet: gspread.Spreadsheet) -> None:
-    """Create 'visiting_cards' and 'users' worksheets with headers if missing."""
+    """Create or migrate 'visiting_cards' and 'users' worksheets."""
     existing_titles = {ws.title for ws in spreadsheet.worksheets()}
 
     if CARDS_WORKSHEET not in existing_titles:
@@ -164,8 +298,7 @@ def ensure_worksheets(spreadsheet: gspread.Spreadsheet) -> None:
         cards_ws.append_row(CARD_HEADERS, value_input_option="RAW")
     else:
         cards_ws = spreadsheet.worksheet(CARDS_WORKSHEET)
-        if not cards_ws.row_values(1):
-            cards_ws.append_row(CARD_HEADERS, value_input_option="RAW")
+        _migrate_cards_worksheet_if_needed(cards_ws)
 
     if USERS_WORKSHEET not in existing_titles:
         users_ws = spreadsheet.add_worksheet(
@@ -190,7 +323,7 @@ def get_users_worksheet() -> gspread.Worksheet:
 # User Authentication Functions (Backed by `users` Tab)
 # ---------------------------------------------------------------------------
 def fetch_all_users() -> list[dict[str, str]]:
-    """Fetch all user records directly from Google Sheets (fresh, uncached)."""
+    """Fetch all user records directly from Google Sheets."""
     ws = get_users_worksheet()
     all_rows = ws.get_all_values()
     if len(all_rows) <= 1:
@@ -280,7 +413,7 @@ def authenticate_user(
 
 
 # ---------------------------------------------------------------------------
-# Visiting Card CRUD (Strictly Scoped to Logged-In User)
+# Visiting Card CRUD & Duplicate Detection (Strictly Scoped to User)
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=60, show_spinner=False)
 def _fetch_all_card_rows() -> list[list[str]]:
@@ -292,24 +425,14 @@ def _fetch_all_card_rows() -> list[list[str]]:
 def fetch_user_records(user_id: str) -> pd.DataFrame:
     """Return ONLY the visiting cards uploaded by `user_id`, newest first."""
     all_rows = _fetch_all_card_rows()
-    display_cols = [
-        "Record ID",
-        "Company Name",
-        "Contact Person",
-        "Phone",
-        "Email",
-        "Products / Services",
-        "Address",
-        "Notes",
-        "Saved On",
-    ]
-
     if len(all_rows) <= 1:
-        return pd.DataFrame(columns=display_cols)
+        return pd.DataFrame(columns=DISPLAY_COLUMNS)
 
     headers = all_rows[0]
     data_rows = []
     for row in all_rows[1:]:
+        if not any(cell.strip() for cell in row):
+            continue
         padded = row + [""] * (len(headers) - len(row))
         record = dict(zip(headers, padded))
         if record.get("user_id") == user_id:
@@ -318,47 +441,108 @@ def fetch_user_records(user_id: str) -> pd.DataFrame:
                     "Record ID": record.get("record_id", ""),
                     "Company Name": record.get("company_name", "N/A"),
                     "Contact Person": record.get("contact_person", "N/A"),
-                    "Phone": record.get("phone", "N/A"),
-                    "Email": record.get("email", "N/A"),
+                    "WhatsApp Number": record.get("whatsapp_phone", "N/A"),
+                    "Call Number": record.get("call_phone", "N/A"),
                     "Products / Services": record.get("products_services", "N/A"),
-                    "Address": record.get("address", "N/A"),
                     "Notes": record.get("notes", ""),
                     "Saved On": record.get("created_at", ""),
+                    "Email": record.get("email", "N/A"),
+                    "Address": record.get("address", "N/A"),
                 }
             )
 
     if not data_rows:
-        return pd.DataFrame(columns=display_cols)
+        return pd.DataFrame(columns=DISPLAY_COLUMNS)
 
-    return pd.DataFrame(data_rows[::-1], columns=display_cols)
+    return pd.DataFrame(data_rows[::-1], columns=DISPLAY_COLUMNS)
+
+
+def find_duplicate_records(
+    user_id: str,
+    whatsapp_phone: str,
+    call_phone: str,
+    email: str,
+) -> list[dict[str, Any]]:
+    """
+    Check if the logged-in user already uploaded a card matching any of the
+    new card's phone numbers (WhatsApp or Call) or email addresses.
+    """
+    new_phones = extract_normalized_phones(whatsapp_phone) | extract_normalized_phones(
+        call_phone
+    )
+    new_emails = extract_normalized_emails(email)
+
+    if not new_phones and not new_emails:
+        return []
+
+    # Refresh cache before checking so recently added cards are never missed
+    _fetch_all_card_rows.clear()
+    existing_df = fetch_user_records(user_id)
+    if existing_df.empty:
+        return []
+
+    matches: list[dict[str, Any]] = []
+    for _, row in existing_df.iterrows():
+        existing_phones = extract_normalized_phones(
+            str(row.get("WhatsApp Number", ""))
+        ) | extract_normalized_phones(str(row.get("Call Number", "")))
+        existing_emails = extract_normalized_emails(str(row.get("Email", "")))
+
+        matched_phones = sorted(new_phones & existing_phones)
+        matched_emails = sorted(new_emails & existing_emails)
+
+        if matched_phones or matched_emails:
+            reasons = []
+            if matched_phones:
+                reasons.append(f"Phone: {', '.join(matched_phones)}")
+            if matched_emails:
+                reasons.append(f"Email: {', '.join(matched_emails)}")
+            matches.append(
+                {
+                    "Record ID": row["Record ID"],
+                    "Company Name": row["Company Name"],
+                    "Contact Person": row["Contact Person"],
+                    "WhatsApp Number": row["WhatsApp Number"],
+                    "Call Number": row["Call Number"],
+                    "Email": row["Email"],
+                    "Saved On": row["Saved On"],
+                    "Matched By": " | ".join(reasons),
+                }
+            )
+
+    return matches
 
 
 def save_record(
     user_id: str,
     company_name: str,
     contact_person: str,
-    phone: str,
-    email: str,
-    address: str,
+    whatsapp_phone: str,
+    call_phone: str,
     products_services: str,
     notes: str,
+    email: str,
+    address: str,
 ) -> str:
-    """Append a verified visiting card row tagged with the logged-in user's ID."""
+    """Append a verified visiting card row in CARD_HEADERS order (Email before Address)."""
     ws = get_cards_worksheet()
     record_id = uuid.uuid4().hex[:8]
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    # Enforce default rule if user cleared WhatsApp but left a single number in Call only?
+    # Respect whatever the user manually edited in the verification form.
     row = [
         record_id,
         user_id,
-        company_name.strip() or "N/A",
-        contact_person.strip() or "N/A",
-        phone.strip() or "N/A",
-        email.strip() or "N/A",
-        address.strip() or "N/A",
-        products_services.strip() or "N/A",
+        normalize_digits(company_name).strip() or "N/A",
+        normalize_digits(contact_person).strip() or "N/A",
+        normalize_digits(whatsapp_phone).strip() or "N/A",
+        normalize_digits(call_phone).strip() or "N/A",
+        normalize_digits(products_services).strip() or "N/A",
         notes.strip(),
         timestamp,
+        normalize_digits(email).strip() or "N/A",
+        normalize_digits(address).strip() or "N/A",
     ]
 
     ws.append_row(row, value_input_option="RAW", table_range="A1")
@@ -404,28 +588,57 @@ def build_excel_bytes(df: pd.DataFrame) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# Gemini AI Extraction Helper (with Retry & Fallback)
+# Gemini AI Extraction Helper (Supports 1 or 2 Sides + Retry & Fallback)
 # ---------------------------------------------------------------------------
 def extract_card_details(
-    image_bytes: bytes, mime_type: str, api_key: str
+    images: list[Tuple[bytes, str]], api_key: str
 ) -> Tuple[VisitingCard, str]:
-    """Send the visiting card image to Gemini with automatic retry and model fallback."""
+    """Send 1 or 2 visiting card images (front/back) to Gemini with retry & fallback."""
     if not api_key or not api_key.strip():
         raise ValueError(
             "Gemini API key is missing. Add it in Streamlit Secrets or the sidebar Settings."
         )
+    if not images:
+        raise ValueError("Please provide at least one visiting card image.")
 
     client = genai.Client(api_key=api_key.strip())
 
-    prompt = (
-        "Extract the business details from this visiting card image accurately. "
-        "Pay close attention to Indian phone number formats, GST/company suffixes, "
-        "and multi-line addresses. "
-        "For 'products_services': if products or services are not explicitly written "
-        "on the card, infer what the company likely sells or provides from the company "
-        "name, tagline, logo, or contact person's title. "
-        "If any field is completely absent and cannot be inferred, return 'N/A'."
+    side_note = (
+        "You are given 2 images showing the FRONT and BACK sides of the SAME visiting card. "
+        "Combine and merge all details found across both sides into one unified record without duplicating numbers or text. "
+        if len(images) == 2
+        else "You are given 1 image of a visiting card. "
     )
+
+    prompt = (
+        f"{side_note}"
+        "Extract the business details accurately.\n\n"
+        "IMPORTANT LANGUAGE RULE:\n"
+        "- Always output EVERY field strictly in English (Latin alphabet) with standard Western digits (0-9), "
+        "regardless of the language printed on the card (Gujarati, Hindi, Marathi, Tamil, etc.).\n"
+        "- Transliterate proper nouns (company names, person names, road/area/city names) into clean, readable English.\n"
+        "- Translate descriptive words, landmarks, and products/services into natural English "
+        "(keep widely known Indian item names in standard English spelling, e.g., Bhajiya, Jalebi, Boondi Laddu, Mohanthal).\n"
+        "- Convert ALL regional numerals (e.g., Gujarati ૦-૯, Hindi ०-९) into standard 0-9 digits.\n\n"
+        "IMPORTANT PHONE NUMBER CLASSIFICATION RULE (whatsapp_phone vs call_phone):\n"
+        "- Carefully inspect icons (WhatsApp logo vs phone handset/landline icon) and text labels "
+        "('WP', 'WA', 'WhatsApp' vs 'Call', 'Ph', 'Tel', 'Office', 'Landline', 'Contact').\n"
+        "- If there is ONLY 1 phone number on the card (and it is not explicitly marked as call-only/landline), "
+        "put it in `whatsapp_phone` and set `call_phone` to 'N/A'.\n"
+        "- If there are 2 or more phone numbers on the card and NO icon or text distinguishes WhatsApp from normal Call, "
+        "put ALL of them (comma-separated) in `whatsapp_phone` and set `call_phone` to 'N/A'.\n"
+        "- If icons or text DO specify which number is WhatsApp and which is for normal Call/Office/Landline, "
+        "separate them accordingly into `whatsapp_phone` and `call_phone`.\n\n"
+        "OTHER RULES:\n"
+        "- For `products_services`: if not explicitly listed, infer what the company offers from the company name, "
+        "tagline, logo, or contact person's title.\n"
+        "- If any field is completely absent and cannot be inferred, return 'N/A'."
+    )
+
+    image_parts = [
+        types.Part.from_bytes(data=img_bytes, mime_type=mime_type)
+        for img_bytes, mime_type in images
+    ]
 
     models_to_try = [MODEL_NAME, *FALLBACK_MODELS]
     last_error: Optional[Exception] = None
@@ -435,10 +648,7 @@ def extract_card_details(
             try:
                 response = client.models.generate_content(
                     model=model,
-                    contents=[
-                        types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
-                        prompt,
-                    ],
+                    contents=[*image_parts, prompt],
                     config=types.GenerateContentConfig(
                         response_mime_type="application/json",
                         response_schema=VisitingCard,
@@ -446,7 +656,7 @@ def extract_card_details(
                 )
 
                 if isinstance(response.parsed, VisitingCard):
-                    return response.parsed, model
+                    return _clean_card_output(response.parsed), model
 
                 if not response.text:
                     raise RuntimeError(
@@ -459,7 +669,10 @@ def extract_card_details(
                     response.text.strip(),
                     flags=re.IGNORECASE,
                 )
-                return VisitingCard.model_validate_json(cleaned_json), model
+                return (
+                    _clean_card_output(VisitingCard.model_validate_json(cleaned_json)),
+                    model,
+                )
 
             except genai_errors.APIError as api_err:
                 last_error = api_err
@@ -475,24 +688,34 @@ def extract_card_details(
     raise RuntimeError("All Gemini models failed to process the visiting card.")
 
 
-def run_scan(image_file, api_key: str) -> None:
-    """Process an UploadedFile from either file_uploader or camera_input."""
+def run_scan(image_files: list, api_key: str) -> None:
+    """Process 1 or 2 UploadedFile objects from file_uploader or camera_input."""
     if not api_key:
-        st.error("Gemini API key is not configured. Please add it in the sidebar Settings.")
+        st.error(
+            "Gemini API key is not configured. Please add it in the sidebar Settings."
+        )
+        return
+    if not image_files:
+        st.error("Please upload or capture at least 1 card image.")
+        return
+    if len(image_files) > MAX_CARD_IMAGES:
+        st.error(f"Maximum {MAX_CARD_IMAGES} images (Front & Back) are allowed.")
         return
 
-    image_bytes = image_file.getvalue()
-    mime_type = image_file.type or "image/jpeg"
+    images_payload = [
+        (f.getvalue(), f.type or "image/jpeg") for f in image_files
+    ]
+    side_label = "both card sides" if len(images_payload) == 2 else "visiting card"
 
-    with st.spinner("Scanning visiting card with Gemini..."):
+    with st.spinner(f"Scanning {side_label} with Gemini..."):
         try:
-            extracted, used_model = extract_card_details(
-                image_bytes, mime_type, api_key
-            )
+            extracted, used_model = extract_card_details(images_payload, api_key)
             st.session_state["extracted_card"] = extracted.model_dump()
+            st.session_state["pending_duplicate_save"] = None
             st.session_state["scan_counter"] += 1
             st.session_state["scan_notice"] = (
-                f"Card scanned using `{used_model}`! Please verify or edit the details below and click Save."
+                f"Scanned {len(images_payload)} image(s) using `{used_model}`! "
+                "Please verify or edit the details below and click Save."
             )
         except genai_errors.APIError as api_err:
             st.error(f"Gemini API error ({api_err.code}): {api_err.message}")
@@ -535,6 +758,7 @@ def render_auth_screen() -> None:
                         if ok and user:
                             st.session_state["auth_user"] = user
                             st.session_state["extracted_card"] = None
+                            st.session_state["pending_duplicate_save"] = None
                             st.session_state["scan_notice"] = None
                             st.session_state["flash_success"] = (
                                 f"Welcome back, {user['username']}!"
@@ -551,9 +775,7 @@ def render_auth_screen() -> None:
                     "Username",
                     placeholder="3–30 characters (letters, numbers, _ . -)",
                 )
-                reg_email = st.text_input(
-                    "Email", placeholder="name@example.com"
-                )
+                reg_email = st.text_input("Email", placeholder="name@example.com")
                 reg_password = st.text_input(
                     "Password",
                     type="password",
@@ -576,6 +798,7 @@ def render_auth_screen() -> None:
                             if ok and user:
                                 st.session_state["auth_user"] = user
                                 st.session_state["extracted_card"] = None
+                                st.session_state["pending_duplicate_save"] = None
                                 st.session_state["scan_notice"] = None
                                 st.session_state["flash_success"] = (
                                     f"Account created! Welcome, {user['username']}."
@@ -595,10 +818,14 @@ def main() -> None:
         st.session_state["auth_user"] = None
     if "extracted_card" not in st.session_state:
         st.session_state["extracted_card"] = None
+    if "pending_duplicate_save" not in st.session_state:
+        st.session_state["pending_duplicate_save"] = None
     if "scan_counter" not in st.session_state:
         st.session_state["scan_counter"] = 0
     if "flash_success" not in st.session_state:
         st.session_state["flash_success"] = None
+    if "flash_info" not in st.session_state:
+        st.session_state["flash_info"] = None
     if "scan_notice" not in st.session_state:
         st.session_state["scan_notice"] = None
 
@@ -640,8 +867,10 @@ def main() -> None:
         if st.button("Logout", use_container_width=True):
             st.session_state["auth_user"] = None
             st.session_state["extracted_card"] = None
+            st.session_state["pending_duplicate_save"] = None
             st.session_state["scan_notice"] = None
             st.session_state["flash_success"] = None
+            st.session_state["flash_info"] = None
             st.rerun()
 
         st.divider()
@@ -649,7 +878,6 @@ def main() -> None:
 
         server_api_key = str(get_secret("GEMINI_API_KEY", "") or "").strip()
         if server_api_key:
-            # Keep server secret hidden from users on shared/multi-user deployments
             st.success("Gemini API key configured")
             override_key = st.text_input(
                 "Use your own Gemini API Key (optional)",
@@ -686,128 +914,256 @@ def main() -> None:
         st.success(st.session_state["flash_success"])
         st.session_state["flash_success"] = None
 
-    # ---- Step 1: Image Capture & Upload ----
-    st.subheader("1. Capture or Upload Visiting Card")
-    tab_upload, tab_camera = st.tabs(["Upload Image", "Take Photo with Camera"])
+    if st.session_state["flash_info"]:
+        st.info(st.session_state["flash_info"])
+        st.session_state["flash_info"] = None
+
+    # ---- Step 1: Image Capture & Upload (1 or 2 Sides) ----
+    st.subheader("1. Capture or Upload Visiting Card (1 or 2 Sides)")
+    tab_upload, tab_camera = st.tabs(["Upload Image(s)", "Take Photo with Camera"])
 
     with tab_upload:
-        uploaded_file = st.file_uploader(
-            "Choose a visiting card image (JPG or PNG)",
+        uploaded_files = st.file_uploader(
+            "Choose 1 or 2 visiting card images (Front & Back — JPG or PNG)",
             type=["jpg", "jpeg", "png"],
+            accept_multiple_files=True,
             key="card_file_uploader",
         )
-        if uploaded_file is not None:
-            st.image(
-                uploaded_file.getvalue(),
-                caption="Uploaded Card Preview",
-                width=400,
-            )
-            if st.button(
-                "Scan Uploaded Card",
-                type="primary",
-                key="btn_scan_upload",
-            ):
-                run_scan(uploaded_file, active_api_key)
+        if uploaded_files:
+            if len(uploaded_files) > MAX_CARD_IMAGES:
+                st.error(
+                    f"Maximum {MAX_CARD_IMAGES} images allowed (Front & Back side). "
+                    f"You selected {len(uploaded_files)} — please remove the extra file(s)."
+                )
+            else:
+                preview_cols = st.columns(len(uploaded_files))
+                side_labels = ["Side 1 (Front)", "Side 2 (Back)"]
+                for idx, file_obj in enumerate(uploaded_files):
+                    with preview_cols[idx]:
+                        st.image(
+                            file_obj.getvalue(),
+                            caption=side_labels[idx],
+                            width=360,
+                        )
+                if st.button(
+                    f"Scan Uploaded Card ({len(uploaded_files)} image{'s' if len(uploaded_files) > 1 else ''})",
+                    type="primary",
+                    key="btn_scan_upload",
+                ):
+                    run_scan(uploaded_files, active_api_key)
 
     with tab_camera:
-        camera_photo = st.camera_input(
-            "Point your mobile or laptop camera at the visiting card",
-            key="card_camera_input",
+        cam_front = st.camera_input(
+            "Side 1 (Front) — Point your camera at the front of the visiting card",
+            key="card_camera_front",
         )
-        if camera_photo is not None:
+        add_back_side = st.checkbox(
+            "Card has details on the back side (capture 2nd photo)",
+            key="toggle_camera_back",
+        )
+        cam_back = None
+        if add_back_side:
+            cam_back = st.camera_input(
+                "Side 2 (Back) — Point your camera at the back of the visiting card",
+                key="card_camera_back",
+            )
+
+        captured_photos = [p for p in (cam_front, cam_back) if p is not None]
+        if captured_photos:
             if st.button(
-                "Scan Captured Photo",
+                f"Scan Captured Photo{'s' if len(captured_photos) > 1 else ''} ({len(captured_photos)})",
                 type="primary",
                 key="btn_scan_camera",
             ):
-                run_scan(camera_photo, active_api_key)
+                run_scan(captured_photos, active_api_key)
 
-    # ---- Step 2: Verification & Edit Form ----
+    # ---- Step 2: Verification Form & Duplicate Confirmation ----
     if st.session_state["extracted_card"] is not None:
         st.divider()
         st.subheader("2. Verify & Save Details")
 
-        if st.session_state["scan_notice"]:
-            st.info(st.session_state["scan_notice"])
-            st.session_state["scan_notice"] = None
+        pending_dup = st.session_state["pending_duplicate_save"]
 
-        card = st.session_state["extracted_card"]
-        suffix = st.session_state["scan_counter"]
+        if pending_dup is not None:
+            # Show duplicate warning & Yes/No confirmation prompt
+            st.warning(
+                "**Duplicate Card Detected!** A card with the same phone number or email "
+                "is already saved in your account."
+            )
+            st.caption("Existing matching card(s) in your account:")
+            st.dataframe(
+                pd.DataFrame(pending_dup["matches"]),
+                use_container_width=True,
+                hide_index=True,
+            )
 
-        with st.form(key=f"verify_card_form_{suffix}"):
-            col1, col2 = st.columns(2)
+            st.markdown(
+                "**Do you want to upload this same card data again?**"
+            )
+            dup_col1, dup_col2, _ = st.columns([1.3, 1.3, 3.4])
+            with dup_col1:
+                if st.button(
+                    "Yes, Upload Again",
+                    type="primary",
+                    use_container_width=True,
+                    key="btn_dup_yes",
+                ):
+                    data = pending_dup["payload"]
+                    try:
+                        save_record(
+                            user_id=current_user_id,
+                            company_name=data["company_name"],
+                            contact_person=data["contact_person"],
+                            whatsapp_phone=data["whatsapp_phone"],
+                            call_phone=data["call_phone"],
+                            products_services=data["products_services"],
+                            notes=data["notes"],
+                            email=data["email"],
+                            address=data["address"],
+                        )
+                        st.session_state["pending_duplicate_save"] = None
+                        st.session_state["extracted_card"] = None
+                        st.session_state["flash_success"] = (
+                            f"Saved '{data['company_name']}' to your account."
+                        )
+                        st.rerun()
+                    except Exception as sheet_err:
+                        st.error(f"Could not save to Google Sheets: {sheet_err}")
 
-            with col1:
-                company_name = st.text_input(
-                    "Company Name",
-                    value=card.get("company_name", "N/A"),
-                    key=f"company_{suffix}",
-                )
-                contact_person = st.text_input(
-                    "Contact Person",
-                    value=card.get("contact_person", "N/A"),
-                    key=f"contact_{suffix}",
-                )
-                phone = st.text_input(
-                    "Phone",
-                    value=card.get("phone", "N/A"),
-                    key=f"phone_{suffix}",
-                )
+            with dup_col2:
+                if st.button(
+                    "No, Cancel",
+                    type="secondary",
+                    use_container_width=True,
+                    key="btn_dup_no",
+                ):
+                    st.session_state["pending_duplicate_save"] = None
+                    st.session_state["extracted_card"] = None
+                    st.session_state["flash_info"] = (
+                        "Duplicate upload cancelled — card was not saved again."
+                    )
+                    st.rerun()
 
-            with col2:
+        else:
+            if st.session_state["scan_notice"]:
+                st.info(st.session_state["scan_notice"])
+                st.session_state["scan_notice"] = None
+
+            card = st.session_state["extracted_card"]
+            suffix = st.session_state["scan_counter"]
+
+            with st.form(key=f"verify_card_form_{suffix}"):
+                # Row 1: Company Name & Contact Person
+                r1_c1, r1_c2 = st.columns(2)
+                with r1_c1:
+                    company_name = st.text_input(
+                        "Company Name",
+                        value=card.get("company_name", "N/A"),
+                        key=f"company_{suffix}",
+                    )
+                with r1_c2:
+                    contact_person = st.text_input(
+                        "Contact Person",
+                        value=card.get("contact_person", "N/A"),
+                        key=f"contact_{suffix}",
+                    )
+
+                # Row 2: WhatsApp Number & Normal Call Number
+                r2_c1, r2_c2 = st.columns(2)
+                with r2_c1:
+                    whatsapp_phone = st.text_input(
+                        "WhatsApp Number",
+                        value=card.get("whatsapp_phone", "N/A"),
+                        key=f"whatsapp_{suffix}",
+                    )
+                with r2_c2:
+                    call_phone = st.text_input(
+                        "Call Number (Normal)",
+                        value=card.get("call_phone", "N/A"),
+                        key=f"call_{suffix}",
+                    )
+
+                # Row 3: Products / Services & Additional Notes
+                r3_c1, r3_c2 = st.columns(2)
+                with r3_c1:
+                    products_services = st.text_input(
+                        "Products / Services",
+                        value=card.get("products_services", "N/A"),
+                        key=f"products_{suffix}",
+                    )
+                with r3_c2:
+                    notes = st.text_input(
+                        "Additional Notes (Optional)",
+                        placeholder="e.g., Met at trade fair, wholesale supplier...",
+                        key=f"notes_{suffix}",
+                    )
+
+                # Final fields: Email strictly before Address
                 email = st.text_input(
                     "Email",
                     value=card.get("email", "N/A"),
                     key=f"email_{suffix}",
                 )
-                products_services = st.text_input(
-                    "Products / Services",
-                    value=card.get("products_services", "N/A"),
-                    key=f"products_{suffix}",
-                )
                 address = st.text_area(
                     "Address",
                     value=card.get("address", "N/A"),
-                    height=80,
+                    height=85,
                     key=f"address_{suffix}",
                 )
 
-            notes = st.text_area(
-                "Additional Notes (Optional)",
-                placeholder="e.g., Met at trade fair, wholesale supplier, call next week...",
-                height=70,
-                key=f"notes_{suffix}",
-            )
+                btn_col1, btn_col2, _ = st.columns([1.2, 1, 4])
+                with btn_col1:
+                    submitted = st.form_submit_button("Save Card", type="primary")
+                with btn_col2:
+                    discarded = st.form_submit_button("Discard")
 
-            btn_col1, btn_col2, _ = st.columns([1.2, 1, 4])
-            with btn_col1:
-                submitted = st.form_submit_button("Save Card", type="primary")
-            with btn_col2:
-                discarded = st.form_submit_button("Discard")
+                if submitted:
+                    try:
+                        matches = find_duplicate_records(
+                            user_id=current_user_id,
+                            whatsapp_phone=whatsapp_phone,
+                            call_phone=call_phone,
+                            email=email,
+                        )
+                        if matches:
+                            st.session_state["pending_duplicate_save"] = {
+                                "payload": {
+                                    "company_name": company_name,
+                                    "contact_person": contact_person,
+                                    "whatsapp_phone": whatsapp_phone,
+                                    "call_phone": call_phone,
+                                    "products_services": products_services,
+                                    "notes": notes,
+                                    "email": email,
+                                    "address": address,
+                                },
+                                "matches": matches,
+                            }
+                            st.rerun()
+                        else:
+                            save_record(
+                                user_id=current_user_id,
+                                company_name=company_name,
+                                contact_person=contact_person,
+                                whatsapp_phone=whatsapp_phone,
+                                call_phone=call_phone,
+                                products_services=products_services,
+                                notes=notes,
+                                email=email,
+                                address=address,
+                            )
+                            st.session_state["extracted_card"] = None
+                            st.session_state["flash_success"] = (
+                                f"Saved '{company_name}' to your account."
+                            )
+                            st.rerun()
+                    except Exception as sheet_err:
+                        st.error(f"Could not save to Google Sheets: {sheet_err}")
 
-            if submitted:
-                try:
-                    save_record(
-                        user_id=current_user_id,
-                        company_name=company_name,
-                        contact_person=contact_person,
-                        phone=phone,
-                        email=email,
-                        address=address,
-                        products_services=products_services,
-                        notes=notes,
-                    )
+                if discarded:
                     st.session_state["extracted_card"] = None
-                    st.session_state["flash_success"] = (
-                        f"Saved '{company_name}' to your account."
-                    )
+                    st.session_state["pending_duplicate_save"] = None
                     st.rerun()
-                except Exception as sheet_err:
-                    st.error(f"Could not save to Google Sheets: {sheet_err}")
-
-            if discarded:
-                st.session_state["extracted_card"] = None
-                st.rerun()
 
     # ---- Step 3: User's Saved Records, Search & Excel Export ----
     st.divider()
@@ -830,7 +1186,7 @@ def main() -> None:
     with search_col:
         search_query = st.text_input(
             "Search records",
-            placeholder="Filter your cards by company name, products/services, or address...",
+            placeholder="Filter by company name, products/services, phone, email, or address...",
             label_visibility="collapsed",
         )
 
@@ -864,6 +1220,9 @@ def main() -> None:
             all_records_df["Company Name"].str.contains(q, case=False, na=False)
             | all_records_df["Products / Services"].str.contains(q, case=False, na=False)
             | all_records_df["Address"].str.contains(q, case=False, na=False)
+            | all_records_df["WhatsApp Number"].str.contains(q, case=False, na=False)
+            | all_records_df["Call Number"].str.contains(q, case=False, na=False)
+            | all_records_df["Email"].str.contains(q, case=False, na=False)
         )
         filtered_df = all_records_df[mask]
         st.caption(f"Showing {len(filtered_df)} of {len(all_records_df)} saved cards")
