@@ -364,6 +364,19 @@ def inject_clean_ui_css() -> None:
                     font-size: 1.2rem !important;
                 }
             }
+            /* Keep card image previews & camera compact on laptop and phone */
+            [data-testid="stImage"] img {
+                max-height: 240px !important;
+                max-width: min(300px, 100%) !important;
+                width: auto !important;
+                height: auto !important;
+                object-fit: contain;
+                border-radius: 8px;
+                border: 1px solid rgba(128, 128, 128, 0.25);
+            }
+            [data-testid="stCameraInput"] {
+                max-width: 420px;
+            }
         </style>
         """,
         unsafe_allow_html=True,
@@ -3094,14 +3107,14 @@ def main() -> None:
                         f"You selected {len(uploaded_files)} — please remove the extra file(s)."
                     )
                 else:
-                    preview_cols = st.columns(len(uploaded_files))
+                    preview_cols = st.columns(2)
                     side_labels = ["Side 1 (Front)", "Side 2 (Back)"]
                     for idx, file_obj in enumerate(uploaded_files):
                         with preview_cols[idx]:
                             st.image(
                                 file_obj.getvalue(),
                                 caption=side_labels[idx],
-                                use_container_width=True,
+                                width=280,
                             )
                     if st.button(
                         f"Scan Card ({len(uploaded_files)} image{'s' if len(uploaded_files) > 1 else ''})",
