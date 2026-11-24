@@ -27,7 +27,7 @@ from pydantic import BaseModel, Field
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-SCHEMA_VERSION = "v3_table_format_and_otp"
+SCHEMA_VERSION = "v4_email_after_wp"
 
 MODEL_CHAIN = [
     "gemini-3.5-flash-lite",
@@ -62,20 +62,20 @@ CARD_HEADERS = [
     "contact_person",
     "call_phone",
     "whatsapp_phone",
+    "email",
     "products_services",
     "address",
     "city",
     "notes",
     "created_at",
-    "email",
 ]
 
-# Exact default table columns and order
 DEFAULT_TABLE_COLUMNS = [
     "Company Name",
     "Contact Person",
     "Contact No.",
     "WhatsApp No.",
+    "Email",
     "Product / Services",
     "Address",
     "City",
@@ -86,7 +86,6 @@ DEFAULT_TABLE_COLUMNS = [
 ALL_RECORD_COLUMNS = [
     "Record ID",
     *DEFAULT_TABLE_COLUMNS,
-    "Email",
 ]
 
 USER_HEADERS = [
@@ -1143,12 +1142,12 @@ def save_record(
         normalize_digits(contact_person).strip() or "N/A",
         format_phone_numbers(call_phone),
         format_phone_numbers(whatsapp_phone),
+        normalize_digits(email).strip() or "N/A",
         normalize_digits(products_services).strip() or "N/A",
         normalize_digits(address).strip() or "N/A",
         normalize_digits(city).strip() or "N/A",
         notes.strip(),
         timestamp,
-        normalize_digits(email).strip() or "N/A",
     ]
 
     ws.append_row(row, value_input_option="RAW", table_range="A1")
@@ -1190,12 +1189,12 @@ def update_record(
                 normalize_digits(contact_person).strip() or "N/A",
                 format_phone_numbers(call_phone),
                 format_phone_numbers(whatsapp_phone),
+                normalize_digits(email).strip() or "N/A",
                 normalize_digits(products_services).strip() or "N/A",
                 normalize_digits(address).strip() or "N/A",
                 normalize_digits(city).strip() or "N/A",
                 notes.strip(),
                 original_created_at,
-                normalize_digits(email).strip() or "N/A",
             ]
             end_cell = rowcol_to_a1(sheet_row_idx, len(CARD_HEADERS))
             ws.update(
@@ -2058,11 +2057,7 @@ def main() -> None:
 
     is_filtered = bool(search_query.strip()) or selected_city != "All Cities"
 
-    show_email_col = st.checkbox("Show Email column in table", value=False)
-    visible_columns = (
-        [*DEFAULT_TABLE_COLUMNS, "Email"] if show_email_col else DEFAULT_TABLE_COLUMNS
-    )
-    display_df = filtered_df[visible_columns]
+    display_df = filtered_df[DEFAULT_TABLE_COLUMNS]
 
     with export_col:
         if not display_df.empty:
