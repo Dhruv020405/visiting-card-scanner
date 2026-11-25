@@ -35,7 +35,7 @@ from pydantic import BaseModel, Field
 # ---------------------------------------------------------------------------
 # Configuration & Security Constants
 # ---------------------------------------------------------------------------
-SCHEMA_VERSION = "v11_multiuser_quota_resilient"
+SCHEMA_VERSION = "v12_bulk_outreach_and_multi_wp"
 
 MODEL_CHAIN = [
     "gemini-3.5-flash-lite",
@@ -63,6 +63,7 @@ MAX_PHYSICAL_ROWS_SCANNED = 2000           # Max 2000 physical rows scanned (inc
 MAX_EXCEL_IMPORT_COLS = 40                 # Max 40 columns per import file
 MAX_FIELD_LEN = 250
 MAX_LONG_FIELD_LEN = 800
+MAX_DIRECT_BCC_EMAILS = 45                 # Safe URL length cap for 1-click browser BCC links
 
 # Auth, Session & Rate-Limiting Constants
 MIN_SESSION_SECRET_LEN = 32
@@ -410,25 +411,43 @@ def inject_clean_ui_css() -> None:
                 border-radius: 10px;
                 border: 1px solid rgba(128, 128, 128, 0.22);
                 background: rgba(128, 128, 128, 0.04);
-                margin-bottom: 0.65rem;
+                margin-bottom: 0.55rem;
+            }
+            .vcard-outreach-card-sent {
+                border-left: 4px solid #16a34a;
+                opacity: 0.82;
             }
             .vcard-action-link {
                 display: inline-block;
-                padding: 0.38rem 0.8rem;
+                padding: 0.4rem 0.85rem;
                 border-radius: 6px;
                 text-decoration: none !important;
                 font-size: 0.86rem;
                 font-weight: 600;
                 margin-right: 0.5rem;
-                margin-top: 0.4rem;
+                margin-top: 0.45rem;
             }
             .vcard-wa-btn {
                 background: #16a34a;
                 color: #ffffff !important;
             }
+            .vcard-gmail-btn {
+                background: #dc2626;
+                color: #ffffff !important;
+            }
             .vcard-mail-btn {
                 background: #2563eb;
                 color: #ffffff !important;
+            }
+            .vcard-sent-badge {
+                display: inline-block;
+                padding: 0.12rem 0.5rem;
+                border-radius: 999px;
+                font-size: 0.75rem;
+                font-weight: 600;
+                background: rgba(22, 163, 74, 0.18);
+                color: #16a34a;
+                margin-left: 0.4rem;
             }
 
             @keyframes vcardSlideDown {
@@ -603,7 +622,6 @@ def _is_transient_sheets_error(exc: Exception) -> bool:
 
 
 def _sheets_call_with_retry(fn: Callable[[], _T], attempts: int = 3) -> _T:
-    """Retry transient Google Sheets 429/5xx errors with short backoff."""
     last_exc: Optional[Exception] = None
     for idx in range(attempts):
         try:
@@ -772,18 +790,47 @@ def extract_normalized_phones(phone_str: str) -> set[str]:
     return phones
 
 
-def extract_primary_wa_dial_number(wp_str: str, fallback_call_str: str = "") -> str:
-    for candidate in (wp_str, fallback_call_str):
-        formatted = format_phone_numbers(candidate)
-        if formatted == "N/A":
+def extract_all_wa_dial_numbers(
+    wp_str: str, fallback_call_str: str = ""
+) -> list[Tuple[str, str]]:
+    """
+    Return ALL unique (display_number, international_wa_digits) pairs for a card
+    so cards with 2+ WhatsApp numbers generate separate 1-click links for each number.
+    """
+    results: list[Tuple[str, str]] = []
+    seen_dial: set[str] = set()
+
+    formatted_wp = format_phone_numbers(wp_str)
+    sources = (
+        [formatted_wp]
+        if formatted_wp != "N/A"
+        else [format_phone_numbers(fallback_call_str)]
+    )
+
+    for candidate in sources:
+        if not candidate or candidate == "N/A":
             continue
-        for part in formatted.split(" / "):
-            digits = re.sub(r"\D", "", part)
+        for part in candidate.split(" / "):
+            clean_disp = part.strip()
+            digits = re.sub(r"\D", "", clean_disp)
+            if not digits:
+                continue
             if len(digits) == 10 and digits[0] in "6789":
-                return f"91{digits}"
-            if len(digits) >= 10:
-                return digits
-    return ""
+                dial = f"91{digits}"
+            elif len(digits) >= 10:
+                dial = digits
+            else:
+                continue
+            if dial not in seen_dial:
+                seen_dial.add(dial)
+                results.append((clean_disp, dial))
+
+    return results
+
+
+def extract_primary_wa_dial_number(wp_str: str, fallback_call_str: str = "") -> str:
+    pairs = extract_all_wa_dial_numbers(wp_str, fallback_call_str)
+    return pairs[0][1] if pairs else ""
 
 
 def extract_normalized_emails(email_str: str) -> set[str]:
@@ -1005,6 +1052,7 @@ def clear_account_specific_state(preserve_flash: bool = False) -> None:
     st.session_state["audit_warning"] = None
     st.session_state["ai_growth_output"] = None
     st.session_state["ai_pitch_output"] = None
+    st.session_state["campaign_sent_keys"] = set()
     st.session_state["edit_counter"] = st.session_state.get("edit_counter", 0) + 1
     clear_uploaded_inputs()
     if not preserve_flash:
@@ -1548,11 +1596,6 @@ def create_server_session(user_id: str) -> str:
 
 @st.cache_data(ttl=60, show_spinner=False)
 def _check_session_in_sheets(composite_token: str) -> Tuple[str, Optional[str]]:
-    """
-    Cached session lookup (60s TTL). Returns ("valid", user_id) or ("invalid", None).
-    Raises _TransientStorageError on Sheets 429/network errors so transient outages
-    are never cached or mistaken for a revoked session.
-    """
     if "." not in composite_token:
         return "invalid", None
     session_id, raw_secret = composite_token.split(".", 1)
@@ -1658,10 +1701,6 @@ def logout_user_session() -> None:
 
 
 def sync_and_restore_session() -> Tuple[Optional[dict[str, str]], bool]:
-    """
-    Validate active sessions against server-side revocation state without ever
-    logging out active users on transient Google Sheets 429 rate-limit spikes.
-    """
     try:
         if "session" in st.query_params:
             st.query_params.pop("session", None)
@@ -1774,7 +1813,6 @@ class QuotaExceededError(Exception):
 
 @st.cache_data(ttl=60, show_spinner=False)
 def get_user_scans_today(user_id: str) -> int:
-    """Cached 60s daily scan counter read (cleared immediately on scan reservation)."""
     today = get_quota_date_str()
     ws = get_usage_worksheet()
     rows = _sheets_call_with_retry(ws.get_all_values)
@@ -2230,7 +2268,6 @@ def authenticate_user(
     if not allowed:
         return False, lock_msg, None
 
-    # Check 60s-cached users list first to avoid unnecessary Sheets reads during bursts
     users = fetch_all_users()
     matched_users = [
         u
@@ -3626,7 +3663,7 @@ def render_auth_screen() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Analyze & Growth Hub (Escaped HTML, User-Bound AI Output & Atomic Quota)
+# Analyze & Growth Hub (Bulk WhatsApp, Multi-WP Support & Bulk Gmail/Mail BCC)
 # ---------------------------------------------------------------------------
 def _compute_analytics_tables(
     df: pd.DataFrame,
@@ -3777,6 +3814,25 @@ def _get_user_bound_ai_text(state_key: str, user_id: str) -> Optional[str]:
     return None
 
 
+def _build_gmail_compose_url(
+    to_email: str = "",
+    bcc_emails: Optional[list[str]] = None,
+    subject: str = "",
+    body: str = "",
+) -> str:
+    """Build a direct Gmail Web compose URL that works on every browser without mailto: handlers."""
+    params = ["view=cm", "fs=1"]
+    if to_email:
+        params.append(f"to={quote(to_email)}")
+    if bcc_emails:
+        params.append(f"bcc={quote(','.join(bcc_emails))}")
+    if subject:
+        params.append(f"su={quote(subject)}")
+    if body:
+        params.append(f"body={quote(body)}")
+    return f"https://mail.google.com/mail/?{'&'.join(params)}"
+
+
 def render_analyze_section(
     all_records_df: pd.DataFrame,
     current_username: str,
@@ -3790,7 +3846,7 @@ def render_analyze_section(
         with hdr_col:
             st.subheader("Analyze & Growth Hub")
             st.caption(
-                "Market intelligence, 1-click WhatsApp/Email campaigns, and AI growth playbooks built from your saved leads."
+                "Market intelligence, bulk WhatsApp & Email campaigns, and AI growth playbooks built from your saved leads."
             )
 
         if all_records_df.empty:
@@ -3866,7 +3922,7 @@ def render_analyze_section(
         tab_market, tab_outreach, tab_ai_growth = st.tabs(
             [
                 "Market & Territory Insights",
-                "1-Click WhatsApp & Email Campaigns",
+                "Bulk WhatsApp & Email Campaigns",
                 "AI Marketing Strategist & Pitch",
             ]
         )
@@ -3898,9 +3954,11 @@ def render_analyze_section(
                     use_container_width=True,
                 )
 
+        # ---- Bulk WhatsApp & Bulk Email Campaign Launcher ----
         with tab_outreach:
             st.caption(
-                "Segment your contacts and launch instant personalized WhatsApp or Email outreach."
+                "Filter your contacts by City, Product/Service, or Channel to launch Bulk Email (BCC) "
+                "and Bulk WhatsApp outreach—including cards with 2 WhatsApp numbers."
             )
 
             unique_cities = sorted(
@@ -3911,7 +3969,7 @@ def render_analyze_section(
                 }
             )
 
-            f1, f2, f3 = st.columns([1.3, 1.5, 1.4])
+            f1, f2, f3 = st.columns([1.2, 1.5, 1.5])
             with f1:
                 camp_city = st.selectbox(
                     "Target City",
@@ -3920,7 +3978,7 @@ def render_analyze_section(
                 )
             with f2:
                 camp_keyword = st.text_input(
-                    "Filter by Product / Company",
+                    "Filter by Product / Company / Keyword",
                     placeholder="e.g., Educational, PVC, Ahmedabad...",
                     key="camp_keyword_filter",
                 )
@@ -3931,6 +3989,7 @@ def render_analyze_section(
                         "All Contacts",
                         "WhatsApp Ready Only",
                         "Email Ready Only",
+                        "Both WhatsApp & Email",
                     ],
                     key="camp_channel_filter",
                 )
@@ -3943,167 +4002,403 @@ def render_analyze_section(
                 ]
             if camp_keyword.strip():
                 camp_df = search_records_df(camp_df, camp_keyword)
+
+            has_wp_mask = camp_df["WhatsApp No."].apply(
+                lambda x: str(x).strip().upper() != "N/A"
+            )
+            has_email_mask = camp_df["Email"].apply(
+                lambda x: str(x).strip().upper() != "N/A" and is_valid_email(str(x).strip())
+            )
+
             if camp_channel == "WhatsApp Ready Only":
-                camp_df = camp_df[
-                    camp_df["WhatsApp No."].apply(
-                        lambda x: str(x).strip().upper() != "N/A"
-                    )
-                ]
+                camp_df = camp_df[has_wp_mask]
             elif camp_channel == "Email Ready Only":
-                camp_df = camp_df[
-                    camp_df["Email"].apply(lambda x: str(x).strip().upper() != "N/A")
-                ]
-
-            templates = {
-                "Business Intro & Catalog": (
-                    "Hello {person},\n\n"
-                    "Greetings! We saved your contact from {company} ({city}). "
-                    "We'd love to share our latest product catalog and explore working together "
-                    "around {product}.\n\n"
-                    "Please let us know a good time to connect!"
-                ),
-                "Trade Fair / Meeting Follow-Up": (
-                    "Hello {person},\n\n"
-                    "It was great connecting with {company}! Following up on our discussion "
-                    "regarding {product} in {city}. Sharing our details here so we stay in touch."
-                ),
-                "Seasonal / Special Offer": (
-                    "Hello {person},\n\n"
-                    "Special update for our partners in {city}! We have fresh stock and priority pricing "
-                    "available this month. Reply 'CATALOG' to receive our latest price list for {company}."
-                ),
-                "Distributor / B2B Partnership": (
-                    "Hello {person},\n\n"
-                    "We are expanding our partner network in {city} and noticed {company}'s strong presence in "
-                    "{product}. Would you be open to a quick 5-minute call this week?"
-                ),
-            }
-
-            tpl_col1, tpl_col2 = st.columns([1.4, 2.6])
-            with tpl_col1:
-                chosen_tpl_name = st.selectbox(
-                    "Campaign Template",
-                    options=[*templates.keys(), "Custom Message"],
-                    key="camp_template_select",
-                )
-                st.caption(
-                    "Available tags: `{person}`, `{company}`, `{city}`, `{product}`"
-                )
-            with tpl_col2:
-                default_body = (
-                    "Hello {person}, reaching out to {company} regarding {product}."
-                    if chosen_tpl_name == "Custom Message"
-                    else templates[chosen_tpl_name]
-                )
-                message_template = st.text_area(
-                    "Message Template (editable)",
-                    value=default_body,
-                    height=115,
-                    key=f"camp_msg_box_{chosen_tpl_name}",
-                )
+                camp_df = camp_df[has_email_mask]
+            elif camp_channel == "Both WhatsApp & Email":
+                camp_df = camp_df[has_wp_mask & has_email_mask]
 
             if camp_df.empty:
                 st.warning("No leads match the selected campaign filters.")
             else:
-                campaign_rows = []
+                # Optional company multi-select so the user can include/exclude specific filtered leads
+                label_to_id: dict[str, str] = {}
                 for _, r in camp_df.iterrows():
-                    personalized = _render_campaign_message(message_template, r)
-                    campaign_rows.append(
-                        {
-                            "Company Name": r["Company Name"],
-                            "Contact Person": r["Contact Person"],
-                            "WhatsApp No.": r["WhatsApp No."],
-                            "Contact No.": r["Contact No."],
-                            "Email": r["Email"],
-                            "City": r["City"],
-                            "Product / Services": r["Product / Services"],
-                            "Personalized Message": personalized,
-                        }
-                    )
-                campaign_export_df = pd.DataFrame(campaign_rows)
+                    lbl = f"{r['Company Name']} ({r['City']}) [{str(r['Record ID'])[:8]}]"
+                    label_to_id[lbl] = str(r["Record ID"])
 
-                c_info, c_dl = st.columns([3, 1.5])
-                with c_info:
-                    st.markdown(
-                        f"**{len(camp_df)}** target contact(s) ready — tap **Send WhatsApp** or **Send Email** below:"
+                all_labels = list(label_to_id.keys())
+                sel_col1, sel_col2 = st.columns([1.4, 3.6])
+                with sel_col1:
+                    select_all_filtered = st.checkbox(
+                        f"Select all {len(all_labels)} filtered lead(s)",
+                        value=True,
+                        key=f"camp_select_all_{camp_city}_{camp_channel}_{camp_keyword}",
                     )
-                with c_dl:
-                    st.download_button(
-                        label="Export Campaign List (.xlsx)",
-                        data=build_excel_bytes(campaign_export_df, "Campaign Leads"),
-                        file_name=f"campaign_outreach_{datetime.now().strftime('%Y%m%d')}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True,
-                        key="btn_export_campaign_xlsx",
-                    )
-
-                for _, r in camp_df.head(25).iterrows():
-                    personalized = _render_campaign_message(message_template, r)
-                    wa_dial = extract_primary_wa_dial_number(
-                        str(r["WhatsApp No."]), str(r["Contact No."])
-                    )
-                    raw_email_val = str(r["Email"]).strip()
-                    email_val = (
-                        raw_email_val
-                        if raw_email_val.upper() != "N/A"
-                        and is_valid_email(raw_email_val)
-                        else ""
-                    )
-
-                    safe_company = html.escape(str(r["Company Name"]), quote=True)
-                    safe_person = html.escape(str(r["Contact Person"]), quote=True)
-                    safe_city = html.escape(str(r["City"]), quote=True)
-                    safe_product = html.escape(str(r["Product / Services"]), quote=True)
-                    display_phone_raw = (
-                        str(r["WhatsApp No."])
-                        if str(r["WhatsApp No."]).strip().upper() != "N/A"
-                        else str(r["Contact No."])
-                    )
-                    safe_phone_label = html.escape(display_phone_raw, quote=True)
-                    safe_email_label = html.escape(email_val, quote=True)
-
-                    links_html = ""
-                    if wa_dial and re.fullmatch(r"\d{10,15}", wa_dial):
-                        wa_url = html.escape(
-                            f"https://wa.me/{wa_dial}?text={quote(personalized)}",
-                            quote=True,
+                with sel_col2:
+                    if select_all_filtered:
+                        selected_labels = all_labels
+                        st.caption(
+                            f"Targeting all **{len(selected_labels)}** filtered lead(s). Uncheck to pick specific companies."
                         )
-                        links_html += (
-                            f'<a class="vcard-action-link vcard-wa-btn" '
-                            f'href="{wa_url}" target="_blank" rel="noopener noreferrer">'
-                            f"Send WhatsApp ({safe_phone_label})</a>"
+                    else:
+                        selected_labels = st.multiselect(
+                            "Choose specific companies to include",
+                            options=all_labels,
+                            default=all_labels[: min(5, len(all_labels))],
+                            label_visibility="collapsed",
+                            key=f"camp_multiselect_{camp_city}_{camp_channel}_{camp_keyword}",
                         )
-                    if email_val:
-                        subj = quote(
-                            f"Connecting with {r['Company Name']} — {r['Product / Services']}"
-                        )
-                        mail_url = html.escape(
-                            f"mailto:{quote(email_val)}?subject={subj}&body={quote(personalized)}",
-                            quote=True,
-                        )
-                        links_html += (
-                            f'<a class="vcard-action-link vcard-mail-btn" '
-                            f'href="{mail_url}" target="_blank" rel="noopener noreferrer">'
-                            f"Send Email ({safe_email_label})</a>"
-                        )
-                    if not links_html:
-                        links_html = '<span style="opacity:0.65;font-size:0.85rem;">No WhatsApp or Email saved for this contact.</span>'
 
-                    st.markdown(
-                        f"""
-                        <div class="vcard-outreach-card">
-                            <strong>{safe_company}</strong> · {safe_person}
-                            <span style="opacity:0.75;">({safe_city} | {safe_product})</span><br/>
-                            {links_html}
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
+                selected_ids = {label_to_id[lbl] for lbl in selected_labels}
+                target_df = camp_df[camp_df["Record ID"].isin(selected_ids)].copy()
+
+                if target_df.empty:
+                    st.warning("Please select at least one company above.")
+                else:
+                    templates = {
+                        "Business Intro & Catalog": (
+                            "Hello {person},\n\n"
+                            "Greetings! We saved your contact from {company} ({city}). "
+                            "We'd love to share our latest product catalog and explore working together "
+                            "around {product}.\n\n"
+                            "Please let us know a good time to connect!"
+                        ),
+                        "Trade Fair / Meeting Follow-Up": (
+                            "Hello {person},\n\n"
+                            "It was great connecting with {company}! Following up on our discussion "
+                            "regarding {product} in {city}. Sharing our details here so we stay in touch."
+                        ),
+                        "Seasonal / Special Offer": (
+                            "Hello {person},\n\n"
+                            "Special update for our partners in {city}! We have fresh stock and priority pricing "
+                            "available this month. Reply 'CATALOG' to receive our latest price list for {company}."
+                        ),
+                        "Distributor / B2B Partnership": (
+                            "Hello {person},\n\n"
+                            "We are expanding our partner network in {city} and noticed {company}'s strong presence in "
+                            "{product}. Would you be open to a quick 5-minute call this week?"
+                        ),
+                    }
+
+                    tpl_col1, tpl_col2 = st.columns([1.4, 2.6])
+                    with tpl_col1:
+                        chosen_tpl_name = st.selectbox(
+                            "Campaign Template",
+                            options=[*templates.keys(), "Custom Message"],
+                            key="camp_template_select",
+                        )
+                        email_subject_tpl = st.text_input(
+                            "Email Subject",
+                            value="Connecting regarding {product} — {city}",
+                            key="camp_email_subject_input",
+                        )
+                        st.caption(
+                            "Personalization tags: `{person}`, `{company}`, `{city}`, `{product}`"
+                        )
+                    with tpl_col2:
+                        default_body = (
+                            "Hello {person}, reaching out to {company} regarding {product}."
+                            if chosen_tpl_name == "Custom Message"
+                            else templates[chosen_tpl_name]
+                        )
+                        message_template = st.text_area(
+                            "Message Template (editable)",
+                            value=default_body,
+                            height=130,
+                            key=f"camp_msg_box_{chosen_tpl_name}",
+                        )
+
+                    # Collect all unique emails and all WhatsApp numbers (including 2nd WP numbers)
+                    bulk_emails: list[str] = []
+                    seen_emails: set[str] = set()
+                    all_wa_entries: list[dict[str, str]] = []
+
+                    for _, r in target_df.iterrows():
+                        raw_em = str(r["Email"]).strip()
+                        if raw_em.upper() != "N/A":
+                            for em_part in re.split(r"[,;/|\s]+", raw_em):
+                                clean_em = em_part.strip()
+                                if is_valid_email(clean_em) and clean_em.lower() not in seen_emails:
+                                    seen_emails.add(clean_em.lower())
+                                    bulk_emails.append(clean_em)
+
+                        wa_pairs = extract_all_wa_dial_numbers(
+                            str(r["WhatsApp No."]), str(r["Contact No."])
+                        )
+                        for idx_wp, (disp_num, dial_digits) in enumerate(wa_pairs, start=1):
+                            all_wa_entries.append(
+                                {
+                                    "record_id": str(r["Record ID"]),
+                                    "company": str(r["Company Name"]),
+                                    "disp": disp_num,
+                                    "dial": dial_digits,
+                                    "slot": idx_wp,
+                                }
+                            )
+
+                    # ---- Bulk Email Action Box (Gmail Web + Mail App / Outlook BCC) ----
+                    with st.container(border=True):
+                        st.markdown("#### Bulk Email Launcher (BCC — Private Group Send)")
+                        if not bulk_emails:
+                            st.info("None of the selected leads have a valid email address.")
+                        else:
+                            sample_row = target_df.iloc[0]
+                            bulk_subject = _render_campaign_message(
+                                email_subject_tpl, sample_row
+                            )
+                            # Replace per-company tags with neutral group wording for bulk BCC
+                            bulk_body = message_template
+                            for tag, fallback in (
+                                ("{person}", "Sir/Madam"),
+                                ("{company}", "your team"),
+                                ("{city}", camp_city if camp_city != "All Cities" else "your city"),
+                                ("{product}", camp_keyword.strip() or "your business"),
+                            ):
+                                bulk_body = bulk_body.replace(tag, fallback)
+
+                            bcc_slice = bulk_emails[:MAX_DIRECT_BCC_EMAILS]
+                            gmail_bulk_url = html.escape(
+                                _build_gmail_compose_url(
+                                    bcc_emails=bcc_slice,
+                                    subject=bulk_subject,
+                                    body=bulk_body,
+                                ),
+                                quote=True,
+                            )
+                            mailto_bulk_url = html.escape(
+                                f"mailto:?bcc={quote(','.join(bcc_slice))}&subject={quote(bulk_subject)}&body={quote(bulk_body)}",
+                                quote=True,
+                            )
+
+                            st.caption(
+                                f"**{len(bulk_emails)}** email(s) ready in BCC. "
+                                "Use **Open in Gmail Web** if your device does not have Outlook/Mail App configured."
+                            )
+                            st.markdown(
+                                f'<a class="vcard-action-link vcard-gmail-btn" href="{gmail_bulk_url}" target="_blank" rel="noopener noreferrer">'
+                                f"Open Bulk Email in Gmail Web ({len(bcc_slice)} BCC)</a>"
+                                f'<a class="vcard-action-link vcard-mail-btn" href="{mailto_bulk_url}" target="_blank" rel="noopener noreferrer">'
+                                f"Open Bulk Email in Mail App / Outlook ({len(bcc_slice)} BCC)</a>",
+                                unsafe_allow_html=True,
+                            )
+
+                            if len(bulk_emails) > MAX_DIRECT_BCC_EMAILS:
+                                st.warning(
+                                    f"Direct browser buttons include the first {MAX_DIRECT_BCC_EMAILS} emails to stay within URL limits. "
+                                    f"Copy the full list of {len(bulk_emails)} emails below:"
+                                )
+
+                            with st.expander(
+                                f"Copy All {len(bulk_emails)} Filtered Email Address(es)"
+                            ):
+                                st.code(", ".join(bulk_emails), language=None)
+
+                    # ---- Bulk WhatsApp & Personalized Queue ----
+                    sent_keys: set[str] = st.session_state.setdefault(
+                        "campaign_sent_keys", set()
+                    )
+                    total_wa_targets = len(all_wa_entries)
+                    sent_wa_count = sum(
+                        1
+                        for item in all_wa_entries
+                        if f"{item['record_id']}:{item['dial']}" in sent_keys
                     )
 
-                if len(camp_df) > 25:
-                    st.caption(
-                        f"Showing top 25 contacts on screen. Download the Excel sheet above to access all {len(camp_df)} personalized messages."
-                    )
+                    q_col1, q_col2, q_col3 = st.columns([2.4, 1.3, 1.5])
+                    with q_col1:
+                        st.markdown(
+                            f"#### Individual & Bulk WhatsApp Queue "
+                            f"({sent_wa_count} / {total_wa_targets} marked sent)"
+                        )
+                    with q_col2:
+                        if st.button(
+                            "Reset Sent Marks",
+                            use_container_width=True,
+                            key="btn_reset_camp_sent",
+                        ):
+                            st.session_state["campaign_sent_keys"] = set()
+                            st.rerun()
+                    with q_col3:
+                        # Export full campaign Excel with separate columns for WP #1 & WP #2
+                        campaign_rows = []
+                        for _, r in target_df.iterrows():
+                            personalized = _render_campaign_message(message_template, r)
+                            wa_pairs = extract_all_wa_dial_numbers(
+                                str(r["WhatsApp No."]), str(r["Contact No."])
+                            )
+                            wp1_disp, wp1_dial = wa_pairs[0] if len(wa_pairs) >= 1 else ("N/A", "")
+                            wp2_disp, wp2_dial = wa_pairs[1] if len(wa_pairs) >= 2 else ("N/A", "")
+                            campaign_rows.append(
+                                {
+                                    "Company Name": r["Company Name"],
+                                    "Contact Person": r["Contact Person"],
+                                    "WhatsApp #1": wp1_disp,
+                                    "WhatsApp #2": wp2_disp,
+                                    "Contact No.": r["Contact No."],
+                                    "Email": r["Email"],
+                                    "City": r["City"],
+                                    "Product / Services": r["Product / Services"],
+                                    "Personalized Message": personalized,
+                                    "WhatsApp Link #1": (
+                                        f"https://wa.me/{wp1_dial}?text={quote(personalized)}"
+                                        if wp1_dial
+                                        else "N/A"
+                                    ),
+                                    "WhatsApp Link #2": (
+                                        f"https://wa.me/{wp2_dial}?text={quote(personalized)}"
+                                        if wp2_dial
+                                        else "N/A"
+                                    ),
+                                }
+                            )
+                        st.download_button(
+                            label="Export Campaign (.xlsx)",
+                            data=build_excel_bytes(
+                                pd.DataFrame(campaign_rows), "Campaign Leads"
+                            ),
+                            file_name=f"campaign_outreach_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True,
+                            key="btn_export_campaign_xlsx",
+                        )
+
+                    if all_wa_entries:
+                        with st.expander(
+                            f"WhatsApp Broadcast Helper — Copy All {total_wa_targets} Number(s)"
+                        ):
+                            st.caption(
+                                "Copy these formatted numbers for a WhatsApp Broadcast list on your phone:"
+                            )
+                            st.code(
+                                "\n".join(
+                                    f"{item['company']} — +{item['dial']}"
+                                    for item in all_wa_entries
+                                ),
+                                language=None,
+                            )
+
+                    # Render each filtered card with ALL WhatsApp numbers + both Gmail & Mail App buttons
+                    for _, r in target_df.head(30).iterrows():
+                        rec_id = str(r["Record ID"])
+                        personalized = _render_campaign_message(message_template, r)
+                        subj_text = _render_campaign_message(email_subject_tpl, r)
+                        wa_pairs = extract_all_wa_dial_numbers(
+                            str(r["WhatsApp No."]), str(r["Contact No."])
+                        )
+
+                        raw_email_val = str(r["Email"]).strip()
+                        email_val = (
+                            raw_email_val
+                            if raw_email_val.upper() != "N/A"
+                            and is_valid_email(raw_email_val)
+                            else ""
+                        )
+
+                        safe_company = html.escape(str(r["Company Name"]), quote=True)
+                        safe_person = html.escape(str(r["Contact Person"]), quote=True)
+                        safe_city = html.escape(str(r["City"]), quote=True)
+                        safe_product = html.escape(str(r["Product / Services"]), quote=True)
+
+                        is_card_sent = any(
+                            f"{rec_id}:{dial}" in sent_keys for _, dial in wa_pairs
+                        ) or (f"{rec_id}:email" in sent_keys)
+
+                        links_html = ""
+                        for wp_idx, (disp_num, wa_dial) in enumerate(wa_pairs, start=1):
+                            if re.fullmatch(r"\d{10,15}", wa_dial):
+                                wa_url = html.escape(
+                                    f"https://wa.me/{wa_dial}?text={quote(personalized)}",
+                                    quote=True,
+                                )
+                                wp_tag = (
+                                    f"WhatsApp #{wp_idx}"
+                                    if len(wa_pairs) > 1
+                                    else "Send WhatsApp"
+                                )
+                                links_html += (
+                                    f'<a class="vcard-action-link vcard-wa-btn" '
+                                    f'href="{wa_url}" target="_blank" rel="noopener noreferrer">'
+                                    f"{wp_tag} ({html.escape(disp_num, quote=True)})</a>"
+                                )
+
+                        if email_val:
+                            gmail_url = html.escape(
+                                _build_gmail_compose_url(
+                                    to_email=email_val,
+                                    subject=subj_text,
+                                    body=personalized,
+                                ),
+                                quote=True,
+                            )
+                            mail_url = html.escape(
+                                f"mailto:{quote(email_val)}?subject={quote(subj_text)}&body={quote(personalized)}",
+                                quote=True,
+                            )
+                            safe_email_lbl = html.escape(email_val, quote=True)
+                            links_html += (
+                                f'<a class="vcard-action-link vcard-gmail-btn" '
+                                f'href="{gmail_url}" target="_blank" rel="noopener noreferrer">'
+                                f"Gmail ({safe_email_lbl})</a>"
+                                f'<a class="vcard-action-link vcard-mail-btn" '
+                                f'href="{mail_url}" target="_blank" rel="noopener noreferrer">'
+                                f"Mail App</a>"
+                            )
+
+                        if not links_html:
+                            links_html = '<span style="opacity:0.65;font-size:0.85rem;">No WhatsApp or Email saved for this contact.</span>'
+
+                        sent_badge_html = (
+                            '<span class="vcard-sent-badge">Sent ✓</span>'
+                            if is_card_sent
+                            else ""
+                        )
+                        card_cls = (
+                            "vcard-outreach-card vcard-outreach-card-sent"
+                            if is_card_sent
+                            else "vcard-outreach-card"
+                        )
+
+                        card_c1, card_c2 = st.columns([4.4, 1.1])
+                        with card_c1:
+                            st.markdown(
+                                f"""
+                                <div class="{card_cls}">
+                                    <strong>{safe_company}</strong> · {safe_person}
+                                    <span style="opacity:0.75;">({safe_city} | {safe_product})</span>
+                                    {sent_badge_html}<br/>
+                                    {links_html}
+                                </div>
+                                """,
+                                unsafe_allow_html=True,
+                            )
+                        with card_c2:
+                            st.markdown("<div style='height: 0.45rem'></div>", unsafe_allow_html=True)
+                            if is_card_sent:
+                                if st.button(
+                                    "Undo",
+                                    use_container_width=True,
+                                    key=f"btn_unmark_sent_{rec_id}",
+                                ):
+                                    for _, dial in wa_pairs:
+                                        sent_keys.discard(f"{rec_id}:{dial}")
+                                    sent_keys.discard(f"{rec_id}:email")
+                                    st.rerun()
+                            else:
+                                if st.button(
+                                    "Mark Sent ✓",
+                                    use_container_width=True,
+                                    key=f"btn_mark_sent_{rec_id}",
+                                ):
+                                    for _, dial in wa_pairs:
+                                        sent_keys.add(f"{rec_id}:{dial}")
+                                    if email_val:
+                                        sent_keys.add(f"{rec_id}:email")
+                                    st.rerun()
+
+                    if len(target_df) > 30:
+                        st.caption(
+                            f"Showing top 30 contacts on screen. Download the Excel sheet above to access all {len(target_df)} personalized messages."
+                        )
 
         with tab_ai_growth:
             ai_mode = st.radio(
@@ -4839,6 +5134,7 @@ def main() -> None:
         ("ai_growth_output", None),
         ("ai_pitch_output", None),
         ("otp_sends_this_session", 0),
+        ("campaign_sent_keys", set()),
     ):
         if key not in st.session_state:
             st.session_state[key] = default
