@@ -32,10 +32,12 @@ from gspread.utils import rowcol_to_a1
 from PIL import Image, ImageOps
 from pydantic import BaseModel, Field
 
+from crm_module import format_inr, get_crm_due_summary, render_crm_section
+
 # ---------------------------------------------------------------------------
 # Configuration & Security Constants
 # ---------------------------------------------------------------------------
-SCHEMA_VERSION = "v12_bulk_outreach_and_multi_wp"
+SCHEMA_VERSION = "v13_crm_and_multi_email"
 
 MODEL_CHAIN = [
     "gemini-3.5-flash-lite",
@@ -44,43 +46,38 @@ MODEL_CHAIN = [
     "gemini-3.8-flash",
 ]
 
-# Anti-504 Timeout & Fixed Process-Wide Image Pixel Limit
 PER_REQUEST_TIMEOUT_MS = 22_000
 TOTAL_SCAN_BUDGET_SEC = 45.0
 MAX_IMAGE_SIDE_PX = 1400
 JPEG_QUALITY = 82
-MAX_DECODED_IMAGE_PIXELS = 25_000_000  # 25 megapixels max decoded image size
+MAX_DECODED_IMAGE_PIXELS = 25_000_000
 
-# Set Pillow decompression-bomb limit once at startup (never mutated per request)
 Image.MAX_IMAGE_PIXELS = MAX_DECODED_IMAGE_PIXELS
 
-# Upload & Import Safeguards
 MAX_CARD_IMAGES = 2
-MAX_IMAGE_FILE_BYTES = 5 * 1024 * 1024     # 5 MB max per card image
-MAX_EXCEL_FILE_BYTES = 2 * 1024 * 1024     # 2 MB max per Excel/CSV upload
-MAX_EXCEL_IMPORT_ROWS = 500                # Max 500 non-empty rows per import batch
-MAX_PHYSICAL_ROWS_SCANNED = 2000           # Max 2000 physical rows scanned (including blanks)
-MAX_EXCEL_IMPORT_COLS = 40                 # Max 40 columns per import file
+MAX_IMAGE_FILE_BYTES = 5 * 1024 * 1024
+MAX_EXCEL_FILE_BYTES = 2 * 1024 * 1024
+MAX_EXCEL_IMPORT_ROWS = 500
+MAX_PHYSICAL_ROWS_SCANNED = 2000
+MAX_EXCEL_IMPORT_COLS = 40
 MAX_FIELD_LEN = 250
 MAX_LONG_FIELD_LEN = 800
-MAX_DIRECT_BCC_EMAILS = 45                 # Safe URL length cap for 1-click browser BCC links
+MAX_DIRECT_BCC_EMAILS = 45
 
-# Auth, Session & Rate-Limiting Constants
 MIN_SESSION_SECRET_LEN = 32
 MIN_PASSWORD_LENGTH = 8
 PBKDF2_ITERATIONS = 260_000
 DEFAULT_DAILY_SCAN_LIMIT = 40
-SESSION_TTL_SECONDS = 7 * 24 * 60 * 60     # 7-day revocable session
-OTP_TTL_SECONDS = 10 * 60                  # 10-minute OTP expiry
-MAX_OTP_GUESS_ATTEMPTS = 5                 # Lock OTP after 5 wrong guesses
-OTP_RESEND_COOLDOWN_SEC = 60               # 60s cooldown between OTP sends
-MAX_OTP_SENDS_PER_EMAIL_HOUR = 4           # Max 4 OTP emails per hour per address
-MAX_OTP_SENDS_PER_SESSION = 6              # Max 6 OTP sends per browser session
-MAX_OTP_SENDS_GLOBAL_HOUR = 40             # Global hourly cap across all addresses
-MAX_LOGIN_ATTEMPTS = 5                     # Lock login after 5 failed guesses
-LOGIN_LOCKOUT_SECONDS = 15 * 60            # 15-minute login lockout
+SESSION_TTL_SECONDS = 7 * 24 * 60 * 60
+OTP_TTL_SECONDS = 10 * 60
+MAX_OTP_GUESS_ATTEMPTS = 5
+OTP_RESEND_COOLDOWN_SEC = 60
+MAX_OTP_SENDS_PER_EMAIL_HOUR = 4
+MAX_OTP_SENDS_PER_SESSION = 6
+MAX_OTP_SENDS_GLOBAL_HOUR = 40
+MAX_LOGIN_ATTEMPTS = 5
+LOGIN_LOCKOUT_SECONDS = 15 * 60
 
-# Google Sheets Worksheet Names
 CARDS_WORKSHEET = "visiting_cards"
 USERS_WORKSHEET = "users"
 USAGE_WORKSHEET = "scan_usage"
@@ -90,11 +87,9 @@ SESSIONS_WORKSHEET = "sessions"
 RATE_LIMITS_WORKSHEET = "auth_rate_limits"
 AUDIT_LOGS_WORKSHEET = "audit_logs"
 
-# In-process lock paired with cross-worker optimistic compare-and-verify on Sheets
 _WRITE_LOCK = threading.Lock()
 _T = TypeVar("_T")
 
-# Worksheet Schemas
 CARD_HEADERS = [
     "record_id",
     "user_id",
@@ -158,159 +153,39 @@ STANDARD_FIELD_LABELS_LOWER = {
     "deleted at",
 }
 
-USER_HEADERS = [
-    "user_id",
-    "username",
-    "email",
-    "password_hash",
-    "role",
-    "created_at",
-]
-
-USAGE_HEADERS = [
-    "user_id",
-    "quota_date",
-    "scan_count",
-    "updated_at",
-]
-
-OTP_HEADERS = [
-    "email",
-    "code_hash",
-    "expires_at",
-    "used",
-    "attempts",
-    "created_at",
-]
-
-SESSION_HEADERS = [
-    "session_id",
-    "user_id",
-    "token_hash",
-    "expires_at",
-    "revoked",
-    "created_at",
-]
-
-RATE_LIMIT_HEADERS = [
-    "limit_key",
-    "attempt_count",
-    "window_start",
-    "locked_until",
-]
-
-AUDIT_HEADERS = [
-    "log_id",
-    "user_id",
-    "action",
-    "record_id",
-    "details",
-    "created_at",
-]
+USER_HEADERS = ["user_id", "username", "email", "password_hash", "role", "created_at"]
+USAGE_HEADERS = ["user_id", "quota_date", "scan_count", "updated_at"]
+OTP_HEADERS = ["email", "code_hash", "expires_at", "used", "attempts", "created_at"]
+SESSION_HEADERS = ["session_id", "user_id", "token_hash", "expires_at", "revoked", "created_at"]
+RATE_LIMIT_HEADERS = ["limit_key", "attempt_count", "window_start", "locked_until"]
+AUDIT_HEADERS = ["log_id", "user_id", "action", "record_id", "details", "created_at"]
 
 EXCEL_COLUMN_ALIASES: dict[str, list[str]] = {
     "company_name": [
-        "company name",
-        "company",
-        "business name",
-        "business",
-        "firm name",
-        "firm",
-        "organization",
-        "org",
-        "party name",
-        "party",
-        "shop name",
-        "shop",
-        "client",
+        "company name", "company", "business name", "business", "firm name", "firm",
+        "organization", "org", "party name", "party", "shop name", "shop", "client",
     ],
     "contact_person": [
-        "contact person",
-        "person",
-        "name",
-        "full name",
-        "contact name",
-        "owner",
-        "owner name",
-        "director",
-        "manager",
-        "representative",
+        "contact person", "person", "name", "full name", "contact name", "owner",
+        "owner name", "director", "manager", "representative",
     ],
     "call_phone": [
-        "contact no",
-        "contact no.",
-        "contact number",
-        "call no",
-        "call number",
-        "call",
-        "phone",
-        "phone no",
-        "phone number",
-        "mobile",
-        "mobile no",
-        "mobile number",
-        "telephone",
-        "tel",
-        "landline",
-        "office no",
-        "contact",
+        "contact no", "contact no.", "contact number", "call no", "call number", "call",
+        "phone", "phone no", "phone number", "mobile", "mobile no", "mobile number",
+        "telephone", "tel", "landline", "office no", "contact",
     ],
     "whatsapp_phone": [
-        "whatsapp no",
-        "whatsapp no.",
-        "whatsapp number",
-        "whatsapp",
-        "wp no",
-        "wp number",
-        "wp",
-        "wa no",
-        "wa number",
-        "wa",
+        "whatsapp no", "whatsapp no.", "whatsapp number", "whatsapp", "wp no",
+        "wp number", "wp", "wa no", "wa number", "wa",
     ],
-    "email": [
-        "email",
-        "email id",
-        "email address",
-        "e-mail",
-        "mail",
-        "mail id",
-    ],
+    "email": ["email", "email id", "email address", "e-mail", "mail", "mail id"],
     "products_services": [
-        "product / services",
-        "products / services",
-        "product/services",
-        "products/services",
-        "products",
-        "product",
-        "services",
-        "service",
-        "business type",
-        "category",
-        "items",
-        "dealing in",
+        "product / services", "products / services", "product/services", "products/services",
+        "products", "product", "services", "service", "business type", "category", "items", "dealing in",
     ],
-    "address": [
-        "address",
-        "full address",
-        "office address",
-        "shop address",
-        "factory address",
-        "location",
-    ],
-    "city": [
-        "city",
-        "town",
-        "district",
-        "place",
-    ],
-    "notes": [
-        "notes",
-        "note",
-        "remarks",
-        "remark",
-        "comments",
-        "comment",
-    ],
+    "address": ["address", "full address", "office address", "shop address", "factory address", "location"],
+    "city": ["city", "town", "district", "place"],
+    "notes": ["notes", "note", "remarks", "remark", "comments", "comment"],
 }
 
 FIELD_PLACEHOLDERS = {
@@ -318,7 +193,7 @@ FIELD_PLACEHOLDERS = {
     "contact_person": "e.g., Rajesh Patel (Sales Manager)",
     "call_phone": "e.g., 9876543210 / 07926300000",
     "whatsapp_phone": "e.g., 9876543210 / 9123456789",
-    "email": "e.g., contact@example.com",
+    "email": "e.g., sales@example.com / info@example.com",
     "products_services": "e.g., Industrial Valves, Pumps, Automation",
     "address": "e.g., Plot 12, GIDC Estate, Main Road",
     "city": "e.g., Ahmedabad",
@@ -327,7 +202,7 @@ FIELD_PLACEHOLDERS = {
 }
 
 st.set_page_config(
-    page_title="Company Visiting Card Scanner",
+    page_title="Company Visiting Card Scanner & CRM",
     page_icon="📇",
     layout="wide",
     initial_sidebar_state="auto",
@@ -355,116 +230,51 @@ def inject_clean_ui_css() -> None:
                 display: none !important;
                 visibility: hidden !important;
             }
-
-            .block-container {
-                padding-top: 1.4rem;
-                padding-bottom: 2.5rem;
-                max-width: 1200px;
+            .block-container { padding-top: 1.4rem; padding-bottom: 2.5rem; max-width: 1200px; }
+            .stButton > button, .stDownloadButton > button, .stFormSubmitButton > button {
+                min-height: 2.65rem; border-radius: 8px; font-weight: 500;
             }
-
-            .stButton > button,
-            .stDownloadButton > button,
-            .stFormSubmitButton > button {
-                min-height: 2.65rem;
-                border-radius: 8px;
-                font-weight: 500;
-            }
-
             [data-testid="stImage"] img {
                 max-height: 240px !important;
                 max-width: min(300px, 100%) !important;
-                width: auto !important;
-                height: auto !important;
-                object-fit: contain;
-                border-radius: 8px;
+                width: auto !important; height: auto !important;
+                object-fit: contain; border-radius: 8px;
                 border: 1px solid rgba(128, 128, 128, 0.25);
             }
-            [data-testid="stCameraInput"] {
-                max-width: 420px;
-            }
-
-            .vcard-stat-strip {
-                display: flex;
-                flex-wrap: wrap;
-                gap: 0.65rem;
-                margin: 0.35rem 0 1rem 0;
-            }
+            [data-testid="stCameraInput"] { max-width: 420px; }
+            .vcard-stat-strip { display: flex; flex-wrap: wrap; gap: 0.65rem; margin: 0.35rem 0 1rem 0; }
             .vcard-stat-pill {
-                flex: 1 1 150px;
-                padding: 0.65rem 0.95rem;
-                border-radius: 10px;
-                border: 1px solid rgba(128, 128, 128, 0.22);
-                background: rgba(128, 128, 128, 0.06);
+                flex: 1 1 150px; padding: 0.65rem 0.95rem; border-radius: 10px;
+                border: 1px solid rgba(128, 128, 128, 0.22); background: rgba(128, 128, 128, 0.06);
             }
-            .vcard-stat-label {
-                font-size: 0.78rem;
-                opacity: 0.72;
-                margin-bottom: 0.15rem;
-            }
-            .vcard-stat-value {
-                font-size: 1.15rem;
-                font-weight: 600;
-            }
-
+            .vcard-stat-label { font-size: 0.78rem; opacity: 0.72; margin-bottom: 0.15rem; }
+            .vcard-stat-value { font-size: 1.15rem; font-weight: 600; }
             .vcard-outreach-card {
-                padding: 0.85rem 1rem;
-                border-radius: 10px;
+                padding: 0.85rem 1rem; border-radius: 10px;
                 border: 1px solid rgba(128, 128, 128, 0.22);
-                background: rgba(128, 128, 128, 0.04);
-                margin-bottom: 0.55rem;
+                background: rgba(128, 128, 128, 0.04); margin-bottom: 0.55rem;
             }
-            .vcard-outreach-card-sent {
-                border-left: 4px solid #16a34a;
-                opacity: 0.82;
-            }
+            .vcard-outreach-card-sent { border-left: 4px solid #16a34a; opacity: 0.82; }
             .vcard-action-link {
-                display: inline-block;
-                padding: 0.4rem 0.85rem;
-                border-radius: 6px;
-                text-decoration: none !important;
-                font-size: 0.86rem;
-                font-weight: 600;
-                margin-right: 0.5rem;
-                margin-top: 0.45rem;
+                display: inline-block; padding: 0.4rem 0.85rem; border-radius: 6px;
+                text-decoration: none !important; font-size: 0.86rem; font-weight: 600;
+                margin-right: 0.5rem; margin-top: 0.45rem;
             }
-            .vcard-wa-btn {
-                background: #16a34a;
-                color: #ffffff !important;
-            }
-            .vcard-gmail-btn {
-                background: #dc2626;
-                color: #ffffff !important;
-            }
-            .vcard-mail-btn {
-                background: #2563eb;
-                color: #ffffff !important;
-            }
+            .vcard-wa-btn { background: #16a34a; color: #ffffff !important; }
+            .vcard-gmail-btn { background: #dc2626; color: #ffffff !important; }
+            .vcard-mail-btn { background: #2563eb; color: #ffffff !important; }
             .vcard-sent-badge {
-                display: inline-block;
-                padding: 0.12rem 0.5rem;
-                border-radius: 999px;
-                font-size: 0.75rem;
-                font-weight: 600;
-                background: rgba(22, 163, 74, 0.18);
-                color: #16a34a;
-                margin-left: 0.4rem;
+                display: inline-block; padding: 0.12rem 0.5rem; border-radius: 999px;
+                font-size: 0.75rem; font-weight: 600;
+                background: rgba(22, 163, 74, 0.18); color: #16a34a; margin-left: 0.4rem;
             }
-
             @keyframes vcardSlideDown {
                 from { opacity: 0; transform: translateY(-10px); }
                 to { opacity: 1; transform: translateY(0); }
             }
-            .vcard-form-anchor {
-                scroll-margin-top: 1rem;
-                animation: vcardSlideDown 0.3s ease-out;
-            }
-
+            .vcard-form-anchor { scroll-margin-top: 1rem; animation: vcardSlideDown 0.3s ease-out; }
             @media (max-width: 768px) {
-                .block-container {
-                    padding-top: 0.9rem;
-                    padding-left: 0.85rem;
-                    padding-right: 0.85rem;
-                }
+                .block-container { padding-top: 0.9rem; padding-left: 0.85rem; padding-right: 0.85rem; }
                 h1 { font-size: 1.65rem !important; }
                 h2, h3 { font-size: 1.2rem !important; }
             }
@@ -492,7 +302,6 @@ export default function(component) {
         }
         return;
     }
-
     if (action === "clear") {
         try { localStorage.removeItem(STORAGE_KEY); } catch (e) {}
         if (window.__vcardReportedToken !== "__none__") {
@@ -501,15 +310,11 @@ export default function(component) {
         }
         return;
     }
-
     let existing = "__none__";
     try {
         const val = localStorage.getItem(STORAGE_KEY);
-        if (val && val.trim()) {
-            existing = val.trim();
-        }
+        if (val && val.trim()) existing = val.trim();
     } catch (e) {}
-
     if (window.__vcardReportedToken !== existing) {
         window.__vcardReportedToken = existing;
         setTimeout(() => setStateValue("token", existing), 0);
@@ -528,35 +333,24 @@ export default function(component) {
         const tryCloseMobileSidebar = () => {
             if (window.innerWidth > 900) return;
             const sidebar = document.querySelector('[data-testid="stSidebar"]');
-            if (!sidebar) return;
-            if (sidebar.getAttribute("aria-expanded") === "false") return;
+            if (!sidebar || sidebar.getAttribute("aria-expanded") === "false") return;
             const btn =
                 document.querySelector('[data-testid="stSidebarCollapseButton"] button') ||
                 sidebar.querySelector('[data-testid="stSidebarHeader"] button') ||
-                sidebar.querySelector(
-                    'button[aria-label*="Close"], button[aria-label*="Collapse"], button[kind="headerNoPadding"]'
-                );
+                sidebar.querySelector('button[aria-label*="Close"], button[aria-label*="Collapse"], button[kind="headerNoPadding"]');
             if (btn) btn.click();
         };
         setTimeout(tryCloseMobileSidebar, 60);
         setTimeout(tryCloseMobileSidebar, 240);
     }
-
     if (scrollSeq > 0 && window.__vcardLastScrollSeq !== scrollSeq) {
         window.__vcardLastScrollSeq = scrollSeq;
         const tryScrollToForm = () => {
             const el = document.getElementById("card-entry-form-anchor");
-            if (el) {
-                el.scrollIntoView({ behavior: "smooth", block: "start" });
-                return true;
-            }
+            if (el) { el.scrollIntoView({ behavior: "smooth", block: "start" }); return true; }
             return false;
         };
-        setTimeout(() => {
-            if (!tryScrollToForm()) {
-                setTimeout(tryScrollToForm, 250);
-            }
-        }, 120);
+        setTimeout(() => { if (!tryScrollToForm()) setTimeout(tryScrollToForm, 250); }, 120);
     }
 }
 """
@@ -606,18 +400,8 @@ def _is_transient_sheets_error(exc: Exception) -> bool:
             return True
     msg = str(exc).lower()
     return any(
-        token in msg
-        for token in (
-            "429",
-            "quota exceeded",
-            "rate limit",
-            "too many requests",
-            "503",
-            "502",
-            "500",
-            "timed out",
-            "connection reset",
-        )
+        t in msg
+        for t in ("429", "quota exceeded", "rate limit", "too many requests", "503", "502", "500", "timed out", "connection reset")
     )
 
 
@@ -637,7 +421,7 @@ def _sheets_call_with_retry(fn: Callable[[], _T], attempts: int = 3) -> _T:
 
 
 # ---------------------------------------------------------------------------
-# Secret, Session Signing, Password Policy & Normalization Helpers
+# Secret, Session Signing, Password Policy & Multi-Phone / Multi-Email Helpers
 # ---------------------------------------------------------------------------
 def get_secret(key: str, default: Any = None) -> Any:
     try:
@@ -668,8 +452,7 @@ def get_required_session_signing_key() -> bytes:
     raw_secret = str(get_secret("SESSION_SECRET", "") or "").strip()
     if len(raw_secret) < MIN_SESSION_SECRET_LEN:
         raise ValueError(
-            f"`SESSION_SECRET` is missing or shorter than {MIN_SESSION_SECRET_LEN} characters. "
-            "Generate a random 64-character secret and add `SESSION_SECRET = \"...\"` to Streamlit Secrets."
+            f"`SESSION_SECRET` is missing or shorter than {MIN_SESSION_SECRET_LEN} characters."
         )
     return hashlib.sha256(f"vcard-session-v3:{raw_secret}".encode("utf-8")).digest()
 
@@ -696,10 +479,7 @@ def verify_password(password: str, stored_hash: str) -> bool:
         if algo != "pbkdf2_sha256":
             return False
         dk = hashlib.pbkdf2_hmac(
-            "sha256",
-            password.encode("utf-8"),
-            salt.encode("utf-8"),
-            int(iter_str),
+            "sha256", password.encode("utf-8"), salt.encode("utf-8"), int(iter_str)
         )
         return hmac.compare_digest(dk.hex(), expected_hex)
     except Exception:
@@ -793,20 +573,14 @@ def extract_normalized_phones(phone_str: str) -> set[str]:
 def extract_all_wa_dial_numbers(
     wp_str: str, fallback_call_str: str = ""
 ) -> list[Tuple[str, str]]:
-    """
-    Return ALL unique (display_number, international_wa_digits) pairs for a card
-    so cards with 2+ WhatsApp numbers generate separate 1-click links for each number.
-    """
     results: list[Tuple[str, str]] = []
     seen_dial: set[str] = set()
-
     formatted_wp = format_phone_numbers(wp_str)
     sources = (
         [formatted_wp]
         if formatted_wp != "N/A"
         else [format_phone_numbers(fallback_call_str)]
     )
-
     for candidate in sources:
         if not candidate or candidate == "N/A":
             continue
@@ -824,20 +598,48 @@ def extract_all_wa_dial_numbers(
             if dial not in seen_dial:
                 seen_dial.add(dial)
                 results.append((clean_disp, dial))
-
     return results
 
 
-def extract_primary_wa_dial_number(wp_str: str, fallback_call_str: str = "") -> str:
-    pairs = extract_all_wa_dial_numbers(wp_str, fallback_call_str)
-    return pairs[0][1] if pairs else ""
+def parse_email_list(raw: str) -> list[str]:
+    """Extract all valid, deduplicated lowercase email addresses from a string."""
+    if not raw or str(raw).strip().upper() in ("N/A", "NAN", "NONE"):
+        return []
+    parts = re.split(r"[,/;\|\n\s]+", str(raw).strip())
+    emails: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        cleaned = part.strip().strip("<>()[]\"'").lower()
+        if not cleaned or cleaned in ("n/a", "nan", "none"):
+            continue
+        if is_valid_email(cleaned) and cleaned not in seen:
+            seen.add(cleaned)
+            emails.append(cleaned)
+    return emails
+
+
+def format_emails(raw: str) -> str:
+    """Format one or multiple emails into a single column string separated by ' / '."""
+    emails = parse_email_list(raw)
+    return " / ".join(emails) if emails else "N/A"
+
+
+def are_all_emails_valid(raw: str) -> bool:
+    """Return True if blank/N/A or every delimited token is a valid email address."""
+    if not raw or str(raw).strip().upper() in ("", "N/A", "NAN", "NONE"):
+        return True
+    tokens = [
+        t.strip()
+        for t in re.split(r"[,/;\|\n]+", str(raw).strip())
+        if t.strip()
+    ]
+    if not tokens:
+        return True
+    return all(is_valid_email(t.lower()) for t in tokens)
 
 
 def extract_normalized_emails(email_str: str) -> set[str]:
-    if not email_str or email_str.strip().upper() == "N/A":
-        return set()
-    parts = re.split(r"[,;/|\s]+", email_str.strip().lower())
-    return {p for p in parts if is_valid_email(p)}
+    return set(parse_email_list(email_str))
 
 
 # ---------------------------------------------------------------------------
@@ -1108,7 +910,12 @@ class VisitingCard(BaseModel):
         )
     )
     email: str = Field(
-        description="Email address in English (Latin script). Return 'N/A' if missing."
+        description=(
+            "All email address(es) printed on the card in English (Latin script, lowercase), "
+            "separated by ' / ' if there are 2 or more (example: 'sales@company.com / info@company.com'). "
+            "Keep every email printed on the card in this single field — do NOT put a second email in extra_details. "
+            "Return 'N/A' if missing."
+        )
     )
     products_services: str = Field(
         description=(
@@ -1147,16 +954,19 @@ def _clean_card_output(card: VisitingCard) -> Tuple[VisitingCard, dict[str, str]
     raw_city = sanitize_text_field(card.city, 100)
     clean_city = raw_city if raw_city and raw_city.upper() != "N/A" else "N/A"
 
+    collected_emails = parse_email_list(card.email)
     extra_dict: dict[str, str] = {}
     for item in card.extra_details or []:
         lbl = sanitize_text_field(item.label, 80)
         val = sanitize_text_field(item.value, MAX_FIELD_LEN)
-        if (
-            lbl
-            and val
-            and val.upper() != "N/A"
-            and lbl.lower() not in STANDARD_FIELD_LABELS_LOWER
-        ):
+        if not lbl or not val or val.upper() == "N/A":
+            continue
+        if "email" in lbl.lower() or "mail" in lbl.lower():
+            for extra_em in parse_email_list(val):
+                if extra_em not in collected_emails:
+                    collected_emails.append(extra_em)
+            continue
+        if lbl.lower() not in STANDARD_FIELD_LABELS_LOWER:
             extra_dict[lbl] = val
 
     cleaned = card.model_copy(
@@ -1165,7 +975,7 @@ def _clean_card_output(card: VisitingCard) -> Tuple[VisitingCard, dict[str, str]
             "contact_person": sanitize_text_field(card.contact_person, MAX_FIELD_LEN) or "N/A",
             "call_phone": format_phone_numbers(card.call_phone),
             "whatsapp_phone": format_phone_numbers(card.whatsapp_phone),
-            "email": sanitize_text_field(card.email, 160) or "N/A",
+            "email": " / ".join(collected_emails) if collected_emails else "N/A",
             "products_services": sanitize_text_field(card.products_services, MAX_FIELD_LEN) or "N/A",
             "address": sanitize_text_field(card.address, MAX_LONG_FIELD_LEN) or "N/A",
             "city": clean_city,
@@ -1180,18 +990,13 @@ def _clean_card_output(card: VisitingCard) -> Tuple[VisitingCard, dict[str, str]
 @st.cache_resource(show_spinner=False)
 def get_spreadsheet(_schema_version: str = SCHEMA_VERSION) -> gspread.Spreadsheet:
     get_required_session_signing_key()
-
     creds_section = get_secret("gcp_service_account")
     sheet_url = get_secret("GSHEET_URL")
-
     if not creds_section or not sheet_url:
         raise ValueError(
-            "Google Sheets is not configured. Add `GSHEET_URL` and "
-            "`[gcp_service_account]` to Streamlit Secrets."
+            "Google Sheets is not configured. Add `GSHEET_URL` and `[gcp_service_account]` to Streamlit Secrets."
         )
-
-    creds_dict = dict(creds_section)
-    client = gspread.service_account_from_dict(creds_dict)
+    client = gspread.service_account_from_dict(dict(creds_section))
     spreadsheet = _sheets_call_with_retry(
         lambda: client.open_by_url(str(sheet_url).strip())
     )
@@ -1218,9 +1023,7 @@ def _migrate_cards_worksheet_if_needed(cards_ws: gspread.Worksheet) -> None:
     ]
     if normalized_headers == CARD_HEADERS:
         if normalized_headers != current_headers:
-            cards_ws.update(
-                values=[CARD_HEADERS], range_name="A1", value_input_option="RAW"
-            )
+            cards_ws.update(values=[CARD_HEADERS], range_name="A1", value_input_option="RAW")
         return
 
     allowed_card_cols = set(CARD_HEADERS) | {"phone"}
@@ -1237,20 +1040,16 @@ def _migrate_cards_worksheet_if_needed(cards_ws: gspread.Worksheet) -> None:
             continue
         padded = row + [""] * (len(normalized_headers) - len(row))
         old_rec = dict(zip(normalized_headers, padded))
-
-        wp_val = format_phone_numbers(
-            old_rec.get("whatsapp_phone") or old_rec.get("phone") or "N/A"
-        )
-        call_val = format_phone_numbers(old_rec.get("call_phone") or "N/A")
-
         new_rec = {
             "record_id": old_rec.get("record_id") or str(uuid.uuid4()),
             "user_id": old_rec.get("user_id", "default_user"),
             "company_name": old_rec.get("company_name", "N/A"),
             "contact_person": old_rec.get("contact_person", "N/A"),
-            "call_phone": call_val,
-            "whatsapp_phone": wp_val,
-            "email": old_rec.get("email", "N/A"),
+            "call_phone": format_phone_numbers(old_rec.get("call_phone") or "N/A"),
+            "whatsapp_phone": format_phone_numbers(
+                old_rec.get("whatsapp_phone") or old_rec.get("phone") or "N/A"
+            ),
+            "email": format_emails(old_rec.get("email", "N/A")),
             "products_services": old_rec.get("products_services", "N/A"),
             "address": old_rec.get("address", "N/A"),
             "city": old_rec.get("city", "N/A") or "N/A",
@@ -1261,11 +1060,7 @@ def _migrate_cards_worksheet_if_needed(cards_ws: gspread.Worksheet) -> None:
         }
         migrated_rows.append([new_rec[col] for col in CARD_HEADERS])
 
-    cards_ws.update(
-        values=migrated_rows,
-        range_name="A1",
-        value_input_option="RAW",
-    )
+    cards_ws.update(values=migrated_rows, range_name="A1", value_input_option="RAW")
 
 
 def _migrate_or_validate_worksheet(
@@ -1298,8 +1093,7 @@ def _migrate_or_validate_worksheet(
     unknown_cols = [h for h in trimmed_headers if h not in expected_headers]
     if unknown_cols or len(set(trimmed_headers)) != len(trimmed_headers):
         raise ValueError(
-            f"Schema mismatch in worksheet '{sheet_label}': expected headers {expected_headers}, "
-            f"but found {trimmed_headers}."
+            f"Schema mismatch in worksheet '{sheet_label}': expected {expected_headers}, found {trimmed_headers}."
         )
 
     if ws.col_count < len(expected_headers):
@@ -1455,7 +1249,7 @@ def fetch_user_audit_logs(
 
 
 # ---------------------------------------------------------------------------
-# Rate Limiting & Lockout Protection (Cached Reads + Retry on 429)
+# Rate Limiting & Lockout Protection
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=15, show_spinner=False)
 def _fetch_rate_limit_rows() -> list[list[str]]:
@@ -2472,7 +2266,7 @@ def _rows_to_user_df(
                     "WhatsApp No.": format_phone_numbers(
                         record.get("whatsapp_phone", "N/A")
                     ),
-                    "Email": record.get("email", "N/A") or "N/A",
+                    "Email": format_emails(record.get("email", "N/A")),
                     "Product / Services": record.get("products_services", "N/A") or "N/A",
                     "Address": record.get("address", "N/A") or "N/A",
                     "City": record.get("city", "N/A") or "N/A",
@@ -2608,7 +2402,7 @@ def save_record_atomic(
             sanitize_text_field(contact_person, MAX_FIELD_LEN) or "N/A",
             format_phone_numbers(call_phone),
             format_phone_numbers(whatsapp_phone),
-            sanitize_text_field(email, 160) or "N/A",
+            format_emails(email),
             sanitize_text_field(products_services, MAX_FIELD_LEN) or "N/A",
             sanitize_text_field(address, MAX_LONG_FIELD_LEN) or "N/A",
             sanitize_text_field(city, 100) or "N/A",
@@ -2687,8 +2481,7 @@ def merge_excel_records_atomic(
 
             formatted_call = format_phone_numbers(raw_vals["call_phone"])
             formatted_wp = format_phone_numbers(raw_vals["whatsapp_phone"])
-            raw_email = sanitize_text_field(raw_vals["email"], 160)
-            clean_email = raw_email if is_valid_email(raw_email.lower()) else "N/A"
+            clean_email = format_emails(raw_vals["email"])
 
             row_phones = extract_normalized_phones(
                 formatted_call
@@ -2791,7 +2584,7 @@ def update_record(
                     sanitize_text_field(contact_person, MAX_FIELD_LEN) or "N/A",
                     format_phone_numbers(call_phone),
                     format_phone_numbers(whatsapp_phone),
-                    sanitize_text_field(email, 160) or "N/A",
+                    format_emails(email),
                     sanitize_text_field(products_services, MAX_FIELD_LEN) or "N/A",
                     sanitize_text_field(address, MAX_LONG_FIELD_LEN) or "N/A",
                     sanitize_text_field(city, 100) or "N/A",
@@ -3155,8 +2948,7 @@ def preview_excel_merge_rows(
         if not has_at_least_one_field(*raw_vals.values(), *extra_dict.values()):
             continue
 
-        raw_email = sanitize_text_field(raw_vals["email"], 160)
-        clean_email = raw_email if is_valid_email(raw_email.lower()) else "N/A"
+        clean_email = format_emails(raw_vals["email"])
         preview.append(
             {
                 "company_name": sanitize_text_field(raw_vals["company_name"], MAX_FIELD_LEN) or "N/A",
@@ -3223,6 +3015,10 @@ def extract_card_details(
         "put ALL of them in `whatsapp_phone` separated by ' / ' and set `call_phone` to 'N/A'.\n"
         "- If icons or text DO specify which number is WhatsApp and which is for normal Call/Office/Landline, "
         "separate them accordingly into `whatsapp_phone` and `call_phone`.\n\n"
+        "EMAIL RULE:\n"
+        "- Extract ALL email addresses printed anywhere on the card (front or back) into the single `email` field, "
+        "in lowercase, separated by ' / ' (example: 'sales@company.com / info@company.com'). "
+        "Never move a second email into `extra_details`.\n\n"
         "CITY RULE:\n"
         "- Put ONLY the clean English city/town name in `city` (e.g., 'Ahmedabad', 'Mumbai', 'Kapadvanj', 'Dakor'). "
         "Do not put street, state, or PIN code in `city`. Infer from the address or PIN code if unambiguous; else 'N/A'.\n\n"
@@ -3443,7 +3239,7 @@ def render_auth_screen() -> None:
     with center_col:
         st.title("Company Visiting Card Scanner")
         st.caption(
-            "Sign in or create an account to scan, organize, analyze, and export your visiting cards."
+            "Sign in or create an account to scan, organize, manage CRM deals, and export your visiting cards."
         )
 
         with st.container(border=True):
@@ -3663,7 +3459,7 @@ def render_auth_screen() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Analyze & Growth Hub (Bulk WhatsApp, Multi-WP Support & Bulk Gmail/Mail BCC)
+# Analyze & Growth Hub (Bulk WhatsApp, Multi-WP, Multi-Email & Bulk BCC)
 # ---------------------------------------------------------------------------
 def _compute_analytics_tables(
     df: pd.DataFrame,
@@ -3675,7 +3471,7 @@ def _compute_analytics_tables(
     has_wp = df["WhatsApp No."].apply(lambda x: str(x).strip().upper() != "N/A")
     has_call = df["Contact No."].apply(lambda x: str(x).strip().upper() != "N/A")
     has_any_phone = has_wp | has_call
-    has_email = df["Email"].apply(lambda x: str(x).strip().upper() != "N/A")
+    has_email = df["Email"].apply(lambda x: bool(parse_email_list(str(x))))
     has_city = df["City"].apply(lambda x: str(x).strip().upper() != "N/A")
     has_website = df["Extra Details"].str.contains(
         r"website|www\.|http|\.com|\.in|\.org|\.net", case=False, na=False
@@ -3820,7 +3616,6 @@ def _build_gmail_compose_url(
     subject: str = "",
     body: str = "",
 ) -> str:
-    """Build a direct Gmail Web compose URL that works on every browser without mailto: handlers."""
     params = ["view=cm", "fs=1"]
     if to_email:
         params.append(f"to={quote(to_email)}")
@@ -3954,11 +3749,10 @@ def render_analyze_section(
                     use_container_width=True,
                 )
 
-        # ---- Bulk WhatsApp & Bulk Email Campaign Launcher ----
         with tab_outreach:
             st.caption(
-                "Filter your contacts by City, Product/Service, or Channel to launch Bulk Email (BCC) "
-                "and Bulk WhatsApp outreach—including cards with 2 WhatsApp numbers."
+                "Filter contacts by City, Product/Service, or Channel to launch Bulk Email (BCC) "
+                "and WhatsApp outreach—supporting cards with multiple WhatsApp numbers or emails."
             )
 
             unique_cities = sorted(
@@ -4007,7 +3801,7 @@ def render_analyze_section(
                 lambda x: str(x).strip().upper() != "N/A"
             )
             has_email_mask = camp_df["Email"].apply(
-                lambda x: str(x).strip().upper() != "N/A" and is_valid_email(str(x).strip())
+                lambda x: bool(parse_email_list(str(x)))
             )
 
             if camp_channel == "WhatsApp Ready Only":
@@ -4020,7 +3814,6 @@ def render_analyze_section(
             if camp_df.empty:
                 st.warning("No leads match the selected campaign filters.")
             else:
-                # Optional company multi-select so the user can include/exclude specific filtered leads
                 label_to_id: dict[str, str] = {}
                 for _, r in camp_df.iterrows():
                     lbl = f"{r['Company Name']} ({r['City']}) [{str(r['Record ID'])[:8]}]"
@@ -4108,19 +3901,15 @@ def render_analyze_section(
                             key=f"camp_msg_box_{chosen_tpl_name}",
                         )
 
-                    # Collect all unique emails and all WhatsApp numbers (including 2nd WP numbers)
                     bulk_emails: list[str] = []
                     seen_emails: set[str] = set()
                     all_wa_entries: list[dict[str, str]] = []
 
                     for _, r in target_df.iterrows():
-                        raw_em = str(r["Email"]).strip()
-                        if raw_em.upper() != "N/A":
-                            for em_part in re.split(r"[,;/|\s]+", raw_em):
-                                clean_em = em_part.strip()
-                                if is_valid_email(clean_em) and clean_em.lower() not in seen_emails:
-                                    seen_emails.add(clean_em.lower())
-                                    bulk_emails.append(clean_em)
+                        for clean_em in parse_email_list(str(r["Email"])):
+                            if clean_em not in seen_emails:
+                                seen_emails.add(clean_em)
+                                bulk_emails.append(clean_em)
 
                         wa_pairs = extract_all_wa_dial_numbers(
                             str(r["WhatsApp No."]), str(r["Contact No."])
@@ -4132,11 +3921,10 @@ def render_analyze_section(
                                     "company": str(r["Company Name"]),
                                     "disp": disp_num,
                                     "dial": dial_digits,
-                                    "slot": idx_wp,
+                                    "slot": str(idx_wp),
                                 }
                             )
 
-                    # ---- Bulk Email Action Box (Gmail Web + Mail App / Outlook BCC) ----
                     with st.container(border=True):
                         st.markdown("#### Bulk Email Launcher (BCC — Private Group Send)")
                         if not bulk_emails:
@@ -4146,7 +3934,6 @@ def render_analyze_section(
                             bulk_subject = _render_campaign_message(
                                 email_subject_tpl, sample_row
                             )
-                            # Replace per-company tags with neutral group wording for bulk BCC
                             bulk_body = message_template
                             for tag, fallback in (
                                 ("{person}", "Sir/Madam"),
@@ -4171,7 +3958,7 @@ def render_analyze_section(
                             )
 
                             st.caption(
-                                f"**{len(bulk_emails)}** email(s) ready in BCC. "
+                                f"**{len(bulk_emails)}** email(s) ready in BCC (including multiple emails per card). "
                                 "Use **Open in Gmail Web** if your device does not have Outlook/Mail App configured."
                             )
                             st.markdown(
@@ -4193,7 +3980,6 @@ def render_analyze_section(
                             ):
                                 st.code(", ".join(bulk_emails), language=None)
 
-                    # ---- Bulk WhatsApp & Personalized Queue ----
                     sent_keys: set[str] = st.session_state.setdefault(
                         "campaign_sent_keys", set()
                     )
@@ -4219,7 +4005,6 @@ def render_analyze_section(
                             st.session_state["campaign_sent_keys"] = set()
                             st.rerun()
                     with q_col3:
-                        # Export full campaign Excel with separate columns for WP #1 & WP #2
                         campaign_rows = []
                         for _, r in target_df.iterrows():
                             personalized = _render_campaign_message(message_template, r)
@@ -4277,7 +4062,6 @@ def render_analyze_section(
                                 language=None,
                             )
 
-                    # Render each filtered card with ALL WhatsApp numbers + both Gmail & Mail App buttons
                     for _, r in target_df.head(30).iterrows():
                         rec_id = str(r["Record ID"])
                         personalized = _render_campaign_message(message_template, r)
@@ -4285,14 +4069,7 @@ def render_analyze_section(
                         wa_pairs = extract_all_wa_dial_numbers(
                             str(r["WhatsApp No."]), str(r["Contact No."])
                         )
-
-                        raw_email_val = str(r["Email"]).strip()
-                        email_val = (
-                            raw_email_val
-                            if raw_email_val.upper() != "N/A"
-                            and is_valid_email(raw_email_val)
-                            else ""
-                        )
+                        email_list = parse_email_list(str(r["Email"]))
 
                         safe_company = html.escape(str(r["Company Name"]), quote=True)
                         safe_person = html.escape(str(r["Contact Person"]), quote=True)
@@ -4321,20 +4098,23 @@ def render_analyze_section(
                                     f"{wp_tag} ({html.escape(disp_num, quote=True)})</a>"
                                 )
 
-                        if email_val:
+                        if email_list:
+                            joined_to = ",".join(email_list)
                             gmail_url = html.escape(
                                 _build_gmail_compose_url(
-                                    to_email=email_val,
+                                    to_email=joined_to,
                                     subject=subj_text,
                                     body=personalized,
                                 ),
                                 quote=True,
                             )
                             mail_url = html.escape(
-                                f"mailto:{quote(email_val)}?subject={quote(subj_text)}&body={quote(personalized)}",
+                                f"mailto:{quote(joined_to)}?subject={quote(subj_text)}&body={quote(personalized)}",
                                 quote=True,
                             )
-                            safe_email_lbl = html.escape(email_val, quote=True)
+                            safe_email_lbl = html.escape(
+                                " / ".join(email_list), quote=True
+                            )
                             links_html += (
                                 f'<a class="vcard-action-link vcard-gmail-btn" '
                                 f'href="{gmail_url}" target="_blank" rel="noopener noreferrer">'
@@ -4391,7 +4171,7 @@ def render_analyze_section(
                                 ):
                                     for _, dial in wa_pairs:
                                         sent_keys.add(f"{rec_id}:{dial}")
-                                    if email_val:
+                                    if email_list:
                                         sent_keys.add(f"{rec_id}:email")
                                     st.rerun()
 
@@ -4847,13 +4627,11 @@ def _render_update_record_body(
 
         if update_submitted:
             parsed_extra = parse_extra_data_from_input(upd_extra_text)
-            clean_upd_email = sanitize_text_field(upd_email, 160)
-            if (
-                clean_upd_email
-                and clean_upd_email.upper() != "N/A"
-                and not is_valid_email(clean_upd_email)
-            ):
-                st.error("Please enter a valid email address (or leave it as N/A).")
+            clean_upd_email = sanitize_text_field(upd_email, 220)
+            if not are_all_emails_valid(clean_upd_email):
+                st.error(
+                    "Please enter valid email address(es) separated by ' / ' (or leave it as N/A)."
+                )
             elif not has_at_least_one_field(
                 upd_company,
                 upd_contact,
@@ -5200,6 +4978,7 @@ def main() -> None:
 
         nav_items = [
             ("home", "Home"),
+            ("crm", "CRM Pipeline"),
             ("show", "Show Records"),
             ("analyze", "Analyze & Growth"),
             ("update", "Update Record"),
@@ -5272,7 +5051,7 @@ def main() -> None:
     trigger_ui_bridge()
 
     # ---- Clean Page Header & Escaped Quick-Stats Strip ----
-    st.title("Company Visiting Card Scanner")
+    st.title("Company Visiting Card Scanner & CRM")
     safe_username_html = html.escape(str(current_username), quote=True)
     st.markdown(
         f"""
@@ -5312,6 +5091,16 @@ def main() -> None:
         st.session_state["flash_info"] = None
 
     # ---- Dedicated Sidebar Views ----
+    if active_view == "crm":
+        render_crm_section(
+            spreadsheet=get_spreadsheet(SCHEMA_VERSION),
+            all_records_df=all_records_df,
+            current_user_id=current_user_id,
+            current_username=current_username,
+            build_multi_sheet_excel_fn=build_multi_sheet_excel_bytes,
+        )
+        return
+
     if active_view == "show":
         render_show_records_section(
             all_records_df=all_records_df,
@@ -5357,6 +5146,27 @@ def main() -> None:
             key_prefix="nav_trash",
         )
         return
+
+    # ---- Home-Page CRM Follow-Up Reminder Banner ----
+    overdue_cnt, due_today_cnt, open_pipe_val = get_crm_due_summary(
+        get_spreadsheet(SCHEMA_VERSION), all_records_df, current_user_id
+    )
+    if overdue_cnt > 0 or due_today_cnt > 0:
+        alert_col1, alert_col2 = st.columns([4.0, 1.3])
+        with alert_col1:
+            st.warning(
+                f"**CRM Reminder:** You have **{overdue_cnt}** overdue and **{due_today_cnt}** due-today "
+                f"follow-up(s) · Open Pipeline: **{format_inr(open_pipe_val)}**."
+            )
+        with alert_col2:
+            if st.button(
+                "Open CRM Queue",
+                type="primary",
+                use_container_width=True,
+                key="btn_home_open_crm",
+            ):
+                st.session_state["active_view"] = "crm"
+                st.rerun()
 
     # ---- HOME VIEW: Step 1 (Upload / Camera / Merge Excel + Manual Entry) ----
     upload_rev = st.session_state["uploader_reset_counter"]
@@ -5829,13 +5639,11 @@ def main() -> None:
 
                     if submitted:
                         parsed_extra = parse_extra_data_from_input(extra_details_text)
-                        clean_email_val = sanitize_text_field(email, 160)
-                        if (
-                            clean_email_val
-                            and clean_email_val.upper() != "N/A"
-                            and not is_valid_email(clean_email_val)
-                        ):
-                            st.error("Please enter a valid email address (or leave it blank / N/A).")
+                        clean_email_val = sanitize_text_field(email, 220)
+                        if not are_all_emails_valid(clean_email_val):
+                            st.error(
+                                "Please enter valid email address(es) separated by ' / ' (or leave blank / N/A)."
+                            )
                         elif not has_at_least_one_field(
                             company_name,
                             contact_person,
