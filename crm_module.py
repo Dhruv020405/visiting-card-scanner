@@ -12,12 +12,26 @@ import pandas as pd
 import streamlit as st
 from gspread.exceptions import APIError as GSpreadAPIError
 
+from rbac_org import (
+    ROLE_ADMIN,
+    ROLE_COMPANY_HEAD,
+    ROLE_EMPLOYEE,
+    ROLE_USER,
+    can_access_crm,
+    get_company_by_id,
+    get_company_members,
+    get_role_badge_label,
+    normalize_role,
+)
+
 CRM_PIPELINE_WORKSHEET = "crm_pipeline"
 CRM_ACTIVITIES_WORKSHEET = "crm_activities"
 
 CRM_PIPELINE_HEADERS = [
     "record_id",
     "user_id",
+    "company_id",
+    "assigned_to",
     "lead_stage",
     "priority",
     "deal_value",
@@ -30,11 +44,13 @@ CRM_PIPELINE_HEADERS = [
 CRM_ACTIVITY_HEADERS = [
     "activity_id",
     "user_id",
+    "company_id",
     "record_id",
     "activity_type",
     "summary",
     "stage_after",
     "next_followup",
+    "logged_by_name",
     "created_at",
 ]
 
@@ -69,12 +85,7 @@ STAGE_COLORS: dict[str, str] = {
 }
 
 CRM_PRIORITIES = ["Hot", "Warm", "Cold"]
-
-PRIORITY_COLORS: dict[str, str] = {
-    "Hot": "#dc2626",
-    "Warm": "#d97706",
-    "Cold": "#0284c7",
-}
+PRIORITY_COLORS: dict[str, str] = {"Hot": "#dc2626", "Warm": "#d97706", "Cold": "#0284c7"}
 
 CRM_SOURCES = [
     "Visiting Card Scan",
@@ -92,6 +103,7 @@ ACTIVITY_TYPES = [
     "Email Sent",
     "Meeting / Visit",
     "Quote Shared",
+    "Lead Assigned",
     "Stage Updated",
     "Note",
 ]
@@ -122,7 +134,6 @@ def _retry_sheets(fn: Callable[[], _T], attempts: int = 3) -> _T:
 
 
 def format_inr(amount: float) -> str:
-    """Format numeric values using Indian numbering (e.g., ₹1,25,000)."""
     try:
         val = int(round(float(amount)))
     except Exception:
@@ -165,6 +176,19 @@ def _normalize_company_key(company_name: str) -> str:
     return cleaned or raw
 
 
+def _parse_emails(raw_email: str) -> list[str]:
+    if not raw_email or str(raw_email).strip().upper() == "N/A":
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for part in re.split(r"[,;/\|\s]+", str(raw_email).strip()):
+        em = part.strip().lower()
+        if re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", em) and em not in seen:
+            seen.add(em)
+            out.append(em)
+    return out
+
+
 def _get_or_init_ws(
     spreadsheet: gspread.Spreadsheet, title: str, headers: list[str]
 ) -> gspread.Worksheet:
@@ -200,7 +224,9 @@ def _get_or_init_ws(
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def _fetch_pipeline_rows(_spreadsheet_id: str, user_id: str) -> dict[str, dict[str, str]]:
+def _fetch_pipeline_rows(
+    _spreadsheet_id: str, scope_key: str, company_id: str, user_id: str, role: str
+) -> dict[str, dict[str, str]]:
     ss = st.session_state["_crm_spreadsheet_ref"]
     ws = _get_or_init_ws(ss, CRM_PIPELINE_WORKSHEET, CRM_PIPELINE_HEADERS)
     rows = _retry_sheets(ws.get_all_values)
@@ -213,13 +239,22 @@ def _fetch_pipeline_rows(_spreadsheet_id: str, user_id: str) -> dict[str, dict[s
             continue
         padded = row + [""] * (len(headers) - len(row))
         rec = dict(zip(headers, padded))
-        if rec.get("user_id") == user_id and rec.get("record_id"):
-            result[rec["record_id"]] = rec
+        rid = rec.get("record_id", "")
+        if not rid:
+            continue
+        if role == ROLE_ADMIN:
+            result[rid] = rec
+        elif company_id and rec.get("company_id") == company_id:
+            result[rid] = rec
+        elif not rec.get("company_id") and rec.get("user_id") == user_id:
+            result[rid] = rec
     return result
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def _fetch_activity_rows(_spreadsheet_id: str, user_id: str) -> list[dict[str, str]]:
+def _fetch_activity_rows(
+    _spreadsheet_id: str, scope_key: str, company_id: str, user_id: str, role: str
+) -> list[dict[str, str]]:
     ss = st.session_state["_crm_spreadsheet_ref"]
     ws = _get_or_init_ws(ss, CRM_ACTIVITIES_WORKSHEET, CRM_ACTIVITY_HEADERS)
     rows = _retry_sheets(ws.get_all_values)
@@ -232,7 +267,11 @@ def _fetch_activity_rows(_spreadsheet_id: str, user_id: str) -> list[dict[str, s
             continue
         padded = row + [""] * (len(headers) - len(row))
         rec = dict(zip(headers, padded))
-        if rec.get("user_id") == user_id:
+        if role == ROLE_ADMIN:
+            out.append(rec)
+        elif company_id and rec.get("company_id") == company_id:
+            out.append(rec)
+        elif not rec.get("company_id") and rec.get("user_id") == user_id:
             out.append(rec)
     return out[::-1]
 
@@ -240,14 +279,21 @@ def _fetch_activity_rows(_spreadsheet_id: str, user_id: str) -> list[dict[str, s
 def get_crm_due_summary(
     spreadsheet: gspread.Spreadsheet,
     all_records_df: pd.DataFrame,
-    current_user_id: str,
+    current_user: dict[str, str],
 ) -> Tuple[int, int, float]:
-    """Return (overdue_count, due_today_count, open_pipeline_inr) using cached CRM data."""
-    if all_records_df.empty:
+    if not can_access_crm(current_user) or all_records_df.empty:
         return 0, 0, 0.0
+
+    user_id = str(current_user.get("user_id", ""))
+    company_id = str(current_user.get("company_id", ""))
+    role = normalize_role(current_user.get("role", ROLE_USER), current_user.get("email", ""))
+    scope_key = f"{role}:{company_id}:{user_id}"
+
     st.session_state["_crm_spreadsheet_ref"] = spreadsheet
     try:
-        pipeline_map = _fetch_pipeline_rows(spreadsheet.id, current_user_id)
+        pipeline_map = _fetch_pipeline_rows(
+            spreadsheet.id, scope_key, company_id, user_id, role
+        )
     except Exception:
         return 0, 0, 0.0
 
@@ -259,6 +305,9 @@ def get_crm_due_summary(
     for _, r in all_records_df.iterrows():
         rid = str(r["Record ID"])
         meta = pipeline_map.get(rid, {})
+        assignee = str(meta.get("assigned_to") or r.get("Assigned To") or user_id).strip()
+        if role == ROLE_EMPLOYEE and assignee not in (user_id, ""):
+            continue
         stage = meta.get("lead_stage") if meta.get("lead_stage") in CRM_STAGES else "New Lead"
         if stage in ("Won", "Lost"):
             continue
@@ -275,6 +324,8 @@ def get_crm_due_summary(
 def upsert_crm_pipeline(
     spreadsheet: gspread.Spreadsheet,
     user_id: str,
+    company_id: str,
+    assigned_to: str,
     record_id: str,
     lead_stage: str,
     priority: str,
@@ -287,9 +338,13 @@ def upsert_crm_pipeline(
     clean_val = str(int(round(max(0.0, float(deal_value)))))
     clean_stage = lead_stage if lead_stage in CRM_STAGES else "New Lead"
     clean_prio = priority if priority in CRM_PRIORITIES else "Warm"
+    clean_assignee = assigned_to.strip() or user_id
+
     new_row = [
         record_id,
         user_id,
+        company_id.strip(),
+        clean_assignee,
         clean_stage,
         clean_prio,
         clean_val,
@@ -302,11 +357,11 @@ def upsert_crm_pipeline(
         ws = _get_or_init_ws(spreadsheet, CRM_PIPELINE_WORKSHEET, CRM_PIPELINE_HEADERS)
         rows = _retry_sheets(ws.get_all_values)
         for idx, row in enumerate(rows[1:], start=2):
-            if len(row) >= 2 and row[0] == record_id and row[1] == user_id:
+            if len(row) >= 1 and row[0] == record_id:
                 _retry_sheets(
                     lambda: ws.update(
                         values=[new_row],
-                        range_name=f"A{idx}:I{idx}",
+                        range_name=f"A{idx}:K{idx}",
                         value_input_option="RAW",
                     )
                 )
@@ -321,6 +376,9 @@ def upsert_crm_pipeline(
 def log_crm_activity(
     spreadsheet: gspread.Spreadsheet,
     user_id: str,
+    company_id: str,
+    assigned_to: str,
+    logged_by_name: str,
     record_id: str,
     activity_type: str,
     summary: str,
@@ -344,11 +402,13 @@ def log_crm_activity(
                 [
                     act_id,
                     user_id,
+                    company_id.strip(),
                     record_id,
                     activity_type,
                     clean_summary,
                     new_stage,
                     next_followup_str,
+                    logged_by_name,
                     now_str,
                 ],
                 value_input_option="RAW",
@@ -360,6 +420,8 @@ def log_crm_activity(
     upsert_crm_pipeline(
         spreadsheet=spreadsheet,
         user_id=user_id,
+        company_id=company_id,
+        assigned_to=assigned_to,
         record_id=record_id,
         lead_stage=new_stage,
         priority=priority,
@@ -370,24 +432,32 @@ def log_crm_activity(
     )
 
 
-def _extract_wa_and_tel(wp_str: str, call_str: str) -> Tuple[str, str]:
-    wa_digits = ""
+def _extract_wa_and_tel(wp_str: str, call_str: str) -> Tuple[list[Tuple[str, str]], str]:
+    wa_pairs: list[Tuple[str, str]] = []
+    seen_wa: set[str] = set()
     tel_digits = ""
+
     for raw in (wp_str, call_str):
         if not raw or str(raw).strip().upper() == "N/A":
             continue
         for part in str(raw).split(" / "):
-            digits = re.sub(r"\D", "", part)
+            disp = part.strip()
+            digits = re.sub(r"\D", "", disp)
             if not digits:
                 continue
             if not tel_digits and len(digits) >= 7:
                 tel_digits = digits
-            if not wa_digits:
+            if raw == wp_str or not wa_pairs:
                 if len(digits) == 10 and digits[0] in "6789":
-                    wa_digits = f"91{digits}"
+                    dial = f"91{digits}"
                 elif len(digits) >= 10:
-                    wa_digits = digits
-    return wa_digits, tel_digits
+                    dial = digits
+                else:
+                    continue
+                if dial not in seen_wa:
+                    seen_wa.add(dial)
+                    wa_pairs.append((disp, dial))
+    return wa_pairs, tel_digits
 
 
 def _inject_crm_css() -> None:
@@ -411,6 +481,16 @@ def _inject_crm_css() -> None:
                 margin-right: 0.35rem;
                 vertical-align: middle;
             }
+            .crm-owner-pill {
+                display: inline-block;
+                padding: 0.12rem 0.5rem;
+                border-radius: 6px;
+                font-size: 0.74rem;
+                font-weight: 600;
+                background: rgba(99, 102, 241, 0.16);
+                color: #6366f1;
+                margin-left: 0.35rem;
+            }
             .crm-stage-header {
                 padding: 0.5rem 0.75rem;
                 border-radius: 8px;
@@ -418,9 +498,6 @@ def _inject_crm_css() -> None:
                 font-weight: 600;
                 font-size: 0.88rem;
                 margin-bottom: 0.55rem;
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
             }
             .crm-board-item {
                 padding: 0.65rem 0.75rem;
@@ -456,23 +533,95 @@ def _inject_crm_css() -> None:
     )
 
 
+def _build_quick_action_links(row_like: Any, msg_text: str, subject_text: str) -> str:
+    wa_pairs, tel_digits = _extract_wa_and_tel(
+        str(row_like["WhatsApp No."]), str(row_like["Contact No."])
+    )
+    emails = _parse_emails(str(row_like["Email"]))
+    links = ""
+    for idx, (disp, wa_dial) in enumerate(wa_pairs, start=1):
+        wa_href = html.escape(
+            f"https://wa.me/{wa_dial}?text={quote(msg_text)}", quote=True
+        )
+        lbl = f"WhatsApp #{idx}" if len(wa_pairs) > 1 else "WhatsApp"
+        links += (
+            f'<a class="crm-btn-link crm-btn-wa" href="{wa_href}" '
+            f'target="_blank" rel="noopener noreferrer">{lbl} ({html.escape(disp)})</a>'
+        )
+    if emails:
+        joined_em = ",".join(emails)
+        gmail_href = html.escape(
+            f"https://mail.google.com/mail/?view=cm&fs=1&to={quote(joined_em)}"
+            f"&su={quote(subject_text)}&body={quote(msg_text)}",
+            quote=True,
+        )
+        links += (
+            f'<a class="crm-btn-link crm-btn-gmail" href="{gmail_href}" '
+            f'target="_blank" rel="noopener noreferrer">Gmail ({html.escape(" / ".join(emails))})</a>'
+        )
+    if tel_digits:
+        links += (
+            f'<a class="crm-btn-link crm-btn-call" href="tel:{html.escape(tel_digits, quote=True)}">'
+            f"Call ({html.escape(tel_digits)})</a>"
+        )
+    return links
+
+
 def render_crm_section(
     spreadsheet: gspread.Spreadsheet,
     all_records_df: pd.DataFrame,
-    current_user_id: str,
-    current_username: str,
+    current_user: dict[str, str],
+    all_users: list[dict[str, str]],
     build_multi_sheet_excel_fn: Callable[[dict[str, pd.DataFrame]], bytes],
+    assign_card_owner_fn: Optional[Callable[[str, str], bool]] = None,
 ) -> None:
-    """Professional Desktop & Mobile CRM with Pipeline Board, 360° Lead Workspace & Company Accounts."""
+    """Role-Aware Company CRM Workspace (Company Head + Employees; blocked for Normal Users)."""
+    if not can_access_crm(current_user):
+        st.error(
+            "CRM access is restricted to Company Heads and Employees. "
+            "Contact your Platform Admin to register your company."
+        )
+        return
+
     _inject_crm_css()
     st.session_state["_crm_spreadsheet_ref"] = spreadsheet
+
+    current_user_id = str(current_user.get("user_id", ""))
+    current_username = str(current_user.get("username", ""))
+    current_full_name = str(current_user.get("full_name") or current_username)
+    company_id = str(current_user.get("company_id", "")).strip()
+    role = normalize_role(current_user.get("role", ROLE_USER), current_user.get("email", ""))
+    is_boss = role in (ROLE_COMPANY_HEAD, ROLE_ADMIN)
+
+    co_info = get_company_by_id(spreadsheet, company_id)
+    co_name_banner = (
+        co_info.get("company_name", "Company CRM")
+        if co_info
+        else ("All Companies (Admin View)" if role == ROLE_ADMIN else "Company CRM")
+    )
+
+    team_members = get_company_members(all_users, company_id, include_disabled=False)
+    if not team_members:
+        team_members = [current_user]
+    member_id_to_label: dict[str, str] = {}
+    for m in team_members:
+        uid = str(m.get("user_id", ""))
+        disp = f"{m.get('full_name') or m.get('username')} ({get_role_badge_label(m.get('role', ROLE_EMPLOYEE))})"
+        member_id_to_label[uid] = disp
+    if current_user_id not in member_id_to_label:
+        member_id_to_label[current_user_id] = f"{current_full_name} ({get_role_badge_label(role)})"
 
     with st.container(border=True):
         hdr_c1, hdr_c2, hdr_c3 = st.columns([3.4, 1.0, 1.4])
         with hdr_c1:
-            st.subheader("CRM Sales Workspace")
+            st.subheader(f"CRM Workspace — {co_name_banner}")
             st.caption(
-                "Manage deal stages, priority follow-ups, company accounts, and customer interaction timelines."
+                f"Signed in as **{current_full_name}** ({get_role_badge_label(role)}) · "
+                + (
+                    "Full company-wide pipeline, employee assignment & revenue analytics."
+                    if is_boss
+                    else "Your assigned company leads, follow-ups & interaction logs."
+                )
             )
         with hdr_c2:
             if st.button("Refresh CRM", use_container_width=True, key="btn_crm_refresh"):
@@ -482,19 +631,29 @@ def render_crm_section(
 
         if all_records_df.empty:
             st.info(
-                "Add or import at least one visiting card first to unlock your CRM pipeline and follow-up manager."
+                "Add or import at least one visiting card first to unlock your company's CRM pipeline."
             )
             return
 
-        pipeline_map = _fetch_pipeline_rows(spreadsheet.id, current_user_id)
-        activities = _fetch_activity_rows(spreadsheet.id, current_user_id)
+        scope_key = f"{role}:{company_id}:{current_user_id}"
+        pipeline_map = _fetch_pipeline_rows(
+            spreadsheet.id, scope_key, company_id, current_user_id, role
+        )
+        activities = _fetch_activity_rows(
+            spreadsheet.id, scope_key, company_id, current_user_id, role
+        )
         today_str = date.today().strftime("%Y-%m-%d")
 
-        # Build unified CRM dataframe
         crm_rows: list[dict[str, Any]] = []
         for _, r in all_records_df.iterrows():
             rid = str(r["Record ID"])
             meta = pipeline_map.get(rid, {})
+            default_owner = str(r.get("Assigned To") or r.get("User ID") or current_user_id).strip()
+            assigned_uid = str(meta.get("assigned_to") or default_owner or current_user_id).strip()
+
+            if role == ROLE_EMPLOYEE and assigned_uid not in (current_user_id, ""):
+                continue
+
             stage = (
                 meta.get("lead_stage")
                 if meta.get("lead_stage") in CRM_STAGES
@@ -521,6 +680,7 @@ def render_crm_section(
                     due_status = "Upcoming"
 
             co_name = str(r["Company Name"])
+            owner_label = member_id_to_label.get(assigned_uid, "Unassigned")
             crm_rows.append(
                 {
                     "Record ID": rid,
@@ -534,7 +694,8 @@ def render_crm_section(
                     "Product / Services": str(r["Product / Services"]),
                     "Address": str(r["Address"]),
                     "Notes": str(r["Notes"]),
-                    "Extra Details": str(r.get("Extra Details", "")),
+                    "Assigned To": assigned_uid,
+                    "Owner Name": owner_label,
                     "Stage": stage,
                     "Priority": prio,
                     "Deal Value": val,
@@ -546,12 +707,15 @@ def render_crm_section(
                 }
             )
 
+        if not crm_rows:
+            st.info("No deals assigned to you yet.")
+            return
+
         crm_df = pd.DataFrame(crm_rows)
 
-        # Build Company Accounts rollup
         account_rows: list[dict[str, Any]] = []
         valid_co_df = crm_df[crm_df["Company Key"] != ""]
-        for co_key, grp in valid_co_df.groupby("Company Key", sort=False):
+        for _, grp in valid_co_df.groupby("Company Key", sort=False):
             display_co = grp["Company Name"].iloc[0]
             contacts_list = [
                 p for p in grp["Contact Person"].tolist() if p and p.upper() != "N/A"
@@ -585,12 +749,12 @@ def render_crm_section(
             else pd.DataFrame()
         )
 
-        # Multi-sheet CRM Excel Export
         with hdr_c3:
             exp_deals = crm_df[
                 [
                     "Company Name",
                     "Contact Person",
+                    "Owner Name",
                     "Stage",
                     "Priority",
                     "Deal Value",
@@ -623,7 +787,8 @@ def render_crm_section(
                     [
                         {
                             "Timestamp": a.get("created_at", ""),
-                            "Company": id_to_co.get(a.get("record_id", ""), "Deleted Card"),
+                            "Logged By": a.get("logged_by_name", ""),
+                            "Company": id_to_co.get(a.get("record_id", ""), "Company Card"),
                             "Activity": a.get("activity_type", ""),
                             "Summary": a.get("summary", ""),
                             "Stage": a.get("stage_after", ""),
@@ -636,13 +801,12 @@ def render_crm_section(
             st.download_button(
                 label="Export CRM (.xlsx)",
                 data=build_multi_sheet_excel_fn(sheets_to_export),
-                file_name=f"crm_workspace_{current_username}_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                file_name=f"company_crm_{current_username}_{datetime.now().strftime('%Y%m%d')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
                 key="btn_export_full_crm_xlsx",
             )
 
-        # ---- Top Executive KPI Strip ----
         open_df = crm_df[~crm_df["Stage"].isin(["Won", "Lost"])]
         won_df = crm_df[crm_df["Stage"] == "Won"]
         closed_df = crm_df[crm_df["Stage"].isin(["Won", "Lost"])]
@@ -667,19 +831,19 @@ def render_crm_section(
         with m6:
             st.metric("Due / Overdue", len(due_df))
 
-        # ---- 4 Clean Professional Tabs ----
-        tab_action, tab_board, tab_workspace, tab_accounts = st.tabs(
-            [
-                f"Action Queue ({len(due_df)})",
-                "Pipeline Board",
-                "360° Lead & Deal Workspace",
-                f"Company Accounts ({len(accounts_df)})",
-            ]
-        )
+        tab_names = [
+            f"Action Queue ({len(due_df)})",
+            "Pipeline Board",
+            "360° Lead & Deal Workspace",
+            f"Company Accounts ({len(accounts_df)})",
+        ]
+        if is_boss:
+            tab_names.append("Team Performance")
 
-        # ====================================================================
-        # TAB 1: Today's Action Queue (Overdue, Due Today & Hot Deals)
-        # ====================================================================
+        tabs = st.tabs(tab_names)
+        tab_action, tab_board, tab_workspace, tab_accounts = tabs[:4]
+
+        # ---- TAB 1: Action Queue ----
         with tab_action:
             hot_open_df = open_df[
                 (open_df["Priority"] == "Hot")
@@ -687,9 +851,7 @@ def render_crm_section(
             ]
 
             if due_df.empty and hot_open_df.empty:
-                st.success(
-                    "No overdue follow-ups today! Open **360° Lead & Deal Workspace** to schedule follow-ups or mark Hot deals."
-                )
+                st.success("No overdue follow-ups today! Use **360° Lead & Deal Workspace** to schedule next actions.")
             else:
                 if not due_df.empty:
                     st.markdown("#### Follow-Ups Due Today & Overdue")
@@ -699,47 +861,17 @@ def render_crm_section(
                         safe_person = html.escape(item["Contact Person"], quote=True)
                         safe_stage = html.escape(item["Stage"], quote=True)
                         safe_fu = html.escape(item["Next Follow-Up"], quote=True)
+                        safe_owner = html.escape(item["Owner Name"], quote=True)
                         prio_col = PRIORITY_COLORS.get(item["Priority"], "#d97706")
                         border_col = "#dc2626" if item["Due Status"] == "Overdue" else "#f59e0b"
 
-                        wa_digits, tel_digits = _extract_wa_and_tel(
-                            item["WhatsApp No."], item["Contact No."]
-                        )
-                        em_val = (
-                            item["Email"].strip()
-                            if item["Email"].strip().upper() != "N/A"
-                            else ""
-                        )
                         msg_text = (
                             f"Hello {item['Contact Person'] if item['Contact Person'] != 'N/A' else 'Sir/Madam'}, "
                             f"following up regarding {item['Company Name']} ({item['Product / Services']})."
                         )
-
-                        links = ""
-                        if wa_digits:
-                            wa_href = html.escape(
-                                f"https://wa.me/{wa_digits}?text={quote(msg_text)}",
-                                quote=True,
-                            )
-                            links += (
-                                f'<a class="crm-btn-link crm-btn-wa" href="{wa_href}" '
-                                f'target="_blank" rel="noopener noreferrer">WhatsApp</a>'
-                            )
-                        if em_val and "@" in em_val:
-                            gmail_href = html.escape(
-                                f"https://mail.google.com/mail/?view=cm&fs=1&to={quote(em_val)}"
-                                f"&su={quote('Follow-up: ' + item['Company Name'])}&body={quote(msg_text)}",
-                                quote=True,
-                            )
-                            links += (
-                                f'<a class="crm-btn-link crm-btn-gmail" href="{gmail_href}" '
-                                f'target="_blank" rel="noopener noreferrer">Gmail</a>'
-                            )
-                        if tel_digits:
-                            links += (
-                                f'<a class="crm-btn-link crm-btn-call" href="tel:{html.escape(tel_digits, quote=True)}">'
-                                f"Call ({html.escape(tel_digits, quote=True)})</a>"
-                            )
+                        links = _build_quick_action_links(
+                            item, msg_text, f"Follow-up: {item['Company Name']}"
+                        )
 
                         c_card, c_act1, c_act2 = st.columns([3.8, 1.0, 1.0])
                         with c_card:
@@ -748,6 +880,7 @@ def render_crm_section(
                                 <div class="crm-card" style="border-left: 4px solid {border_col};">
                                     <span class="crm-pill" style="background:{prio_col};">{html.escape(item['Priority'])}</span>
                                     <strong>{safe_co}</strong> · {safe_person}
+                                    <span class="crm-owner-pill">{safe_owner}</span>
                                     <span style="color:{border_col};font-weight:600;font-size:0.82rem;">
                                         [{html.escape(item['Due Status'])}: {safe_fu}]
                                     </span><br/>
@@ -761,15 +894,13 @@ def render_crm_section(
                             )
                         with c_act1:
                             st.markdown("<div style='height:0.35rem'></div>", unsafe_allow_html=True)
-                            if st.button(
-                                "Snooze +3d",
-                                use_container_width=True,
-                                key=f"crm_snooze_{rid}",
-                            ):
+                            if st.button("Snooze +3d", use_container_width=True, key=f"crm_snooze_{rid}"):
                                 next_3d = (date.today() + timedelta(days=3)).strftime("%Y-%m-%d")
                                 upsert_crm_pipeline(
                                     spreadsheet=spreadsheet,
                                     user_id=current_user_id,
+                                    company_id=company_id,
+                                    assigned_to=item["Assigned To"],
                                     record_id=rid,
                                     lead_stage=item["Stage"],
                                     priority=item["Priority"],
@@ -784,20 +915,14 @@ def render_crm_section(
                                 st.rerun()
                         with c_act2:
                             st.markdown("<div style='height:0.35rem'></div>", unsafe_allow_html=True)
-                            if st.button(
-                                "Done ✓",
-                                type="primary",
-                                use_container_width=True,
-                                key=f"crm_done_{rid}",
-                            ):
-                                next_stage = (
-                                    "Contacted"
-                                    if item["Stage"] == "New Lead"
-                                    else item["Stage"]
-                                )
+                            if st.button("Done ✓", type="primary", use_container_width=True, key=f"crm_done_{rid}"):
+                                next_stage = "Contacted" if item["Stage"] == "New Lead" else item["Stage"]
                                 log_crm_activity(
                                     spreadsheet=spreadsheet,
                                     user_id=current_user_id,
+                                    company_id=company_id,
+                                    assigned_to=item["Assigned To"],
+                                    logged_by_name=current_full_name,
                                     record_id=rid,
                                     activity_type="Phone Call",
                                     summary="Completed scheduled follow-up.",
@@ -821,6 +946,7 @@ def render_crm_section(
                             <div class="crm-card" style="border-left: 4px solid #dc2626;">
                                 <span class="crm-pill" style="background:#dc2626;">Hot</span>
                                 <strong>{html.escape(h_item['Company Name'])}</strong> · {html.escape(h_item['Contact Person'])}
+                                <span class="crm-owner-pill">{html.escape(h_item['Owner Name'])}</span>
                                 <span style="opacity:0.8;font-size:0.85rem;">
                                     — Stage: <strong>{html.escape(h_item['Stage'])}</strong> · Value: <strong>{format_inr(h_item['Deal Value'])}</strong>
                                 </span>
@@ -829,25 +955,37 @@ def render_crm_section(
                             unsafe_allow_html=True,
                         )
 
-        # ====================================================================
-        # TAB 2: Pipeline Board (Kanban Columns + Table + Funnel Analytics)
-        # ====================================================================
+        # ---- TAB 2: Pipeline Board ----
         with tab_board:
-            b_c1, b_c2, b_c3 = st.columns([1.4, 1.3, 1.8])
-            with b_c1:
+            b_cols = st.columns([1.3, 1.2, 1.3, 1.6]) if is_boss else st.columns([1.4, 1.3, 1.8])
+            with b_cols[0]:
                 board_mode = st.radio(
                     "View Mode",
                     options=["Visual Board", "Pipeline Table"],
                     horizontal=True,
                     key="crm_board_view_mode",
                 )
-            with b_c2:
+            with b_cols[1]:
                 prio_filter = st.selectbox(
-                    "Priority Filter",
+                    "Priority",
                     options=["All Priorities", *CRM_PRIORITIES],
                     key="crm_board_prio_filter",
                 )
-            with b_c3:
+            owner_filter_uid = "ALL"
+            if is_boss:
+                with b_cols[2]:
+                    owner_opts = {"All Team Members": "ALL", **{v: k for k, v in member_id_to_label.items()}}
+                    chosen_owner_lbl = st.selectbox(
+                        "Employee Filter",
+                        options=list(owner_opts.keys()),
+                        key="crm_board_owner_filter",
+                    )
+                    owner_filter_uid = owner_opts[chosen_owner_lbl]
+                search_col = b_cols[3]
+            else:
+                search_col = b_cols[2]
+
+            with search_col:
                 board_search = st.text_input(
                     "Search board",
                     placeholder="Filter by company, contact, or city...",
@@ -857,6 +995,8 @@ def render_crm_section(
             filtered_crm = crm_df.copy()
             if prio_filter != "All Priorities":
                 filtered_crm = filtered_crm[filtered_crm["Priority"] == prio_filter]
+            if is_boss and owner_filter_uid != "ALL":
+                filtered_crm = filtered_crm[filtered_crm["Assigned To"] == owner_filter_uid]
             if board_search.strip():
                 q = board_search.strip()
                 mask = (
@@ -900,6 +1040,7 @@ def render_crm_section(
                                     <span class="crm-pill" style="background:{p_col};font-size:0.68rem;">{html.escape(deal['Priority'])}</span>
                                     <strong>{html.escape(deal['Company Name'])}</strong><br/>
                                     <span style="opacity:0.78;font-size:0.8rem;">{html.escape(deal['Contact Person'])}</span><br/>
+                                    <span style="opacity:0.7;font-size:0.74rem;">Owner: {html.escape(deal['Owner Name'].split(' (')[0])}</span><br/>
                                     <span style="font-weight:600;font-size:0.82rem;">{format_inr(deal['Deal Value'])}</span>
                                 </div>
                                 """,
@@ -915,6 +1056,8 @@ def render_crm_section(
                                     upsert_crm_pipeline(
                                         spreadsheet=spreadsheet,
                                         user_id=current_user_id,
+                                        company_id=company_id,
+                                        assigned_to=deal["Assigned To"],
                                         record_id=deal["Record ID"],
                                         lead_stage=next_stg,
                                         priority=deal["Priority"],
@@ -931,12 +1074,12 @@ def render_crm_section(
                     [
                         "Company Name",
                         "Contact Person",
+                        "Owner Name",
                         "Stage",
                         "Priority",
                         "Deal Value",
                         "Next Follow-Up",
                         "City",
-                        "Lead Source",
                     ]
                 ].copy()
                 tbl["Deal Value"] = tbl["Deal Value"].map(format_inr)
@@ -946,18 +1089,16 @@ def render_crm_section(
             st.divider()
             st.markdown("#### Pipeline Value by Stage (₹)")
             stage_summary = (
-                crm_df.groupby("Stage", as_index=False)["Deal Value"]
+                filtered_crm.groupby("Stage", as_index=False)["Deal Value"]
                 .sum()
                 .set_index("Stage")
             )
             st.bar_chart(stage_summary, use_container_width=True)
 
-        # ====================================================================
-        # TAB 3: 360° Lead & Deal Workspace (Profile + Update + Activity Log)
-        # ====================================================================
+        # ---- TAB 3: 360° Lead & Deal Workspace ----
         with tab_workspace:
             lead_lookup = {
-                f"{r['Company Name']} — {r['Contact Person']} ({r['Stage']} • {r['Priority']}) [{r['Record ID'][:8]}]": r
+                f"{r['Company Name']} — {r['Contact Person']} ({r['Stage']} • {r['Owner Name'].split(' (')[0]}) [{r['Record ID'][:8]}]": r
                 for _, r in crm_df.iterrows()
             }
             selected_lead_lbl = st.selectbox(
@@ -968,39 +1109,13 @@ def render_crm_section(
             lead = lead_lookup[selected_lead_lbl]
             rid = lead["Record ID"]
 
-            wa_digits, tel_digits = _extract_wa_and_tel(
-                lead["WhatsApp No."], lead["Contact No."]
-            )
-            em_val = (
-                lead["Email"].strip()
-                if lead["Email"].strip().upper() != "N/A"
-                else ""
-            )
             quick_msg = (
                 f"Hello {lead['Contact Person'] if lead['Contact Person'] != 'N/A' else 'Sir/Madam'}, "
-                f"connecting from our team regarding {lead['Company Name']}."
+                f"connecting from {co_name_banner} regarding {lead['Company Name']}."
             )
-            quick_links = ""
-            if wa_digits:
-                quick_links += (
-                    f'<a class="crm-btn-link crm-btn-wa" '
-                    f'href="{html.escape(f"https://wa.me/{wa_digits}?text={quote(quick_msg)}", quote=True)}" '
-                    f'target="_blank" rel="noopener noreferrer">WhatsApp ({html.escape(lead["WhatsApp No."])})</a>'
-                )
-            if em_val and "@" in em_val:
-                gmail_u = (
-                    f"https://mail.google.com/mail/?view=cm&fs=1&to={quote(em_val)}"
-                    f"&su={quote('Regarding ' + lead['Company Name'])}&body={quote(quick_msg)}"
-                )
-                quick_links += (
-                    f'<a class="crm-btn-link crm-btn-gmail" href="{html.escape(gmail_u, quote=True)}" '
-                    f'target="_blank" rel="noopener noreferrer">Gmail ({html.escape(em_val)})</a>'
-                )
-            if tel_digits:
-                quick_links += (
-                    f'<a class="crm-btn-link crm-btn-call" href="tel:{html.escape(tel_digits, quote=True)}">'
-                    f"Call ({html.escape(tel_digits)})</a>"
-                )
+            quick_links = _build_quick_action_links(
+                lead, quick_msg, f"Regarding {lead['Company Name']}"
+            )
 
             p_badge_col = PRIORITY_COLORS.get(lead["Priority"], "#d97706")
             s_badge_col = STAGE_COLORS.get(lead["Stage"], "#6366f1")
@@ -1009,7 +1124,8 @@ def render_crm_section(
                 <div class="crm-card">
                     <span class="crm-pill" style="background:{s_badge_col};">{html.escape(lead['Stage'])}</span>
                     <span class="crm-pill" style="background:{p_badge_col};">{html.escape(lead['Priority'])}</span>
-                    <strong style="font-size:1.05rem;">{html.escape(lead['Company Name'])}</strong> · {html.escape(lead['Contact Person'])}<br/>
+                    <strong style="font-size:1.05rem;">{html.escape(lead['Company Name'])}</strong> · {html.escape(lead['Contact Person'])}
+                    <span class="crm-owner-pill">Assigned: {html.escape(lead['Owner Name'])}</span><br/>
                     <span style="opacity:0.82;font-size:0.86rem;">
                         <strong>Products/Services:</strong> {html.escape(lead['Product / Services'])} ·
                         <strong>City:</strong> {html.escape(lead['City'])}<br/>
@@ -1023,22 +1139,10 @@ def render_crm_section(
                 unsafe_allow_html=True,
             )
 
-            if lead["Company Key"]:
-                colleagues = crm_df[
-                    (crm_df["Company Key"] == lead["Company Key"])
-                    & (crm_df["Record ID"] != rid)
-                ]
-                if not colleagues.empty:
-                    names = ", ".join(
-                        f"{c['Contact Person']} ({c['Stage']})"
-                        for _, c in colleagues.iterrows()
-                    )
-                    st.info(f"**Other Contacts at {lead['Company Name']}:** {names}")
-
             left_form, right_log = st.columns(2)
 
             with left_form:
-                st.markdown("#### Update Deal & Follow-Up")
+                st.markdown("#### Update Deal, Assignment & Follow-Up")
                 with st.form(key=f"crm_360_deal_form_{rid}"):
                     f1, f2 = st.columns(2)
                     with f1:
@@ -1068,6 +1172,22 @@ def render_crm_section(
                                 else 0
                             ),
                         )
+
+                    if is_boss:
+                        owner_choices = list(member_id_to_label.keys())
+                        curr_owner_idx = (
+                            owner_choices.index(lead["Assigned To"])
+                            if lead["Assigned To"] in owner_choices
+                            else 0
+                        )
+                        upd_assignee = st.selectbox(
+                            "Assign Deal / Lead To Employee",
+                            options=owner_choices,
+                            format_func=lambda uid: member_id_to_label.get(uid, uid),
+                            index=curr_owner_idx,
+                        )
+                    else:
+                        upd_assignee = lead["Assigned To"]
 
                     d1, d2 = st.columns(2)
                     with d1:
@@ -1106,6 +1226,8 @@ def render_crm_section(
                             upsert_crm_pipeline(
                                 spreadsheet=spreadsheet,
                                 user_id=current_user_id,
+                                company_id=company_id,
+                                assigned_to=upd_assignee,
                                 record_id=rid,
                                 lead_stage=upd_stage,
                                 priority=upd_prio,
@@ -1114,6 +1236,8 @@ def render_crm_section(
                                 lead_source=upd_src,
                                 expected_close=cl_dt.strftime("%Y-%m-%d") if has_close else "",
                             )
+                            if assign_card_owner_fn and upd_assignee != lead["Assigned To"]:
+                                assign_card_owner_fn(rid, upd_assignee)
                             st.session_state["flash_success"] = (
                                 f"Saved deal settings for '{lead['Company Name']}'."
                             )
@@ -1160,6 +1284,9 @@ def render_crm_section(
                                 log_crm_activity(
                                     spreadsheet=spreadsheet,
                                     user_id=current_user_id,
+                                    company_id=company_id,
+                                    assigned_to=lead["Assigned To"],
+                                    logged_by_name=current_full_name,
                                     record_id=rid,
                                     activity_type=act_type,
                                     summary=act_note,
@@ -1184,11 +1311,12 @@ def render_crm_section(
                 st.info("No interactions logged for this contact yet.")
             else:
                 for act in lead_acts[:25]:
+                    actor_txt = act.get("logged_by_name") or "Team Member"
                     st.markdown(
                         f"""
                         <div class="crm-timeline-item">
                             <strong>{html.escape(act.get('activity_type', 'Note'))}</strong>
-                            <span style="opacity:0.7;font-size:0.8rem;"> · {html.escape(act.get('created_at', ''))}</span>
+                            <span style="opacity:0.75;font-size:0.8rem;"> by <strong>{html.escape(actor_txt)}</strong> · {html.escape(act.get('created_at', ''))}</span>
                             <span class="crm-pill" style="background:{STAGE_COLORS.get(act.get('stage_after', ''), '#6366f1')};font-size:0.7rem;margin-left:0.4rem;">
                                 {html.escape(act.get('stage_after', ''))}
                             </span><br/>
@@ -1198,12 +1326,10 @@ def render_crm_section(
                         unsafe_allow_html=True,
                     )
 
-        # ====================================================================
-        # TAB 4: Company Accounts (Grouped Parent Organizations)
-        # ====================================================================
+        # ---- TAB 4: Company Accounts ----
         with tab_accounts:
             st.caption(
-                "Multiple visiting cards from the same company are automatically grouped into a single Company Account."
+                "Multiple visiting cards from the same organization are grouped into one Company Account."
             )
             if accounts_df.empty:
                 st.info("No named company accounts available yet.")
@@ -1222,6 +1348,7 @@ def render_crm_section(
                 members_df = crm_df[crm_df["Company Key"] == acct_key][
                     [
                         "Contact Person",
+                        "Owner Name",
                         "Stage",
                         "Priority",
                         "Deal Value",
@@ -1233,3 +1360,28 @@ def render_crm_section(
                 ].copy()
                 members_df["Deal Value"] = members_df["Deal Value"].map(format_inr)
                 st.dataframe(members_df, use_container_width=True, hide_index=True)
+
+        # ---- TAB 5 (Company Head / Boss Only): Team Performance ----
+        if is_boss and len(tabs) == 5:
+            with tabs[4]:
+                st.markdown("#### Employee Pipeline & Revenue Performance")
+                perf_rows = []
+                for uid, m_label in member_id_to_label.items():
+                    emp_deals = crm_df[crm_df["Assigned To"] == uid]
+                    emp_open = emp_deals[~emp_deals["Stage"].isin(["Won", "Lost"])]
+                    emp_won = emp_deals[emp_deals["Stage"] == "Won"]
+                    emp_due = emp_deals[emp_deals["Due Status"].isin(["Overdue", "Due Today"])]
+                    perf_rows.append(
+                        {
+                            "Team Member": m_label,
+                            "Total Leads": len(emp_deals),
+                            "Open Deals": len(emp_open),
+                            "Open Pipeline": format_inr(emp_open["Deal Value"].sum()),
+                            "Won Deals": len(emp_won),
+                            "Won Revenue": format_inr(emp_won["Deal Value"].sum()),
+                            "Due / Overdue": len(emp_due),
+                        }
+                    )
+                st.dataframe(
+                    pd.DataFrame(perf_rows), use_container_width=True, hide_index=True
+                )

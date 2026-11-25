@@ -33,11 +33,25 @@ from PIL import Image, ImageOps
 from pydantic import BaseModel, Field
 
 from crm_module import format_inr, get_crm_due_summary, render_crm_section
+from rbac_org import (
+    EXTENDED_USER_HEADERS,
+    ROLE_ADMIN,
+    ROLE_COMPANY_HEAD,
+    ROLE_EMPLOYEE,
+    ROLE_USER,
+    can_access_crm,
+    ensure_org_worksheets,
+    get_company_by_id,
+    get_role_badge_label,
+    normalize_role,
+    render_admin_console,
+    render_team_management_section,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration & Security Constants
 # ---------------------------------------------------------------------------
-SCHEMA_VERSION = "v13_crm_and_multi_email"
+SCHEMA_VERSION = "v14_rbac_company_crm"
 
 MODEL_CHAIN = [
     "gemini-3.5-flash-lite",
@@ -105,6 +119,8 @@ CARD_HEADERS = [
     "created_at",
     "extra_data",
     "deleted_at",
+    "company_id",
+    "assigned_to",
 ]
 
 DEFAULT_TABLE_COLUMNS = [
@@ -126,34 +142,20 @@ ALL_RECORD_COLUMNS = [
     "Extra Details",
     "Extra Data JSON",
     "Deleted At",
+    "User ID",
+    "Company ID",
+    "Assigned To",
 ]
 
 STANDARD_FIELD_LABELS_LOWER = {
-    "company name",
-    "company",
-    "contact person",
-    "contact no",
-    "contact no.",
-    "call phone",
-    "phone",
-    "whatsapp no",
-    "whatsapp no.",
-    "whatsapp",
-    "email",
-    "product / services",
-    "products / services",
-    "products",
-    "services",
-    "address",
-    "city",
-    "notes",
-    "saved on",
-    "record id",
-    "user id",
-    "deleted at",
+    "company name", "company", "contact person", "contact no", "contact no.",
+    "call phone", "phone", "whatsapp no", "whatsapp no.", "whatsapp", "email",
+    "product / services", "products / services", "products", "services",
+    "address", "city", "notes", "saved on", "record id", "user id", "deleted at",
+    "company id", "assigned to",
 }
 
-USER_HEADERS = ["user_id", "username", "email", "password_hash", "role", "created_at"]
+USER_HEADERS = EXTENDED_USER_HEADERS
 USAGE_HEADERS = ["user_id", "quota_date", "scan_count", "updated_at"]
 OTP_HEADERS = ["email", "code_hash", "expires_at", "used", "attempts", "created_at"]
 SESSION_HEADERS = ["session_id", "user_id", "token_hash", "expires_at", "revoked", "created_at"]
@@ -209,37 +211,24 @@ st.set_page_config(
 )
 
 
-# ---------------------------------------------------------------------------
-# Clean Responsive UI Styling (Phone + Laptop) & Compact Image Previews
-# ---------------------------------------------------------------------------
 def inject_clean_ui_css() -> None:
     st.markdown(
         """
         <style>
-            [data-testid="stToolbarActions"],
-            [data-testid="stActionButtonIcon"],
-            [data-testid="stAppDeployButton"],
-            .stAppDeployButton,
-            a[href*="github.com"],
-            button[title*="GitHub"],
-            button[title*="Fork"],
-            #MainMenu,
-            footer,
-            .viewerBadge_container__1QSob,
-            .styles_viewerBadge__1yB5_ {
-                display: none !important;
-                visibility: hidden !important;
+            [data-testid="stToolbarActions"], [data-testid="stActionButtonIcon"],
+            [data-testid="stAppDeployButton"], .stAppDeployButton,
+            a[href*="github.com"], button[title*="GitHub"], button[title*="Fork"],
+            #MainMenu, footer, .viewerBadge_container__1QSob, .styles_viewerBadge__1yB5_ {
+                display: none !important; visibility: hidden !important;
             }
             .block-container { padding-top: 1.4rem; padding-bottom: 2.5rem; max-width: 1200px; }
             .stButton > button, .stDownloadButton > button, .stFormSubmitButton > button {
                 min-height: 2.65rem; border-radius: 8px; font-weight: 500;
             }
             [data-testid="stImage"] img {
-                max-height: 240px !important;
-                max-width: min(300px, 100%) !important;
-                width: auto !important; height: auto !important;
-                object-fit: contain; border-radius: 8px;
-                border: 1px solid rgba(128, 128, 128, 0.25);
+                max-height: 240px !important; max-width: min(300px, 100%) !important;
+                width: auto !important; height: auto !important; object-fit: contain;
+                border-radius: 8px; border: 1px solid rgba(128, 128, 128, 0.25);
             }
             [data-testid="stCameraInput"] { max-width: 420px; }
             .vcard-stat-strip { display: flex; flex-wrap: wrap; gap: 0.65rem; margin: 0.35rem 0 1rem 0; }
@@ -248,7 +237,7 @@ def inject_clean_ui_css() -> None:
                 border: 1px solid rgba(128, 128, 128, 0.22); background: rgba(128, 128, 128, 0.06);
             }
             .vcard-stat-label { font-size: 0.78rem; opacity: 0.72; margin-bottom: 0.15rem; }
-            .vcard-stat-value { font-size: 1.15rem; font-weight: 600; }
+            .vcard-stat-value { font-size: 1.12rem; font-weight: 600; }
             .vcard-outreach-card {
                 padding: 0.85rem 1rem; border-radius: 10px;
                 border: 1px solid rgba(128, 128, 128, 0.22);
@@ -284,9 +273,6 @@ def inject_clean_ui_css() -> None:
     )
 
 
-# ---------------------------------------------------------------------------
-# Browser Bridges: localStorage Session + Mobile Sidebar Close & Smooth Scroll
-# ---------------------------------------------------------------------------
 _SESSION_BRIDGE_JS = """
 export default function(component) {
     const { data, setStateValue } = component;
@@ -390,9 +376,6 @@ def trigger_ui_bridge() -> None:
     )
 
 
-# ---------------------------------------------------------------------------
-# Google Sheets Rate-Limit (429) Retry Helper
-# ---------------------------------------------------------------------------
 def _is_transient_sheets_error(exc: Exception) -> bool:
     if isinstance(exc, GSpreadAPIError):
         status = getattr(getattr(exc, "response", None), "status_code", None)
@@ -420,9 +403,6 @@ def _sheets_call_with_retry(fn: Callable[[], _T], attempts: int = 3) -> _T:
     raise last_exc
 
 
-# ---------------------------------------------------------------------------
-# Secret, Session Signing, Password Policy & Multi-Phone / Multi-Email Helpers
-# ---------------------------------------------------------------------------
 def get_secret(key: str, default: Any = None) -> Any:
     try:
         if key in st.secrets:
@@ -602,7 +582,6 @@ def extract_all_wa_dial_numbers(
 
 
 def parse_email_list(raw: str) -> list[str]:
-    """Extract all valid, deduplicated lowercase email addresses from a string."""
     if not raw or str(raw).strip().upper() in ("N/A", "NAN", "NONE"):
         return []
     parts = re.split(r"[,/;\|\n\s]+", str(raw).strip())
@@ -619,13 +598,11 @@ def parse_email_list(raw: str) -> list[str]:
 
 
 def format_emails(raw: str) -> str:
-    """Format one or multiple emails into a single column string separated by ' / '."""
     emails = parse_email_list(raw)
     return " / ".join(emails) if emails else "N/A"
 
 
 def are_all_emails_valid(raw: str) -> bool:
-    """Return True if blank/N/A or every delimited token is a valid email address."""
     if not raw or str(raw).strip().upper() in ("", "N/A", "NAN", "NONE"):
         return True
     tokens = [
@@ -641,9 +618,8 @@ def are_all_emails_valid(raw: str) -> bool:
 def extract_normalized_emails(email_str: str) -> set[str]:
     return set(parse_email_list(email_str))
 
-
 # ---------------------------------------------------------------------------
-# Extra Data Helpers (Lossless JSON Validation & Auto-Expanded Columns)
+# Extra Data Helpers & Image Optimization
 # ---------------------------------------------------------------------------
 def parse_extra_data(raw_json: str) -> dict[str, str]:
     if not raw_json or not str(raw_json).strip():
@@ -867,10 +843,7 @@ def clear_account_specific_state(preserve_flash: bool = False) -> None:
 # ---------------------------------------------------------------------------
 class ExtraDetail(BaseModel):
     label: str = Field(
-        description=(
-            "Short clean English Title Case label for an extra detail on the card "
-            "(e.g., 'Website', 'GSTIN', 'PAN', 'Instagram', 'LinkedIn', 'Fax', 'Branch', 'Timings')."
-        )
+        description="Short clean English Title Case label for an extra detail on the card."
     )
     value: str = Field(
         description="Value of this extra detail in English with standard 0-9 digits."
@@ -878,76 +851,15 @@ class ExtraDetail(BaseModel):
 
 
 class VisitingCard(BaseModel):
-    company_name: str = Field(
-        description=(
-            "Name of the company or business in English (Latin script). "
-            "Transliterate non-English business names cleanly into readable English. Return 'N/A' if missing."
-        )
-    )
-    contact_person: str = Field(
-        description=(
-            "Full name of the contact person in English (Latin script), including designation if printed. "
-            "Transliterate non-English names into readable English. Return 'N/A' if missing."
-        )
-    )
-    call_phone: str = Field(
-        description=(
-            "Normal call / office / landline number(s) formatted as plain ASCII digits separated by ' / ' "
-            "(example: '9876543210 / 07926300000'), removing '+91' and spaces. "
-            "ONLY populate this when the card explicitly distinguishes a call/phone/landline number using a phone/call "
-            "icon or text label ('Call', 'Ph', 'Tel', 'Office', 'Landline', 'Contact') separately from WhatsApp. "
-            "If there is only 1 unspecified number, or 2+ unspecified numbers, return 'N/A' here."
-        )
-    )
-    whatsapp_phone: str = Field(
-        description=(
-            "WhatsApp number(s) formatted as plain ASCII digits separated by ' / ' "
-            "(example: '9876543210 / 9123456789'), removing '+91' and spaces. "
-            "Rules: (1) If WhatsApp icon/logo or text ('WP', 'WA', 'WhatsApp') marks specific number(s), put those here. "
-            "(2) If only 1 number is on the card without a call-only/landline distinction, put it here by default. "
-            "(3) If 2 or more numbers are on the card with NO icon or text distinguishing WhatsApp from Call, "
-            "put ALL of them here separated by ' / '. Return 'N/A' only if no number applies."
-        )
-    )
-    email: str = Field(
-        description=(
-            "All email address(es) printed on the card in English (Latin script, lowercase), "
-            "separated by ' / ' if there are 2 or more (example: 'sales@company.com / info@company.com'). "
-            "Keep every email printed on the card in this single field — do NOT put a second email in extra_details. "
-            "Return 'N/A' if missing."
-        )
-    )
-    products_services: str = Field(
-        description=(
-            "Products or services offered by the company in English (Latin script). "
-            "Translate regional terms into natural English (keep well-known Indian item names in standard English "
-            "spelling like Bhajiya, Jalebi, Boondi Laddu, Mohanthal). If not explicitly listed, infer from the "
-            "company name, title, or tagline. Return 'N/A' only if completely impossible to determine."
-        )
-    )
-    address: str = Field(
-        description=(
-            "Complete physical shop, office, or factory address translated and transliterated into clear English "
-            "with standard 0-9 digits (translate directional words like 'near' or 'next to'; transliterate street "
-            "and city names). Return 'N/A' if missing."
-        )
-    )
-    city: str = Field(
-        description=(
-            "Only the City or Town name in standard English Title Case (e.g., 'Ahmedabad', 'Mumbai', "
-            "'Kapadvanj', 'Dakor', 'Surat', 'Vadodara'). Do NOT include street, state, or PIN code here. "
-            "Infer from the address or PIN code if clear; return 'N/A' if completely absent."
-        )
-    )
-    extra_details: list[ExtraDetail] = Field(
-        default_factory=list,
-        description=(
-            "Any additional useful details printed on the card that do NOT belong in the standard fields "
-            "(such as Website, GSTIN, PAN, Fax, Instagram, LinkedIn, Facebook, Branch, Office Timings, ISO Certification). "
-            "Do NOT repeat company name, contact person, phone, email, products, address, or city here. "
-            "Return an empty list [] if none are printed."
-        ),
-    )
+    company_name: str = Field(description="Company or business name in English. Return 'N/A' if missing.")
+    contact_person: str = Field(description="Contact person full name in English. Return 'N/A' if missing.")
+    call_phone: str = Field(description="Call/landline number(s) separated by ' / ' or 'N/A'.")
+    whatsapp_phone: str = Field(description="WhatsApp/mobile number(s) separated by ' / ' or 'N/A'.")
+    email: str = Field(description="All email address(es) separated by ' / ' or 'N/A'.")
+    products_services: str = Field(description="Products or services in English or 'N/A'.")
+    address: str = Field(description="Physical address in English or 'N/A'.")
+    city: str = Field(description="City or town name in Title Case or 'N/A'.")
+    extra_details: list[ExtraDetail] = Field(default_factory=list)
 
 
 def _clean_card_output(card: VisitingCard) -> Tuple[VisitingCard, dict[str, str]]:
@@ -985,7 +897,7 @@ def _clean_card_output(card: VisitingCard) -> Tuple[VisitingCard, dict[str, str]
 
 
 # ---------------------------------------------------------------------------
-# Google Sheets Storage Layer (Strict Header Validation & Migration)
+# Google Sheets Storage Layer (Company-Scoped & Role-Aware)
 # ---------------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def get_spreadsheet(_schema_version: str = SCHEMA_VERSION) -> gspread.Spreadsheet:
@@ -1040,9 +952,10 @@ def _migrate_cards_worksheet_if_needed(cards_ws: gspread.Worksheet) -> None:
             continue
         padded = row + [""] * (len(normalized_headers) - len(row))
         old_rec = dict(zip(normalized_headers, padded))
+        uid_val = old_rec.get("user_id", "default_user")
         new_rec = {
             "record_id": old_rec.get("record_id") or str(uuid.uuid4()),
-            "user_id": old_rec.get("user_id", "default_user"),
+            "user_id": uid_val,
             "company_name": old_rec.get("company_name", "N/A"),
             "contact_person": old_rec.get("contact_person", "N/A"),
             "call_phone": format_phone_numbers(old_rec.get("call_phone") or "N/A"),
@@ -1057,6 +970,8 @@ def _migrate_cards_worksheet_if_needed(cards_ws: gspread.Worksheet) -> None:
             "created_at": old_rec.get("created_at", ""),
             "extra_data": old_rec.get("extra_data", ""),
             "deleted_at": old_rec.get("deleted_at", ""),
+            "company_id": old_rec.get("company_id", ""),
+            "assigned_to": old_rec.get("assigned_to", "") or uid_val,
         }
         migrated_rows.append([new_rec[col] for col in CARD_HEADERS])
 
@@ -1114,6 +1029,7 @@ def _migrate_or_validate_worksheet(
 
 
 def ensure_worksheets(spreadsheet: gspread.Spreadsheet) -> None:
+    ensure_org_worksheets(spreadsheet)
     existing_ws = _sheets_call_with_retry(spreadsheet.worksheets)
     existing_titles = {ws.title for ws in existing_ws}
 
@@ -1126,7 +1042,11 @@ def ensure_worksheets(spreadsheet: gspread.Spreadsheet) -> None:
         _migrate_cards_worksheet_if_needed(spreadsheet.worksheet(CARDS_WORKSHEET))
 
     worksheet_specs: list[Tuple[str, list[str], dict[str, str]]] = [
-        (USERS_WORKSHEET, USER_HEADERS, {"role": "user"}),
+        (
+            USERS_WORKSHEET,
+            USER_HEADERS,
+            {"role": ROLE_USER, "company_id": "", "full_name": "", "status": "active"},
+        ),
         (USAGE_WORKSHEET, USAGE_HEADERS, {"scan_count": "0"}),
         (RESETS_WORKSHEET, OTP_HEADERS, {"used": "yes", "attempts": "0"}),
         (REGISTER_OTPS_WORKSHEET, OTP_HEADERS, {"used": "yes", "attempts": "0"}),
@@ -1189,8 +1109,6 @@ def get_rate_limits_worksheet() -> gspread.Worksheet:
 
 def get_audit_logs_worksheet() -> gspread.Worksheet:
     return _get_or_create_worksheet(AUDIT_LOGS_WORKSHEET, AUDIT_HEADERS)
-
-
 # ---------------------------------------------------------------------------
 # Audit History Logger
 # ---------------------------------------------------------------------------
@@ -1494,6 +1412,18 @@ def logout_user_session() -> None:
     clear_account_specific_state(preserve_flash=False)
 
 
+def _build_session_user_dict(user_row: dict[str, str]) -> dict[str, str]:
+    email_val = str(user_row.get("email", "")).strip()
+    return {
+        "user_id": str(user_row.get("user_id", "")).strip(),
+        "username": str(user_row.get("username", "")).strip(),
+        "email": email_val,
+        "role": normalize_role(user_row.get("role", ROLE_USER), email_val),
+        "company_id": str(user_row.get("company_id", "")).strip(),
+        "full_name": str(user_row.get("full_name") or user_row.get("username", "")).strip(),
+    }
+
+
 def sync_and_restore_session() -> Tuple[Optional[dict[str, str]], bool]:
     try:
         if "session" in st.query_params:
@@ -1581,13 +1511,12 @@ def sync_and_restore_session() -> Tuple[Optional[dict[str, str]], bool]:
                 return None, True
             for user in users:
                 if user.get("user_id") == user_id:
+                    if str(user.get("status", "active")).strip().lower() == "disabled":
+                        revoke_server_session(stored_token)
+                        st.session_state["session_action"] = "clear"
+                        return None, False
                     clear_account_specific_state(preserve_flash=False)
-                    restored = {
-                        "user_id": user.get("user_id", ""),
-                        "username": user.get("username", ""),
-                        "email": user.get("email", ""),
-                        "role": user.get("role", "user"),
-                    }
+                    restored = _build_session_user_dict(user)
                     st.session_state["auth_user"] = restored
                     st.session_state["bound_user_id"] = user_id
                     st.session_state["session_token"] = stored_token
@@ -1726,7 +1655,7 @@ def release_user_scan_slot(user_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Email OTP Delivery & Verification
+# Email OTP Delivery & Authentication
 # ---------------------------------------------------------------------------
 def _send_otp_email(
     recipient_email: str, username: str, code: str, subject: str, purpose_line: str
@@ -1738,8 +1667,7 @@ def _send_otp_email(
 
     if not smtp_email or not smtp_password:
         raise ValueError(
-            "Email OTP is not configured yet. Add `SMTP_EMAIL` and "
-            "`SMTP_APP_PASSWORD` to Streamlit Secrets."
+            "Email OTP is not configured yet. Add `SMTP_EMAIL` and `SMTP_APP_PASSWORD` to Streamlit Secrets."
         )
 
     msg = EmailMessage()
@@ -1927,9 +1855,6 @@ def _verify_and_consume_otp(
         return True, "Verified."
 
 
-# ---------------------------------------------------------------------------
-# User Authentication, OTP Registration & Generic Password Recovery
-# ---------------------------------------------------------------------------
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_all_users() -> list[dict[str, str]]:
     ws = get_users_worksheet()
@@ -1984,12 +1909,15 @@ def start_registration_otp(
     if not ok:
         return False, msg, None
 
-    pending_data = {
-        "username": clean_username,
-        "email": clean_email,
-        "password_hash": hash_password(password),
-    }
-    return True, msg, pending_data
+    return (
+        True,
+        msg,
+        {
+            "username": clean_username,
+            "email": clean_email,
+            "password_hash": hash_password(password),
+        },
+    )
 
 
 def resend_registration_otp(pending_data: dict[str, str]) -> Tuple[bool, str]:
@@ -2028,22 +1956,38 @@ def complete_registration_with_otp(
 
         user_id = f"usr_{uuid.uuid4().hex}"
         created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        assigned_role = normalize_role(ROLE_USER, clean_email)
 
         ws = get_users_worksheet()
         ws.append_row(
-            [user_id, clean_username, clean_email, pw_hash, "user", created_at],
+            [
+                user_id,
+                clean_username,
+                clean_email,
+                pw_hash,
+                assigned_role,
+                "",
+                clean_username,
+                "active",
+                created_at,
+            ],
             value_input_option="RAW",
             table_range="A1",
         )
         fetch_all_users.clear()
 
-    new_user = {
-        "user_id": user_id,
-        "username": clean_username,
-        "email": clean_email,
-        "role": "user",
-    }
-    return True, "Email verified and account created! Welcome.", new_user
+    return (
+        True,
+        "Email verified and account created! Welcome.",
+        {
+            "user_id": user_id,
+            "username": clean_username,
+            "email": clean_email,
+            "role": assigned_role,
+            "company_id": "",
+            "full_name": clean_username,
+        },
+    )
 
 
 def authenticate_user(
@@ -2087,17 +2031,14 @@ def authenticate_user(
 
     for user in matched_users:
         if verify_password(password, user.get("password_hash", "")):
+            if str(user.get("status", "active")).strip().lower() == "disabled":
+                return (
+                    False,
+                    "Your company account has been disabled by your Company Head.",
+                    None,
+                )
             _clear_rate_limit(rate_key)
-            return (
-                True,
-                "Logged in successfully.",
-                {
-                    "user_id": user.get("user_id", ""),
-                    "username": user.get("username", ""),
-                    "email": user.get("email", ""),
-                    "role": user.get("role", "user"),
-                },
-            )
+            return True, "Logged in successfully.", _build_session_user_dict(user)
         _record_rate_limit_event(
             limit_key=rate_key,
             max_attempts=MAX_LOGIN_ATTEMPTS,
@@ -2207,11 +2148,30 @@ def confirm_password_reset(
         _clear_rate_limit(f"login:{clean_email}")
 
     return True, "Password updated and all active sessions signed out. Please log in with your new password."
+# ---------------------------------------------------------------------------
+# Company-Scoped Visiting Card CRUD, Duplicate-Safe Saves & Soft-Delete
+# ---------------------------------------------------------------------------
+def _can_manage_card_record(
+    record: dict[str, str], current_user: dict[str, str]
+) -> bool:
+    uid = str(current_user.get("user_id", "")).strip()
+    cid = str(current_user.get("company_id", "")).strip()
+    role = normalize_role(
+        current_user.get("role", ROLE_USER), current_user.get("email", "")
+    )
+    rec_uid = str(record.get("user_id", "")).strip()
+    rec_cid = str(record.get("company_id", "")).strip()
+    rec_assignee = str(record.get("assigned_to", "")).strip()
+
+    if role == ROLE_ADMIN:
+        return True
+    if role == ROLE_COMPANY_HEAD and cid and rec_cid == cid:
+        return True
+    if role == ROLE_EMPLOYEE and cid and rec_cid == cid:
+        return uid in (rec_uid, rec_assignee)
+    return rec_uid == uid and not rec_cid
 
 
-# ---------------------------------------------------------------------------
-# Visiting Card CRUD, Atomic Duplicate-Safe Saves, Soft-Delete & Audit
-# ---------------------------------------------------------------------------
 @st.cache_data(ttl=60, show_spinner=False)
 def _fetch_all_card_rows() -> list[list[str]]:
     ws = get_cards_worksheet()
@@ -2235,11 +2195,19 @@ def _fetch_all_card_rows() -> list[list[str]]:
     return all_rows
 
 
-def _rows_to_user_df(
-    all_rows: list[list[str]], user_id: str, include_deleted: bool = False
+def _rows_to_scoped_df(
+    all_rows: list[list[str]],
+    current_user: dict[str, str],
+    include_deleted: bool = False,
 ) -> pd.DataFrame:
     if len(all_rows) <= 1:
         return pd.DataFrame(columns=ALL_RECORD_COLUMNS)
+
+    uid = str(current_user.get("user_id", "")).strip()
+    cid = str(current_user.get("company_id", "")).strip()
+    role = normalize_role(
+        current_user.get("role", ROLE_USER), current_user.get("email", "")
+    )
 
     headers = all_rows[0]
     data_rows = []
@@ -2248,35 +2216,57 @@ def _rows_to_user_df(
             continue
         padded = row + [""] * (len(headers) - len(row))
         record = dict(zip(headers, padded))
-        if record.get("user_id") == user_id:
-            deleted_at = str(record.get("deleted_at", "")).strip()
-            if not include_deleted and deleted_at:
-                continue
-            raw_extra = record.get("extra_data") or record.get("Extra Details") or ""
-            extra_dict = parse_extra_data(raw_extra)
-            extra_json_clean, _ = validate_and_serialize_extra_data(
-                extra_dict, strict=False
+        rec_uid = str(record.get("user_id", "")).strip()
+        rec_cid = str(record.get("company_id", "")).strip()
+        rec_assignee = str(record.get("assigned_to", "")).strip() or rec_uid
+
+        visible = False
+        if role == ROLE_ADMIN:
+            visible = True
+        elif role == ROLE_COMPANY_HEAD and cid:
+            visible = (rec_cid == cid) or (not rec_cid and rec_uid == uid)
+        elif role == ROLE_EMPLOYEE and cid:
+            visible = (rec_cid == cid and uid in (rec_uid, rec_assignee)) or (
+                not rec_cid and rec_uid == uid
             )
-            data_rows.append(
-                {
-                    "Record ID": record.get("record_id", ""),
-                    "Company Name": record.get("company_name", "N/A") or "N/A",
-                    "Contact Person": record.get("contact_person", "N/A") or "N/A",
-                    "Contact No.": format_phone_numbers(record.get("call_phone", "N/A")),
-                    "WhatsApp No.": format_phone_numbers(
-                        record.get("whatsapp_phone", "N/A")
-                    ),
-                    "Email": format_emails(record.get("email", "N/A")),
-                    "Product / Services": record.get("products_services", "N/A") or "N/A",
-                    "Address": record.get("address", "N/A") or "N/A",
-                    "City": record.get("city", "N/A") or "N/A",
-                    "Notes": record.get("notes", "") or "N/A",
-                    "Saved On": record.get("created_at", ""),
-                    "Extra Details": format_extra_data_summary(extra_dict),
-                    "Extra Data JSON": extra_json_clean,
-                    "Deleted At": deleted_at,
-                }
-            )
+        else:
+            visible = rec_uid == uid and not rec_cid
+
+        if not visible:
+            continue
+
+        deleted_at = str(record.get("deleted_at", "")).strip()
+        if not include_deleted and deleted_at:
+            continue
+
+        raw_extra = record.get("extra_data") or record.get("Extra Details") or ""
+        extra_dict = parse_extra_data(raw_extra)
+        extra_json_clean, _ = validate_and_serialize_extra_data(
+            extra_dict, strict=False
+        )
+        data_rows.append(
+            {
+                "Record ID": record.get("record_id", ""),
+                "Company Name": record.get("company_name", "N/A") or "N/A",
+                "Contact Person": record.get("contact_person", "N/A") or "N/A",
+                "Contact No.": format_phone_numbers(record.get("call_phone", "N/A")),
+                "WhatsApp No.": format_phone_numbers(
+                    record.get("whatsapp_phone", "N/A")
+                ),
+                "Email": format_emails(record.get("email", "N/A")),
+                "Product / Services": record.get("products_services", "N/A") or "N/A",
+                "Address": record.get("address", "N/A") or "N/A",
+                "City": record.get("city", "N/A") or "N/A",
+                "Notes": record.get("notes", "") or "N/A",
+                "Saved On": record.get("created_at", ""),
+                "Extra Details": format_extra_data_summary(extra_dict),
+                "Extra Data JSON": extra_json_clean,
+                "Deleted At": deleted_at,
+                "User ID": rec_uid,
+                "Company ID": rec_cid,
+                "Assigned To": rec_assignee,
+            }
+        )
 
     if not data_rows:
         return pd.DataFrame(columns=ALL_RECORD_COLUMNS)
@@ -2284,8 +2274,10 @@ def _rows_to_user_df(
     return pd.DataFrame(data_rows[::-1], columns=ALL_RECORD_COLUMNS)
 
 
-def fetch_user_records(user_id: str, include_deleted: bool = False) -> pd.DataFrame:
-    return _rows_to_user_df(_fetch_all_card_rows(), user_id, include_deleted)
+def fetch_scoped_records(
+    current_user: dict[str, str], include_deleted: bool = False
+) -> pd.DataFrame:
+    return _rows_to_scoped_df(_fetch_all_card_rows(), current_user, include_deleted)
 
 
 def search_records_df(df: pd.DataFrame, query: str) -> pd.DataFrame:
@@ -2363,7 +2355,7 @@ def _ensure_cards_header(ws: gspread.Worksheet) -> None:
 
 
 def save_record_atomic(
-    user_id: str,
+    current_user: dict[str, str],
     company_name: str,
     contact_person: str,
     call_phone: str,
@@ -2377,6 +2369,8 @@ def save_record_atomic(
     allow_duplicate: bool = False,
 ) -> Tuple[Optional[str], list[dict[str, Any]]]:
     extra_json, _ = validate_and_serialize_extra_data(extra_data or {}, strict=True)
+    user_id = str(current_user.get("user_id", "")).strip()
+    company_id = str(current_user.get("company_id", "")).strip()
 
     with _WRITE_LOCK:
         ws = get_cards_worksheet()
@@ -2384,7 +2378,9 @@ def save_record_atomic(
 
         if not allow_duplicate:
             fresh_rows = _sheets_call_with_retry(ws.get_all_values)
-            fresh_df = _rows_to_user_df(fresh_rows, user_id, include_deleted=False)
+            fresh_df = _rows_to_scoped_df(
+                fresh_rows, current_user, include_deleted=False
+            )
             matches = _find_duplicates_in_df(
                 fresh_df, call_phone, whatsapp_phone, email
             )
@@ -2410,6 +2406,8 @@ def save_record_atomic(
             timestamp,
             extra_json,
             "",
+            company_id,
+            user_id,
         ]
 
         _sheets_call_with_retry(
@@ -2425,10 +2423,13 @@ def merge_excel_records_atomic(
     raw_df: pd.DataFrame,
     col_mapping: dict[str, str],
     unmapped_extra_cols: list[str],
-    user_id: str,
+    current_user: dict[str, str],
     skip_duplicates: bool,
     source_name: str,
 ) -> Tuple[int, int, int, list[str]]:
+    user_id = str(current_user.get("user_id", "")).strip()
+    company_id = str(current_user.get("company_id", "")).strip()
+
     with _WRITE_LOCK:
         ws = get_cards_worksheet()
         _ensure_cards_header(ws)
@@ -2436,9 +2437,9 @@ def merge_excel_records_atomic(
         existing_phones: set[str] = set()
         existing_emails: set[str] = set()
         if skip_duplicates:
-            fresh_df = _rows_to_user_df(
+            fresh_df = _rows_to_scoped_df(
                 _sheets_call_with_retry(ws.get_all_values),
-                user_id,
+                current_user,
                 include_deleted=False,
             )
             for _, ex_row in fresh_df.iterrows():
@@ -2519,6 +2520,8 @@ def merge_excel_records_atomic(
                     timestamp,
                     extra_json,
                     "",
+                    company_id,
+                    user_id,
                 ]
             )
 
@@ -2541,9 +2544,31 @@ def merge_excel_records_atomic(
     return len(rows_to_append), skipped_dups, skipped_empty, sorted(dropped_extra_keys)
 
 
+def reassign_card_owner(record_id: str, new_owner_id: str) -> bool:
+    with _WRITE_LOCK:
+        ws = get_cards_worksheet()
+        rows = _sheets_call_with_retry(ws.get_all_values)
+        if len(rows) <= 1:
+            return False
+        headers = rows[0]
+        if "assigned_to" not in headers:
+            return False
+        col_letter = rowcol_to_a1(1, headers.index("assigned_to") + 1)[0]
+        for idx, r in enumerate(rows[1:], start=2):
+            if r and r[0] == record_id:
+                ws.update(
+                    values=[[new_owner_id]],
+                    range_name=f"{col_letter}{idx}",
+                    value_input_option="RAW",
+                )
+                _fetch_all_card_rows.clear()
+                return True
+    return False
+
+
 def update_record(
     record_id: str,
-    user_id: str,
+    current_user: dict[str, str],
     company_name: str,
     contact_person: str,
     call_phone: str,
@@ -2556,6 +2581,7 @@ def update_record(
     extra_data: Optional[dict[str, str]] = None,
 ) -> bool:
     extra_json, _ = validate_and_serialize_extra_data(extra_data or {}, strict=True)
+    actor_uid = str(current_user.get("user_id", "")).strip()
 
     with _WRITE_LOCK:
         ws = get_cards_worksheet()
@@ -2570,7 +2596,7 @@ def update_record(
 
             if (
                 existing.get("record_id") == record_id
-                and existing.get("user_id") == user_id
+                and _can_manage_card_record(existing, current_user)
                 and not str(existing.get("deleted_at", "")).strip()
             ):
                 original_created_at = existing.get(
@@ -2579,7 +2605,7 @@ def update_record(
                 clean_company = sanitize_text_field(company_name, MAX_FIELD_LEN) or "N/A"
                 updated_row = [
                     record_id,
-                    user_id,
+                    existing.get("user_id", actor_uid),
                     clean_company,
                     sanitize_text_field(contact_person, MAX_FIELD_LEN) or "N/A",
                     format_phone_numbers(call_phone),
@@ -2592,6 +2618,8 @@ def update_record(
                     original_created_at,
                     extra_json,
                     "",
+                    existing.get("company_id", ""),
+                    existing.get("assigned_to", "") or existing.get("user_id", actor_uid),
                 ]
                 end_cell = rowcol_to_a1(sheet_row_idx, len(CARD_HEADERS))
                 ws.update(
@@ -2601,14 +2629,15 @@ def update_record(
                 )
                 _fetch_all_card_rows.clear()
                 append_audit_log(
-                    user_id, "UPDATE", record_id, f"Updated card: {clean_company}"
+                    actor_uid, "UPDATE", record_id, f"Updated card: {clean_company}"
                 )
                 return True
 
     return False
 
 
-def soft_delete_record(record_id: str, user_id: str) -> bool:
+def soft_delete_record(record_id: str, current_user: dict[str, str]) -> bool:
+    actor_uid = str(current_user.get("user_id", "")).strip()
     with _WRITE_LOCK:
         ws = get_cards_worksheet()
         all_rows = _sheets_call_with_retry(ws.get_all_values)
@@ -2619,16 +2648,17 @@ def soft_delete_record(record_id: str, user_id: str) -> bool:
         del_col_idx = (
             headers.index("deleted_at") + 1
             if "deleted_at" in headers
-            else len(CARD_HEADERS)
+            else 14
         )
         del_cell_col = rowcol_to_a1(1, del_col_idx)[0]
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         for sheet_row_idx, row in enumerate(all_rows[1:], start=2):
-            row_record_id = row[0] if len(row) > 0 else ""
-            row_user_id = row[1] if len(row) > 1 else ""
-            company_label = row[2] if len(row) > 2 else ""
-            if row_record_id == record_id and row_user_id == user_id:
+            padded = row + [""] * (len(headers) - len(row))
+            rec = dict(zip(headers, padded))
+            if rec.get("record_id") == record_id and _can_manage_card_record(
+                rec, current_user
+            ):
                 ws.update(
                     values=[[now_str]],
                     range_name=f"{del_cell_col}{sheet_row_idx}",
@@ -2636,17 +2666,18 @@ def soft_delete_record(record_id: str, user_id: str) -> bool:
                 )
                 _fetch_all_card_rows.clear()
                 append_audit_log(
-                    user_id,
+                    actor_uid,
                     "SOFT_DELETE",
                     record_id,
-                    f"Moved to Trash: {company_label}",
+                    f"Moved to Trash: {rec.get('company_name', '')}",
                 )
                 return True
 
     return False
 
 
-def restore_deleted_record(record_id: str, user_id: str) -> bool:
+def restore_deleted_record(record_id: str, current_user: dict[str, str]) -> bool:
+    actor_uid = str(current_user.get("user_id", "")).strip()
     with _WRITE_LOCK:
         ws = get_cards_worksheet()
         all_rows = _sheets_call_with_retry(ws.get_all_values)
@@ -2657,15 +2688,16 @@ def restore_deleted_record(record_id: str, user_id: str) -> bool:
         del_col_idx = (
             headers.index("deleted_at") + 1
             if "deleted_at" in headers
-            else len(CARD_HEADERS)
+            else 14
         )
         del_cell_col = rowcol_to_a1(1, del_col_idx)[0]
 
         for sheet_row_idx, row in enumerate(all_rows[1:], start=2):
-            row_record_id = row[0] if len(row) > 0 else ""
-            row_user_id = row[1] if len(row) > 1 else ""
-            company_label = row[2] if len(row) > 2 else ""
-            if row_record_id == record_id and row_user_id == user_id:
+            padded = row + [""] * (len(headers) - len(row))
+            rec = dict(zip(headers, padded))
+            if rec.get("record_id") == record_id and _can_manage_card_record(
+                rec, current_user
+            ):
                 ws.update(
                     values=[[""]],
                     range_name=f"{del_cell_col}{sheet_row_idx}",
@@ -2673,10 +2705,10 @@ def restore_deleted_record(record_id: str, user_id: str) -> bool:
                 )
                 _fetch_all_card_rows.clear()
                 append_audit_log(
-                    user_id,
+                    actor_uid,
                     "RESTORE",
                     record_id,
-                    f"Restored from Trash: {company_label}",
+                    f"Restored from Trash: {rec.get('company_name', '')}",
                 )
                 return True
 
@@ -3228,23 +3260,21 @@ def open_blank_manual_form() -> None:
     st.session_state["scan_notice"] = (
         "Manual entry — fill in at least one field below and click Save Card."
     )
-
-
-# ---------------------------------------------------------------------------
+    # ---------------------------------------------------------------------------
 # Authentication UI (Login, OTP-Verified Register & Generic Password Recovery)
 # ---------------------------------------------------------------------------
 def render_auth_screen() -> None:
     _, center_col, _ = st.columns([1, 1.8, 1])
 
     with center_col:
-        st.title("Company Visiting Card Scanner")
+        st.title("Company Visiting Card Scanner & CRM")
         st.caption(
-            "Sign in or create an account to scan, organize, manage CRM deals, and export your visiting cards."
+            "Sign in with your Company/Employee credentials or create a Normal User account to scan and export cards."
         )
 
         with st.container(border=True):
             tab_login, tab_register, tab_forgot = st.tabs(
-                ["Login", "Register", "Forgot Password"]
+                ["Login", "Register (Normal User)", "Forgot Password"]
             )
 
             with tab_login:
@@ -3270,7 +3300,7 @@ def render_auth_screen() -> None:
                                 login_user_session(user)
                                 st.session_state["pending_registration"] = None
                                 st.session_state["flash_success"] = (
-                                    f"Welcome back, {user['username']}!"
+                                    f"Welcome back, {user.get('full_name') or user['username']}!"
                                 )
                                 st.rerun()
                             else:
@@ -3283,7 +3313,8 @@ def render_auth_screen() -> None:
 
                 if pending_reg is None:
                     st.caption(
-                        "Step 1: Enter your details to receive an email verification OTP."
+                        "Self-registration creates a Normal User card-scanner account. "
+                        "Company CRM accounts are provisioned by your Platform Admin or Company Head."
                     )
                     with st.form("register_step1_form"):
                         reg_username = st.text_input(
@@ -4489,7 +4520,7 @@ def render_show_records_section(
 
 
 def _render_update_record_body(
-    all_records_df: pd.DataFrame, current_user_id: str, key_prefix: str
+    all_records_df: pd.DataFrame, current_user: dict[str, str], key_prefix: str
 ) -> None:
     if all_records_df.empty:
         st.info("No saved records available to update yet.")
@@ -4649,7 +4680,7 @@ def _render_update_record_body(
                 try:
                     updated = update_record(
                         record_id=edit_id,
-                        user_id=current_user_id,
+                        current_user=current_user,
                         company_name=upd_company,
                         contact_person=upd_contact,
                         call_phone=upd_call,
@@ -4670,7 +4701,7 @@ def _render_update_record_body(
                         st.rerun()
                     else:
                         st.warning(
-                            "Record not found or does not belong to your account."
+                            "Record not found or you do not have permission to edit it."
                         )
                 except ValueError as val_err:
                     st.error(str(val_err))
@@ -4680,21 +4711,21 @@ def _render_update_record_body(
 
 def render_update_record_section(
     all_records_df: pd.DataFrame,
-    current_user_id: str,
+    current_user: dict[str, str],
     as_expander: bool,
     key_prefix: str,
 ) -> None:
     if as_expander:
         with st.expander("Update a record (by search)"):
-            _render_update_record_body(all_records_df, current_user_id, key_prefix)
+            _render_update_record_body(all_records_df, current_user, key_prefix)
     else:
         with st.container(border=True):
             st.subheader("Update a Record")
-            _render_update_record_body(all_records_df, current_user_id, key_prefix)
+            _render_update_record_body(all_records_df, current_user, key_prefix)
 
 
 def _render_delete_record_body(
-    all_records_df: pd.DataFrame, current_user_id: str, key_prefix: str
+    all_records_df: pd.DataFrame, current_user: dict[str, str], key_prefix: str
 ) -> None:
     if all_records_df.empty:
         st.info("No saved records available to delete yet.")
@@ -4752,40 +4783,43 @@ def _render_delete_record_body(
         key=f"{key_prefix}_btn_confirm_delete_{del_id}",
     ):
         try:
-            deleted = soft_delete_record(del_id, current_user_id)
+            deleted = soft_delete_record(del_id, current_user)
             if deleted:
                 st.session_state["flash_success"] = (
                     f"Moved '{selected_del_row['Company Name']}' to Trash."
                 )
                 st.rerun()
             else:
-                st.warning("Record not found or does not belong to your account.")
+                st.warning("Record not found or you do not have permission to delete it.")
         except Exception:
             st.error("Could not delete record right now. Please try again.")
 
 
 def render_delete_record_section(
     all_records_df: pd.DataFrame,
-    current_user_id: str,
+    current_user: dict[str, str],
     as_expander: bool,
     key_prefix: str,
 ) -> None:
     if as_expander:
         with st.expander("Delete a record (by search)"):
-            _render_delete_record_body(all_records_df, current_user_id, key_prefix)
+            _render_delete_record_body(all_records_df, current_user, key_prefix)
     else:
         with st.container(border=True):
             st.subheader("Delete a Record")
-            _render_delete_record_body(all_records_df, current_user_id, key_prefix)
+            _render_delete_record_body(all_records_df, current_user, key_prefix)
 
 
 def render_trash_and_audit_section(
-    current_user_id: str, current_username: str, key_prefix: str
+    current_user: dict[str, str], key_prefix: str
 ) -> None:
+    current_user_id = str(current_user.get("user_id", ""))
+    current_username = str(current_user.get("username", ""))
+
     with st.container(border=True):
         st.subheader("Trash, Backups & Audit History")
 
-        all_with_deleted = fetch_user_records(current_user_id, include_deleted=True)
+        all_with_deleted = fetch_scoped_records(current_user, include_deleted=True)
         deleted_df = (
             all_with_deleted[all_with_deleted["Deleted At"].astype(str).str.strip() != ""]
             if not all_with_deleted.empty
@@ -4864,7 +4898,7 @@ def render_trash_and_audit_section(
                     key=f"{key_prefix}_btn_restore",
                 ):
                     if restore_deleted_record(
-                        restore_options[chosen_restore], current_user_id
+                        restore_options[chosen_restore], current_user
                     ):
                         st.session_state["flash_success"] = "Card restored successfully."
                         st.rerun()
@@ -4883,7 +4917,7 @@ def render_trash_and_audit_section(
 
 
 # ---------------------------------------------------------------------------
-# Main Application
+# Main Application (Role-Based Menu & Routing)
 # ---------------------------------------------------------------------------
 def main() -> None:
     inject_clean_ui_css()
@@ -4927,7 +4961,7 @@ def main() -> None:
         storage_error = f"{type(exc).__name__}: {exc}{cause}"
 
     if not storage_ready:
-        st.title("Company Visiting Card Scanner")
+        st.title("Company Visiting Card Scanner & CRM")
         st.error(f"Storage & Security setup required: {storage_error}")
         st.info(
             "Verify `SESSION_SECRET` (32+ chars), `GSHEET_URL`, and `[gcp_service_account]` "
@@ -4944,9 +4978,13 @@ def main() -> None:
         render_auth_screen()
         return
 
-    current_user_id = auth_user["user_id"]
-    current_username = auth_user["username"]
-    current_email = auth_user["email"]
+    current_user_id = str(auth_user.get("user_id", "")).strip()
+    current_username = str(auth_user.get("username", "")).strip()
+    current_email = str(auth_user.get("email", "")).strip()
+    current_full_name = str(auth_user.get("full_name") or current_username).strip()
+    user_role = normalize_role(auth_user.get("role", ROLE_USER), current_email)
+    user_company_id = str(auth_user.get("company_id", "")).strip()
+    auth_user["role"] = user_role
 
     if st.session_state.get("bound_user_id") != current_user_id:
         clear_account_specific_state(preserve_flash=True)
@@ -4962,7 +5000,7 @@ def main() -> None:
     scans_remaining = max(0, daily_limit - scans_used_today) if quota_readable else 0
 
     try:
-        all_records_df = fetch_user_records(current_user_id, include_deleted=False)
+        all_records_df = fetch_scoped_records(auth_user, include_deleted=False)
     except Exception:
         st.warning(
             "Google Sheets is momentarily busy (rate limit). Please wait 10 seconds and click Refresh."
@@ -4971,20 +5009,41 @@ def main() -> None:
             st.rerun()
         return
 
-    # ---- Sidebar: Menu, Account, Security & Collapsible Settings ----
+    spreadsheet = get_spreadsheet(SCHEMA_VERSION)
+    company_info = get_company_by_id(spreadsheet, user_company_id)
+    company_label = (
+        company_info.get("company_name", "")
+        if company_info
+        else ("Platform Admin" if user_role == ROLE_ADMIN else "Personal Account")
+    )
+
+    # ---- Role-Aware Sidebar Menu ----
     with st.sidebar:
         st.markdown("### Menu")
         active_view = st.session_state["active_view"]
 
-        nav_items = [
-            ("home", "Home"),
-            ("crm", "CRM Pipeline"),
-            ("show", "Show Records"),
-            ("analyze", "Analyze & Growth"),
-            ("update", "Update Record"),
-            ("delete", "Delete Record"),
-            ("trash", "Trash & Audit"),
-        ]
+        nav_items: list[Tuple[str, str]] = [("home", "Home")]
+        if can_access_crm(auth_user):
+            nav_items.append(("crm", "CRM Pipeline"))
+        if user_role == ROLE_COMPANY_HEAD and user_company_id:
+            nav_items.append(("team", "My Team"))
+        if user_role == ROLE_ADMIN:
+            nav_items.append(("admin", "Admin Console"))
+        nav_items.extend(
+            [
+                ("show", "Show Records"),
+                ("analyze", "Analyze & Growth"),
+                ("update", "Update Record"),
+                ("delete", "Delete Record"),
+                ("trash", "Trash & Audit"),
+            ]
+        )
+
+        valid_view_keys = {k for k, _ in nav_items}
+        if active_view not in valid_view_keys:
+            active_view = "home"
+            st.session_state["active_view"] = "home"
+
         for view_key, view_label in nav_items:
             if st.button(
                 view_label,
@@ -5003,7 +5062,8 @@ def main() -> None:
 
         st.divider()
         st.markdown("### Account")
-        st.markdown(f"**{current_username}**")
+        st.markdown(f"**{current_full_name}**")
+        st.caption(f"{get_role_badge_label(user_role)} · {company_label}")
         st.caption(current_email)
         st.progress(min(1.0, scans_used_today / daily_limit))
         st.caption(
@@ -5050,18 +5110,22 @@ def main() -> None:
 
     trigger_ui_bridge()
 
-    # ---- Clean Page Header & Escaped Quick-Stats Strip ----
+    # ---- Page Header & Role-Aware Quick-Stats Strip ----
     st.title("Company Visiting Card Scanner & CRM")
-    safe_username_html = html.escape(str(current_username), quote=True)
+    safe_name_html = html.escape(current_full_name, quote=True)
+    safe_role_html = html.escape(
+        f"{get_role_badge_label(user_role)} ({company_label})", quote=True
+    )
     st.markdown(
         f"""
         <div class="vcard-stat-strip">
             <div class="vcard-stat-pill">
-                <div class="vcard-stat-label">Account</div>
-                <div class="vcard-stat-value">{safe_username_html}</div>
+                <div class="vcard-stat-label">Account & Role</div>
+                <div class="vcard-stat-value">{safe_name_html}</div>
+                <div style="font-size:0.75rem;opacity:0.75;">{safe_role_html}</div>
             </div>
             <div class="vcard-stat-pill">
-                <div class="vcard-stat-label">Saved Cards</div>
+                <div class="vcard-stat-label">Accessible Cards</div>
                 <div class="vcard-stat-value">{len(all_records_df)}</div>
             </div>
             <div class="vcard-stat-pill">
@@ -5090,14 +5154,33 @@ def main() -> None:
         st.info(st.session_state["flash_info"])
         st.session_state["flash_info"] = None
 
-    # ---- Dedicated Sidebar Views ----
+    # ---- Role-Protected Sidebar Views ----
     if active_view == "crm":
         render_crm_section(
-            spreadsheet=get_spreadsheet(SCHEMA_VERSION),
+            spreadsheet=spreadsheet,
             all_records_df=all_records_df,
-            current_user_id=current_user_id,
-            current_username=current_username,
+            current_user=auth_user,
+            all_users=fetch_all_users(),
             build_multi_sheet_excel_fn=build_multi_sheet_excel_bytes,
+            assign_card_owner_fn=reassign_card_owner,
+        )
+        return
+
+    if active_view == "team" and user_role == ROLE_COMPANY_HEAD:
+        render_team_management_section(
+            spreadsheet=spreadsheet,
+            current_user=auth_user,
+            all_users=fetch_all_users(),
+            clear_users_cache_fn=fetch_all_users.clear,
+            revoke_sessions_fn=revoke_all_user_sessions,
+        )
+        return
+
+    if active_view == "admin" and user_role == ROLE_ADMIN:
+        render_admin_console(
+            spreadsheet=spreadsheet,
+            all_users=fetch_all_users(),
+            clear_users_cache_fn=fetch_all_users.clear,
         )
         return
 
@@ -5105,7 +5188,7 @@ def main() -> None:
         render_show_records_section(
             all_records_df=all_records_df,
             current_username=current_username,
-            title="Your Saved Visiting Cards",
+            title="Saved Visiting Cards",
             key_prefix="nav_show",
         )
         return
@@ -5124,7 +5207,7 @@ def main() -> None:
     if active_view == "update":
         render_update_record_section(
             all_records_df=all_records_df,
-            current_user_id=current_user_id,
+            current_user=auth_user,
             as_expander=False,
             key_prefix="nav_update",
         )
@@ -5133,7 +5216,7 @@ def main() -> None:
     if active_view == "delete":
         render_delete_record_section(
             all_records_df=all_records_df,
-            current_user_id=current_user_id,
+            current_user=auth_user,
             as_expander=False,
             key_prefix="nav_delete",
         )
@@ -5141,32 +5224,32 @@ def main() -> None:
 
     if active_view == "trash":
         render_trash_and_audit_section(
-            current_user_id=current_user_id,
-            current_username=current_username,
+            current_user=auth_user,
             key_prefix="nav_trash",
         )
         return
 
-    # ---- Home-Page CRM Follow-Up Reminder Banner ----
-    overdue_cnt, due_today_cnt, open_pipe_val = get_crm_due_summary(
-        get_spreadsheet(SCHEMA_VERSION), all_records_df, current_user_id
-    )
-    if overdue_cnt > 0 or due_today_cnt > 0:
-        alert_col1, alert_col2 = st.columns([4.0, 1.3])
-        with alert_col1:
-            st.warning(
-                f"**CRM Reminder:** You have **{overdue_cnt}** overdue and **{due_today_cnt}** due-today "
-                f"follow-up(s) · Open Pipeline: **{format_inr(open_pipe_val)}**."
-            )
-        with alert_col2:
-            if st.button(
-                "Open CRM Queue",
-                type="primary",
-                use_container_width=True,
-                key="btn_home_open_crm",
-            ):
-                st.session_state["active_view"] = "crm"
-                st.rerun()
+    # ---- Home-Page CRM Reminder (Only shown to CRM-authorized roles) ----
+    if can_access_crm(auth_user):
+        overdue_cnt, due_today_cnt, open_pipe_val = get_crm_due_summary(
+            spreadsheet, all_records_df, auth_user
+        )
+        if overdue_cnt > 0 or due_today_cnt > 0:
+            alert_col1, alert_col2 = st.columns([4.0, 1.3])
+            with alert_col1:
+                st.warning(
+                    f"**CRM Reminder ({company_label}):** **{overdue_cnt}** overdue and **{due_today_cnt}** due-today "
+                    f"follow-up(s) · Open Pipeline: **{format_inr(open_pipe_val)}**."
+                )
+            with alert_col2:
+                if st.button(
+                    "Open CRM Queue",
+                    type="primary",
+                    use_container_width=True,
+                    key="btn_home_open_crm",
+                ):
+                    st.session_state["active_view"] = "crm"
+                    st.rerun()
 
     # ---- HOME VIEW: Step 1 (Upload / Camera / Merge Excel + Manual Entry) ----
     upload_rev = st.session_state["uploader_reset_counter"]
@@ -5347,7 +5430,7 @@ def main() -> None:
                         )
 
                         skip_excel_dups = st.checkbox(
-                            "Skip rows that already exist in my account (match by phone or email)",
+                            "Skip rows that already exist (match by phone or email)",
                             value=True,
                             key=f"skip_excel_dups_{upload_rev}",
                         )
@@ -5394,7 +5477,7 @@ def main() -> None:
                                     "Please map at least one column before merging."
                                 )
                             else:
-                                with st.spinner("Merging records into your account..."):
+                                with st.spinner("Merging records..."):
                                     try:
                                         (
                                             added,
@@ -5405,7 +5488,7 @@ def main() -> None:
                                             raw_df=raw_excel_df,
                                             col_mapping=chosen_mapping,
                                             unmapped_extra_cols=active_extra_cols,
-                                            user_id=current_user_id,
+                                            current_user=auth_user,
                                             skip_duplicates=skip_excel_dups,
                                             source_name=uploaded_excel.name,
                                         )
@@ -5470,9 +5553,9 @@ def main() -> None:
             if pending_dup is not None:
                 st.warning(
                     "**Duplicate Card Detected!** A card with the same phone number or email "
-                    "is already saved in your account."
+                    "is already saved."
                 )
-                st.caption("Existing matching card(s) in your account:")
+                st.caption("Existing matching card(s):")
                 st.dataframe(
                     pd.DataFrame(pending_dup["matches"]),
                     use_container_width=True,
@@ -5491,7 +5574,7 @@ def main() -> None:
                         data = pending_dup["payload"]
                         try:
                             save_record_atomic(
-                                user_id=current_user_id,
+                                current_user=auth_user,
                                 company_name=data["company_name"],
                                 contact_person=data["contact_person"],
                                 call_phone=data["call_phone"],
@@ -5514,7 +5597,7 @@ def main() -> None:
                                 or "Card"
                             )
                             st.session_state["flash_success"] = (
-                                f"Saved '{saved_label}' to your account."
+                                f"Saved '{saved_label}'."
                             )
                             st.rerun()
                         except ValueError as val_err:
@@ -5660,7 +5743,7 @@ def main() -> None:
                         else:
                             try:
                                 saved_id, matches = save_record_atomic(
-                                    user_id=current_user_id,
+                                    current_user=auth_user,
                                     company_name=company_name,
                                     contact_person=contact_person,
                                     call_phone=call_phone,
@@ -5700,7 +5783,7 @@ def main() -> None:
                                         or "Card"
                                     )
                                     st.session_state["flash_success"] = (
-                                        f"Saved '{saved_label}' to your account."
+                                        f"Saved '{saved_label}'."
                                     )
                                     st.rerun()
                             except ValueError as val_err:
@@ -5720,20 +5803,20 @@ def main() -> None:
     render_show_records_section(
         all_records_df=all_records_df,
         current_username=current_username,
-        title="3. Your Saved Visiting Cards",
+        title="3. Saved Visiting Cards",
         key_prefix="home_show",
     )
 
     if not all_records_df.empty:
         render_update_record_section(
             all_records_df=all_records_df,
-            current_user_id=current_user_id,
+            current_user=auth_user,
             as_expander=True,
             key_prefix="home_update",
         )
         render_delete_record_section(
             all_records_df=all_records_df,
-            current_user_id=current_user_id,
+            current_user=auth_user,
             as_expander=True,
             key_prefix="home_delete",
         )
