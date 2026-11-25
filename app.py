@@ -16,7 +16,7 @@ import warnings
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
-from typing import Any, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple, TypeVar
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
@@ -27,6 +27,7 @@ import streamlit as st
 from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types
+from gspread.exceptions import APIError as GSpreadAPIError
 from gspread.utils import rowcol_to_a1
 from PIL import Image, ImageOps
 from pydantic import BaseModel, Field
@@ -34,7 +35,7 @@ from pydantic import BaseModel, Field
 # ---------------------------------------------------------------------------
 # Configuration & Security Constants
 # ---------------------------------------------------------------------------
-SCHEMA_VERSION = "v10_cross_worker_and_schema_hardened"
+SCHEMA_VERSION = "v11_multiuser_quota_resilient"
 
 MODEL_CHAIN = [
     "gemini-3.5-flash-lite",
@@ -90,6 +91,7 @@ AUDIT_LOGS_WORKSHEET = "audit_logs"
 
 # In-process lock paired with cross-worker optimistic compare-and-verify on Sheets
 _WRITE_LOCK = threading.Lock()
+_T = TypeVar("_T")
 
 # Worksheet Schemas
 CARD_HEADERS = [
@@ -576,6 +578,47 @@ def trigger_ui_bridge() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Google Sheets Rate-Limit (429) Retry Helper
+# ---------------------------------------------------------------------------
+def _is_transient_sheets_error(exc: Exception) -> bool:
+    if isinstance(exc, GSpreadAPIError):
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if status in (429, 500, 502, 503, 504):
+            return True
+    msg = str(exc).lower()
+    return any(
+        token in msg
+        for token in (
+            "429",
+            "quota exceeded",
+            "rate limit",
+            "too many requests",
+            "503",
+            "502",
+            "500",
+            "timed out",
+            "connection reset",
+        )
+    )
+
+
+def _sheets_call_with_retry(fn: Callable[[], _T], attempts: int = 3) -> _T:
+    """Retry transient Google Sheets 429/5xx errors with short backoff."""
+    last_exc: Optional[Exception] = None
+    for idx in range(attempts):
+        try:
+            return fn()
+        except Exception as exc:
+            last_exc = exc
+            if idx < attempts - 1 and _is_transient_sheets_error(exc):
+                time.sleep(0.8 * (idx + 1))
+                continue
+            raise
+    assert last_exc is not None
+    raise last_exc
+
+
+# ---------------------------------------------------------------------------
 # Secret, Session Signing, Password Policy & Normalization Helpers
 # ---------------------------------------------------------------------------
 def get_secret(key: str, default: Any = None) -> Any:
@@ -604,7 +647,6 @@ def get_quota_date_str() -> str:
 
 
 def get_required_session_signing_key() -> bytes:
-    """Require an explicit, dedicated SESSION_SECRET (>= 32 chars) in Secrets/Env."""
     raw_secret = str(get_secret("SESSION_SECRET", "") or "").strip()
     if len(raw_secret) < MIN_SESSION_SECRET_LEN:
         raise ValueError(
@@ -647,7 +689,6 @@ def verify_password(password: str, stored_hash: str) -> bool:
 
 
 def validate_password_strength(password: str) -> Tuple[bool, str]:
-    """Enforce strong business account passwords (8+ chars, upper, lower, digit)."""
     if len(password) < MIN_PASSWORD_LENGTH:
         return False, f"Password must be at least {MIN_PASSWORD_LENGTH} characters long."
     if not re.search(r"[A-Z]", password):
@@ -668,7 +709,6 @@ def is_valid_username(username: str) -> bool:
 
 
 def sanitize_text_field(val: Any, max_len: int = MAX_FIELD_LEN) -> str:
-    """Normalize digits, strip control characters, and enforce length bounds."""
     if val is None:
         return ""
     cleaned = normalize_digits(str(val)).replace("\x00", "").strip()
@@ -777,10 +817,6 @@ def parse_extra_data(raw_json: str) -> dict[str, str]:
 def validate_and_serialize_extra_data(
     extra: dict[str, str], strict: bool = True
 ) -> Tuple[str, list[str]]:
-    """
-    Serialize extra key-value pairs into valid JSON within MAX_LONG_FIELD_LEN (800 chars).
-    Never truncates raw JSON mid-token.
-    """
     cleaned: dict[str, str] = {}
     for k, v in extra.items():
         ck = sanitize_text_field(k, 80)
@@ -902,10 +938,6 @@ def build_expanded_dataframe(
 
 
 def optimize_card_image(raw_bytes: bytes, fallback_mime: str) -> Tuple[bytes, str]:
-    """
-    Validate dimensions against MAX_DECODED_IMAGE_PIXELS, auto-orient, and compress
-    visiting card photos to JPEG without mutating global Pillow settings per request.
-    """
     if not raw_bytes or len(raw_bytes) > MAX_IMAGE_FILE_BYTES:
         raise ValueError("Image is empty or exceeds the 5 MB upload limit.")
 
@@ -964,10 +996,6 @@ def clear_uploaded_inputs() -> None:
 
 
 def clear_account_specific_state(preserve_flash: bool = False) -> None:
-    """
-    Reset all account-specific session state (forms, generated AI playbooks/pitches,
-    legacy consent flags, active view, and file uploaders) on logout, expiry, or user switch.
-    """
     st.session_state["bound_user_id"] = None
     st.session_state["active_view"] = "home"
     st.session_state["extracted_card"] = None
@@ -977,7 +1005,6 @@ def clear_account_specific_state(preserve_flash: bool = False) -> None:
     st.session_state["audit_warning"] = None
     st.session_state["ai_growth_output"] = None
     st.session_state["ai_pitch_output"] = None
-    st.session_state["ai_consent_enabled"] = False
     st.session_state["edit_counter"] = st.session_state.get("edit_counter", 0) + 1
     clear_uploaded_inputs()
     if not preserve_flash:
@@ -1117,13 +1144,15 @@ def get_spreadsheet(_schema_version: str = SCHEMA_VERSION) -> gspread.Spreadshee
 
     creds_dict = dict(creds_section)
     client = gspread.service_account_from_dict(creds_dict)
-    spreadsheet = client.open_by_url(str(sheet_url).strip())
+    spreadsheet = _sheets_call_with_retry(
+        lambda: client.open_by_url(str(sheet_url).strip())
+    )
     ensure_worksheets(spreadsheet)
     return spreadsheet
 
 
 def _migrate_cards_worksheet_if_needed(cards_ws: gspread.Worksheet) -> None:
-    all_rows = cards_ws.get_all_values()
+    all_rows = _sheets_call_with_retry(cards_ws.get_all_values)
     if not all_rows:
         cards_ws.append_row(CARD_HEADERS, value_input_option="RAW")
         return
@@ -1197,15 +1226,7 @@ def _migrate_or_validate_worksheet(
     sheet_label: str,
     defaults: Optional[dict[str, str]] = None,
 ) -> None:
-    """
-    Ensure `ws` has the exact `expected_headers` order.
-    - If empty, initializes row 1.
-    - If headers are reordered or missing newly added columns (e.g., `attempts` in OTP tabs),
-      migrates rows by header name into `expected_headers`.
-    - If unrecognized/incompatible columns exist, raises a clear startup ValueError so
-      no downstream code ever misreads column positions.
-    """
-    all_rows = ws.get_all_values()
+    all_rows = _sheets_call_with_retry(ws.get_all_values)
     if not all_rows:
         if ws.col_count < len(expected_headers):
             ws.resize(cols=len(expected_headers))
@@ -1251,7 +1272,8 @@ def _migrate_or_validate_worksheet(
 
 
 def ensure_worksheets(spreadsheet: gspread.Spreadsheet) -> None:
-    existing_titles = {ws.title for ws in spreadsheet.worksheets()}
+    existing_ws = _sheets_call_with_retry(spreadsheet.worksheets)
+    existing_titles = {ws.title for ws in existing_ws}
 
     if CARDS_WORKSHEET not in existing_titles:
         cards_ws = spreadsheet.add_worksheet(
@@ -1288,15 +1310,11 @@ def ensure_worksheets(spreadsheet: gspread.Spreadsheet) -> None:
 def _get_or_create_worksheet(title: str, headers: list[str]) -> gspread.Worksheet:
     spreadsheet = get_spreadsheet(SCHEMA_VERSION)
     try:
-        ws = spreadsheet.worksheet(title)
+        return spreadsheet.worksheet(title)
     except gspread.WorksheetNotFound:
         ws = spreadsheet.add_worksheet(title=title, rows=500, cols=len(headers))
         ws.append_row(headers, value_input_option="RAW")
         return ws
-
-    if not ws.row_values(1):
-        ws.append_row(headers, value_input_option="RAW")
-    return ws
 
 
 def get_cards_worksheet() -> gspread.Worksheet:
@@ -1332,7 +1350,7 @@ def get_audit_logs_worksheet() -> gspread.Worksheet:
 
 
 # ---------------------------------------------------------------------------
-# Audit History Logger (Surfaces Write Failures & Exports Complete History)
+# Audit History Logger
 # ---------------------------------------------------------------------------
 def append_audit_log(
     user_id: str, action: str, record_id: str, details: str
@@ -1341,17 +1359,19 @@ def append_audit_log(
         ws = get_audit_logs_worksheet()
         log_id = f"log_{uuid.uuid4().hex}"
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        ws.append_row(
-            [
-                log_id,
-                user_id,
-                action,
-                record_id,
-                sanitize_text_field(details, 300),
-                timestamp,
-            ],
-            value_input_option="RAW",
-            table_range="A1",
+        _sheets_call_with_retry(
+            lambda: ws.append_row(
+                [
+                    log_id,
+                    user_id,
+                    action,
+                    record_id,
+                    sanitize_text_field(details, 300),
+                    timestamp,
+                ],
+                value_input_option="RAW",
+                table_range="A1",
+            )
         )
         return True
     except Exception:
@@ -1365,7 +1385,7 @@ def fetch_user_audit_logs(
     user_id: str, limit: Optional[int] = None
 ) -> pd.DataFrame:
     ws = get_audit_logs_worksheet()
-    rows = ws.get_all_values()
+    rows = _sheets_call_with_retry(ws.get_all_values)
     if len(rows) <= 1:
         return pd.DataFrame(columns=["Timestamp", "Action", "Record ID", "Details"])
 
@@ -1387,16 +1407,21 @@ def fetch_user_audit_logs(
 
 
 # ---------------------------------------------------------------------------
-# Rate Limiting & Lockout Protection (Login, Per-Email OTP & Global OTP)
+# Rate Limiting & Lockout Protection (Cached Reads + Retry on 429)
 # ---------------------------------------------------------------------------
+@st.cache_data(ttl=15, show_spinner=False)
+def _fetch_rate_limit_rows() -> list[list[str]]:
+    ws = get_rate_limits_worksheet()
+    return _sheets_call_with_retry(ws.get_all_values)
+
+
 def _check_rate_limit(
     limit_key: str,
     max_attempts: int,
     window_seconds: int,
     cooldown_seconds: int = 0,
 ) -> Tuple[bool, str]:
-    ws = get_rate_limits_worksheet()
-    rows = ws.get_all_values()
+    rows = _fetch_rate_limit_rows()
     now = int(time.time())
 
     for row in rows[1:]:
@@ -1434,7 +1459,7 @@ def _record_rate_limit_event(
 ) -> None:
     with _WRITE_LOCK:
         ws = get_rate_limits_worksheet()
-        rows = ws.get_all_values()
+        rows = _sheets_call_with_retry(ws.get_all_values)
         now = int(time.time())
 
         for row_idx, row in enumerate(rows[1:], start=2):
@@ -1467,6 +1492,7 @@ def _record_rate_limit_event(
                     range_name=f"A{row_idx}:D{row_idx}",
                     value_input_option="RAW",
                 )
+                _fetch_rate_limit_rows.clear()
                 return
 
         locked_until = now + lockout_seconds if 1 >= max_attempts else 0
@@ -1475,12 +1501,13 @@ def _record_rate_limit_event(
             value_input_option="RAW",
             table_range="A1",
         )
+        _fetch_rate_limit_rows.clear()
 
 
 def _clear_rate_limit(limit_key: str) -> None:
     with _WRITE_LOCK:
         ws = get_rate_limits_worksheet()
-        rows = ws.get_all_values()
+        rows = _sheets_call_with_retry(ws.get_all_values)
         for row_idx, row in enumerate(rows[1:], start=2):
             if len(row) >= 1 and row[0] == limit_key:
                 ws.update(
@@ -1488,12 +1515,17 @@ def _clear_rate_limit(limit_key: str) -> None:
                     range_name=f"A{row_idx}:D{row_idx}",
                     value_input_option="RAW",
                 )
+                _fetch_rate_limit_rows.clear()
                 return
 
 
 # ---------------------------------------------------------------------------
-# Server-Backed Revocable Sessions + Continuous Revalidation
+# Server-Backed Revocable Sessions (Resilient to Transient Sheets 429s)
 # ---------------------------------------------------------------------------
+class _TransientStorageError(Exception):
+    pass
+
+
 def create_server_session(user_id: str) -> str:
     session_id = f"sess_{uuid.uuid4().hex}"
     raw_secret = secrets.token_urlsafe(32)
@@ -1503,48 +1535,67 @@ def create_server_session(user_id: str) -> str:
 
     with _WRITE_LOCK:
         ws = get_sessions_worksheet()
-        ws.append_row(
-            [session_id, user_id, token_hash, expires_at, "no", created_at],
-            value_input_option="RAW",
-            table_range="A1",
+        _sheets_call_with_retry(
+            lambda: ws.append_row(
+                [session_id, user_id, token_hash, expires_at, "no", created_at],
+                value_input_option="RAW",
+                table_range="A1",
+            )
         )
-    verify_server_session.clear()
+    _check_session_in_sheets.clear()
     return f"{session_id}.{raw_secret}"
 
 
-@st.cache_data(ttl=10, show_spinner=False)
-def verify_server_session(composite_token: str) -> Optional[str]:
-    """Verify session signature, expiry, and non-revoked status in Google Sheets."""
-    try:
-        if "." not in composite_token:
-            return None
-        session_id, raw_secret = composite_token.split(".", 1)
-        if not session_id.startswith("sess_") or not raw_secret:
-            return None
+@st.cache_data(ttl=60, show_spinner=False)
+def _check_session_in_sheets(composite_token: str) -> Tuple[str, Optional[str]]:
+    """
+    Cached session lookup (60s TTL). Returns ("valid", user_id) or ("invalid", None).
+    Raises _TransientStorageError on Sheets 429/network errors so transient outages
+    are never cached or mistaken for a revoked session.
+    """
+    if "." not in composite_token:
+        return "invalid", None
+    session_id, raw_secret = composite_token.split(".", 1)
+    if not session_id.startswith("sess_") or not raw_secret:
+        return "invalid", None
 
+    try:
         expected_hash = _hash_session_secret(raw_secret)
         ws = get_sessions_worksheet()
-        rows = ws.get_all_values()
-        now = int(time.time())
+        rows = _sheets_call_with_retry(ws.get_all_values)
+    except Exception as exc:
+        raise _TransientStorageError("Temporary storage read error") from exc
 
-        for row in rows[1:]:
-            if len(row) >= 5 and row[0] == session_id:
-                user_id, stored_hash, exp_str, revoked = (
-                    row[1],
-                    row[2],
-                    row[3],
-                    row[4],
-                )
-                if revoked.strip().lower() == "yes":
-                    return None
+    now = int(time.time())
+    for row in rows[1:]:
+        if len(row) >= 5 and row[0] == session_id:
+            user_id, stored_hash, exp_str, revoked = (
+                row[1],
+                row[2],
+                row[3],
+                row[4],
+            )
+            if revoked.strip().lower() == "yes":
+                return "invalid", None
+            try:
                 if int(exp_str) < now:
-                    return None
-                if hmac.compare_digest(stored_hash, expected_hash):
-                    return user_id
-                return None
+                    return "invalid", None
+            except ValueError:
+                return "invalid", None
+            if hmac.compare_digest(stored_hash, expected_hash):
+                return "valid", user_id
+            return "invalid", None
+
+    return "invalid", None
+
+
+def verify_server_session(composite_token: str) -> Tuple[str, Optional[str]]:
+    try:
+        return _check_session_in_sheets(composite_token)
+    except _TransientStorageError:
+        return "transient_error", None
     except Exception:
-        return None
-    return None
+        return "invalid", None
 
 
 def revoke_server_session(composite_token: Optional[str]) -> None:
@@ -1554,7 +1605,7 @@ def revoke_server_session(composite_token: Optional[str]) -> None:
     try:
         with _WRITE_LOCK:
             ws = get_sessions_worksheet()
-            rows = ws.get_all_values()
+            rows = _sheets_call_with_retry(ws.get_all_values)
             for row_idx, row in enumerate(rows[1:], start=2):
                 if len(row) >= 5 and row[0] == session_id:
                     ws.update(
@@ -1563,7 +1614,7 @@ def revoke_server_session(composite_token: Optional[str]) -> None:
                         value_input_option="RAW",
                     )
                     break
-        verify_server_session.clear()
+        _check_session_in_sheets.clear()
     except Exception:
         pass
 
@@ -1572,7 +1623,7 @@ def revoke_all_user_sessions(user_id: str) -> int:
     revoked_count = 0
     with _WRITE_LOCK:
         ws = get_sessions_worksheet()
-        rows = ws.get_all_values()
+        rows = _sheets_call_with_retry(ws.get_all_values)
         for row_idx, row in enumerate(rows[1:], start=2):
             if (
                 len(row) >= 5
@@ -1585,7 +1636,7 @@ def revoke_all_user_sessions(user_id: str) -> int:
                     value_input_option="RAW",
                 )
                 revoked_count += 1
-    verify_server_session.clear()
+    _check_session_in_sheets.clear()
     return revoked_count
 
 
@@ -1608,8 +1659,8 @@ def logout_user_session() -> None:
 
 def sync_and_restore_session() -> Tuple[Optional[dict[str, str]], bool]:
     """
-    Continuously validate active sessions against server-side revocation state
-    and wipe all account-specific session state on expiry, revocation, or user change.
+    Validate active sessions against server-side revocation state without ever
+    logging out active users on transient Google Sheets 429 rate-limit spikes.
     """
     try:
         if "session" in st.query_params:
@@ -1621,8 +1672,16 @@ def sync_and_restore_session() -> Tuple[Optional[dict[str, str]], bool]:
     current_token = st.session_state.get("session_token") or ""
 
     if current_auth is not None:
-        verified_uid = verify_server_session(current_token) if current_token else None
-        if verified_uid != current_auth.get("user_id"):
+        status, verified_uid = (
+            verify_server_session(current_token)
+            if current_token
+            else ("invalid", None)
+        )
+        if status == "transient_error":
+            st.session_state["flash_info"] = (
+                "Google Sheets is momentarily busy — your session is still active."
+            )
+        elif status != "valid" or verified_uid != current_auth.get("user_id"):
             st.session_state["auth_user"] = None
             st.session_state["session_token"] = None
             st.session_state["session_action"] = "clear"
@@ -1673,9 +1732,21 @@ def sync_and_restore_session() -> Tuple[Optional[dict[str, str]], bool]:
         return None, True
 
     if stored_token and stored_token not in ("__none__", "__clearing__"):
-        user_id = verify_server_session(stored_token)
-        if user_id:
-            for user in fetch_all_users():
+        status, user_id = verify_server_session(stored_token)
+        if status == "transient_error":
+            st.warning(
+                "Google Sheets is momentarily busy restoring your session. Please click Refresh in a few seconds."
+            )
+            return None, True
+        if status == "valid" and user_id:
+            try:
+                users = fetch_all_users()
+            except Exception:
+                st.warning(
+                    "Google Sheets is momentarily busy. Please click Refresh in a few seconds."
+                )
+                return None, True
+            for user in users:
                 if user.get("user_id") == user_id:
                     clear_account_specific_state(preserve_flash=False)
                     restored = {
@@ -1695,16 +1766,18 @@ def sync_and_restore_session() -> Tuple[Optional[dict[str, str]], bool]:
 
 
 # ---------------------------------------------------------------------------
-# Cross-Worker Optimistic Quota Reservation & Release
+# Cached Quota Reads + Optimistic Quota Reservation & Release
 # ---------------------------------------------------------------------------
 class QuotaExceededError(Exception):
     pass
 
 
+@st.cache_data(ttl=60, show_spinner=False)
 def get_user_scans_today(user_id: str) -> int:
+    """Cached 60s daily scan counter read (cleared immediately on scan reservation)."""
     today = get_quota_date_str()
     ws = get_usage_worksheet()
-    rows = ws.get_all_values()
+    rows = _sheets_call_with_retry(ws.get_all_values)
     if len(rows) <= 1:
         return 0
     total = 0
@@ -1715,11 +1788,6 @@ def get_user_scans_today(user_id: str) -> int:
 
 
 def reserve_user_scan_slot(user_id: str, daily_limit: int) -> int:
-    """
-    Reserve 1 daily scan slot using `_WRITE_LOCK` plus post-write optimistic
-    compare-and-verify on Google Sheets so concurrent worker processes cannot
-    silently overwrite each other's increments.
-    """
     if daily_limit < 1:
         raise QuotaExceededError("Daily AI scan limit reached.")
 
@@ -1727,7 +1795,7 @@ def reserve_user_scan_slot(user_id: str, daily_limit: int) -> int:
     with _WRITE_LOCK:
         ws = get_usage_worksheet()
         for _attempt in range(4):
-            rows = ws.get_all_values()
+            rows = _sheets_call_with_retry(ws.get_all_values)
             if not rows:
                 ws.append_row(USAGE_HEADERS, value_input_option="RAW")
                 rows = [USAGE_HEADERS]
@@ -1760,8 +1828,8 @@ def reserve_user_scan_slot(user_id: str, daily_limit: int) -> int:
                     and len(verify_vals[0]) >= 2
                     and verify_vals[0][1] == claim_stamp
                 ):
+                    get_user_scans_today.clear()
                     return new_count
-                # Another worker updated concurrently — retry with fresh count
                 time.sleep(0.15)
                 continue
 
@@ -1773,33 +1841,31 @@ def reserve_user_scan_slot(user_id: str, daily_limit: int) -> int:
                 value_input_option="RAW",
                 table_range="A1",
             )
-            # Re-read to verify no parallel worker also inserted a row for (user_id, today)
-            post_rows = ws.get_all_values()
+            post_rows = _sheets_call_with_retry(ws.get_all_values)
             dups = [
                 (idx, r)
                 for idx, r in enumerate(post_rows[1:], start=2)
                 if len(r) >= 4 and r[0] == user_id and r[1] == today
             ]
             if len(dups) == 1:
+                get_user_scans_today.clear()
                 return 1
-            # Clean up our duplicate row if another worker inserted first, then loop to increment
             for idx, r in reversed(dups):
                 if r[3] == claim_stamp:
                     ws.delete_rows(idx)
                     break
             time.sleep(0.15)
 
-    raise RuntimeError("Could not atomically reserve a scan slot due to concurrent traffic.")
+    raise RuntimeError("Could not reserve a scan slot due to concurrent traffic.")
 
 
 def release_user_scan_slot(user_id: str) -> None:
-    """Return 1 reserved scan slot with compare-and-verify if an AI call fails."""
     try:
         with _WRITE_LOCK:
             ws = get_usage_worksheet()
             today = get_quota_date_str()
             for _attempt in range(3):
-                rows = ws.get_all_values()
+                rows = _sheets_call_with_retry(ws.get_all_values)
                 for row_idx, row in enumerate(rows[1:], start=2):
                     if len(row) >= 3 and row[0] == user_id and row[1] == today:
                         current = int(row[2])
@@ -1819,6 +1885,7 @@ def release_user_scan_slot(user_id: str) -> None:
                             and len(verify_vals[0]) >= 2
                             and verify_vals[0][1] == claim_stamp
                         ):
+                            get_user_scans_today.clear()
                             return
                         break
                 time.sleep(0.1)
@@ -1827,7 +1894,7 @@ def release_user_scan_slot(user_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Email OTP Delivery & Cross-Worker Compare-and-Verify Consumption
+# Email OTP Delivery & Verification
 # ---------------------------------------------------------------------------
 def _send_otp_email(
     recipient_email: str, username: str, code: str, subject: str, purpose_line: str
@@ -1934,10 +2001,12 @@ def _issue_otp(
         )
 
     with _WRITE_LOCK:
-        ws.append_row(
-            [email, code_hash, expires_at, "no", "0", created_at],
-            value_input_option="RAW",
-            table_range="A1",
+        _sheets_call_with_retry(
+            lambda: ws.append_row(
+                [email, code_hash, expires_at, "no", "0", created_at],
+                value_input_option="RAW",
+                table_range="A1",
+            )
         )
 
     _record_otp_send_throttles(purpose_key, email)
@@ -1947,10 +2016,6 @@ def _issue_otp(
 def _verify_and_consume_otp(
     ws: gspread.Worksheet, email: str, code: str
 ) -> Tuple[bool, str]:
-    """
-    Verify and consume an OTP using compare-and-verify claim tokens (`yes:<claim_id>`)
-    so concurrent workers cannot consume the same OTP twice.
-    """
     clean_email = email.strip().lower()
     clean_code = re.sub(r"\s+", "", code.strip())
 
@@ -1958,7 +2023,7 @@ def _verify_and_consume_otp(
         return False, "Please enter the 6-digit verification code from your email."
 
     with _WRITE_LOCK:
-        otp_rows = ws.get_all_values()
+        otp_rows = _sheets_call_with_retry(ws.get_all_values)
         if len(otp_rows) <= 1:
             return False, "Invalid or expired verification code."
 
@@ -2036,7 +2101,7 @@ def _verify_and_consume_otp(
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_all_users() -> list[dict[str, str]]:
     ws = get_users_worksheet()
-    all_rows = ws.get_all_values()
+    all_rows = _sheets_call_with_retry(ws.get_all_values)
     if len(all_rows) <= 1:
         return []
 
@@ -2165,30 +2230,50 @@ def authenticate_user(
     if not allowed:
         return False, lock_msg, None
 
-    fetch_all_users.clear()
-    for user in fetch_all_users():
-        uname = user.get("username", "").strip().lower()
-        uemail = user.get("email", "").strip().lower()
-        if clean_id in (uname, uemail):
-            if verify_password(password, user.get("password_hash", "")):
-                _clear_rate_limit(rate_key)
-                return (
-                    True,
-                    "Logged in successfully.",
-                    {
-                        "user_id": user.get("user_id", ""),
-                        "username": user.get("username", ""),
-                        "email": user.get("email", ""),
-                        "role": user.get("role", "user"),
-                    },
-                )
-            _record_rate_limit_event(
-                limit_key=rate_key,
-                max_attempts=MAX_LOGIN_ATTEMPTS,
-                window_seconds=LOGIN_LOCKOUT_SECONDS,
-                lockout_seconds=LOGIN_LOCKOUT_SECONDS,
+    # Check 60s-cached users list first to avoid unnecessary Sheets reads during bursts
+    users = fetch_all_users()
+    matched_users = [
+        u
+        for u in users
+        if clean_id
+        in (
+            u.get("username", "").strip().lower(),
+            u.get("email", "").strip().lower(),
+        )
+    ]
+    if not matched_users:
+        fetch_all_users.clear()
+        users = fetch_all_users()
+        matched_users = [
+            u
+            for u in users
+            if clean_id
+            in (
+                u.get("username", "").strip().lower(),
+                u.get("email", "").strip().lower(),
             )
-            return False, "Invalid username/email or password.", None
+        ]
+
+    for user in matched_users:
+        if verify_password(password, user.get("password_hash", "")):
+            _clear_rate_limit(rate_key)
+            return (
+                True,
+                "Logged in successfully.",
+                {
+                    "user_id": user.get("user_id", ""),
+                    "username": user.get("username", ""),
+                    "email": user.get("email", ""),
+                    "role": user.get("role", "user"),
+                },
+            )
+        _record_rate_limit_event(
+            limit_key=rate_key,
+            max_attempts=MAX_LOGIN_ATTEMPTS,
+            window_seconds=LOGIN_LOCKOUT_SECONDS,
+            lockout_seconds=LOGIN_LOCKOUT_SECONDS,
+        )
+        return False, "Invalid username/email or password.", None
 
     _record_rate_limit_event(
         limit_key=rate_key,
@@ -2213,12 +2298,18 @@ def request_password_reset(email: str) -> Tuple[bool, str]:
         "a 6-digit reset code has been sent (valid for 10 minutes)."
     )
 
-    fetch_all_users.clear()
-    matched_user = None
-    for user in fetch_all_users():
-        if user.get("email", "").strip().lower() == clean_email:
-            matched_user = user
-            break
+    users = fetch_all_users()
+    matched_user = next(
+        (u for u in users if u.get("email", "").strip().lower() == clean_email),
+        None,
+    )
+    if matched_user is None:
+        fetch_all_users.clear()
+        users = fetch_all_users()
+        matched_user = next(
+            (u for u in users if u.get("email", "").strip().lower() == clean_email),
+            None,
+        )
 
     if not matched_user:
         _record_otp_send_throttles("reset", clean_email)
@@ -2261,7 +2352,7 @@ def confirm_password_reset(
     target_user_id = ""
     with _WRITE_LOCK:
         users_ws = get_users_worksheet()
-        user_rows = users_ws.get_all_values()
+        user_rows = _sheets_call_with_retry(users_ws.get_all_values)
         updated_user = False
         for row_idx, row in enumerate(user_rows[1:], start=2):
             if len(row) >= 4 and row[2].strip().lower() == clean_email:
@@ -2293,7 +2384,7 @@ def confirm_password_reset(
 @st.cache_data(ttl=60, show_spinner=False)
 def _fetch_all_card_rows() -> list[list[str]]:
     ws = get_cards_worksheet()
-    all_rows = ws.get_all_values()
+    all_rows = _sheets_call_with_retry(ws.get_all_values)
     if not all_rows:
         ws.append_row(CARD_HEADERS, value_input_option="RAW")
         return [CARD_HEADERS]
@@ -2367,7 +2458,6 @@ def fetch_user_records(user_id: str, include_deleted: bool = False) -> pd.DataFr
 
 
 def search_records_df(df: pd.DataFrame, query: str) -> pd.DataFrame:
-    """Literal substring search across all card fields (`regex=False`)."""
     q = query.strip()
     if not q or df.empty:
         return df.iloc[0:0]
@@ -2462,7 +2552,7 @@ def save_record_atomic(
         _ensure_cards_header(ws)
 
         if not allow_duplicate:
-            fresh_rows = ws.get_all_values()
+            fresh_rows = _sheets_call_with_retry(ws.get_all_values)
             fresh_df = _rows_to_user_df(fresh_rows, user_id, include_deleted=False)
             matches = _find_duplicates_in_df(
                 fresh_df, call_phone, whatsapp_phone, email
@@ -2491,7 +2581,9 @@ def save_record_atomic(
             "",
         ]
 
-        ws.append_row(row, value_input_option="RAW", table_range="A1")
+        _sheets_call_with_retry(
+            lambda: ws.append_row(row, value_input_option="RAW", table_range="A1")
+        )
         _fetch_all_card_rows.clear()
 
     append_audit_log(user_id, "CREATE", record_id, f"Saved card: {clean_company}")
@@ -2514,7 +2606,9 @@ def merge_excel_records_atomic(
         existing_emails: set[str] = set()
         if skip_duplicates:
             fresh_df = _rows_to_user_df(
-                ws.get_all_values(), user_id, include_deleted=False
+                _sheets_call_with_retry(ws.get_all_values),
+                user_id,
+                include_deleted=False,
             )
             for _, ex_row in fresh_df.iterrows():
                 existing_phones |= extract_normalized_phones(
@@ -2599,7 +2693,11 @@ def merge_excel_records_atomic(
             )
 
         if rows_to_append:
-            ws.append_rows(rows_to_append, value_input_option="RAW", table_range="A1")
+            _sheets_call_with_retry(
+                lambda: ws.append_rows(
+                    rows_to_append, value_input_option="RAW", table_range="A1"
+                )
+            )
             _fetch_all_card_rows.clear()
 
     if rows_to_append:
@@ -2631,7 +2729,7 @@ def update_record(
 
     with _WRITE_LOCK:
         ws = get_cards_worksheet()
-        all_rows = ws.get_all_values()
+        all_rows = _sheets_call_with_retry(ws.get_all_values)
         if len(all_rows) <= 1:
             return False
 
@@ -2683,7 +2781,7 @@ def update_record(
 def soft_delete_record(record_id: str, user_id: str) -> bool:
     with _WRITE_LOCK:
         ws = get_cards_worksheet()
-        all_rows = ws.get_all_values()
+        all_rows = _sheets_call_with_retry(ws.get_all_values)
         if len(all_rows) <= 1:
             return False
 
@@ -2721,7 +2819,7 @@ def soft_delete_record(record_id: str, user_id: str) -> bool:
 def restore_deleted_record(record_id: str, user_id: str) -> bool:
     with _WRITE_LOCK:
         ws = get_cards_worksheet()
-        all_rows = ws.get_all_values()
+        all_rows = _sheets_call_with_retry(ws.get_all_values)
         if len(all_rows) <= 1:
             return False
 
@@ -2762,7 +2860,6 @@ _FORMULA_TRIGGER_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 
 
 def sanitize_excel_cell(val: Any) -> Any:
-    """Prevent Excel/CSV formula injection on both headers and cell values."""
     if not isinstance(val, str):
         return val
     stripped = val.lstrip()
@@ -2772,7 +2869,6 @@ def sanitize_excel_cell(val: Any) -> Any:
 
 
 def sanitize_df_for_excel(df: pd.DataFrame) -> pd.DataFrame:
-    """Sanitize both column headers and cell values before writing to Excel."""
     safe_df = df.copy()
     safe_headers: list[str] = []
     seen_headers: set[str] = set()
@@ -2848,14 +2944,6 @@ def _dedupe_import_headers(raw_header_row: list[Any]) -> list[str]:
 
 
 def read_bounded_spreadsheet(uploaded_file: Any) -> pd.DataFrame:
-    """
-    Stream CSV or XLSX files while enforcing:
-    - File size limit (2 MB)
-    - Column count limit (40 columns)
-    - Non-empty row limit (500 rows)
-    - Physical row scan limit (2,000 rows including blank rows) so sparse workbooks
-      cannot tie up CPU/memory.
-    """
     if getattr(uploaded_file, "size", 0) > MAX_EXCEL_FILE_BYTES:
         raise ValueError("Uploaded spreadsheet exceeds the 2 MB limit.")
 
@@ -3246,7 +3334,7 @@ def run_scan(image_files: list, api_key: str, user_id: str) -> None:
         return
     except Exception:
         st.error(
-            "Unable to verify your daily AI scan quota right now. Please try again in a moment."
+            "Google Sheets is momentarily busy verifying your scan quota. Please tap Scan again in a few seconds."
         )
         return
 
@@ -3683,7 +3771,6 @@ def _render_campaign_message(template: str, row: pd.Series) -> str:
 
 
 def _get_user_bound_ai_text(state_key: str, user_id: str) -> Optional[str]:
-    """Return stored AI output only if it belongs to `user_id`."""
     entry = st.session_state.get(state_key)
     if isinstance(entry, dict) and entry.get("user_id") == user_id:
         return entry.get("text")
@@ -4053,7 +4140,7 @@ def render_analyze_section(
                         st.warning(f"Daily AI limit ({daily_limit}) reached.")
                         return
                     except Exception:
-                        st.error("Unable to verify daily AI quota right now.")
+                        st.error("Google Sheets is momentarily busy. Please try again in a few seconds.")
                         return
 
                     top_cities_list = [
@@ -4156,7 +4243,7 @@ def render_analyze_section(
                             st.warning(f"Daily AI limit ({daily_limit}) reached.")
                             return
                         except Exception:
-                            st.error("Unable to verify daily AI quota right now.")
+                            st.error("Google Sheets is momentarily busy. Please try again in a few seconds.")
                             return
 
                         target = pitch_options[chosen_pitch_label]
@@ -4751,7 +4838,6 @@ def main() -> None:
         ("reset_email_target", ""),
         ("ai_growth_output", None),
         ("ai_pitch_output", None),
-        ("ai_consent_enabled", False),
         ("otp_sends_this_session", 0),
     ):
         if key not in st.session_state:
@@ -4788,7 +4874,6 @@ def main() -> None:
     current_username = auth_user["username"]
     current_email = auth_user["email"]
 
-    # Guard against any account switch in the same browser tab
     if st.session_state.get("bound_user_id") != current_user_id:
         clear_account_specific_state(preserve_flash=True)
         st.session_state["bound_user_id"] = current_user_id
@@ -4805,7 +4890,11 @@ def main() -> None:
     try:
         all_records_df = fetch_user_records(current_user_id, include_deleted=False)
     except Exception:
-        st.error("Unable to load your saved cards right now. Please refresh.")
+        st.warning(
+            "Google Sheets is momentarily busy (rate limit). Please wait 10 seconds and click Refresh."
+        )
+        if st.button("Refresh", key="btn_retry_load_cards"):
+            st.rerun()
         return
 
     # ---- Sidebar: Menu, Account, Security & Collapsible Settings ----
@@ -4911,7 +5000,7 @@ def main() -> None:
 
     if not quota_readable:
         st.warning(
-            "Could not verify daily AI scan quota from storage — AI scanning is paused until connection recovers."
+            "Google Sheets is momentarily busy checking your daily AI quota — AI scanning will resume shortly."
         )
 
     if st.session_state.get("audit_warning"):
