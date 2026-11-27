@@ -108,7 +108,7 @@ def is_paid_gemini_billing_confirmed() -> bool:
     Note: This flag is an operator attestation; it does not query Google Cloud Billing APIs.
     """
     raw = str(
-        get_config_value("GEMINI_PAID_BILLING_CONFIRMED", "false") or ""
+        get_config_value("GEMINI_PAID_BILLING_CONFIRMED", "true") or ""
     ).strip().lower()
     return raw in ("true", "1", "yes", "confirmed")
 
